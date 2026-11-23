@@ -1,6 +1,6 @@
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, KeyBinding, Menu, MenuItem, SystemMenuType,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    App, Bounds, Context, FocusHandle, KeyBinding, Menu, MenuItem, SystemMenuType, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 actions!(xctx, [CloseWindow, Quit]);
@@ -35,21 +35,18 @@ impl Render for RootView {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-w", CloseWindow, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.set_menus(vec![Menu {
-            name: xctx_core::APP_NAME.into(),
-            items: vec![
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action("Quit xctx", Quit),
-            ],
-        }]);
-        cx.on_window_closed(|cx| {
+        cx.set_menus(vec![Menu::new(xctx_core::APP_NAME).items([
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("Quit xctx", Quit),
+        ])]);
+        cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -69,7 +66,7 @@ fn main() {
             |window, cx| {
                 cx.new(|cx| {
                     let focus_handle = cx.focus_handle();
-                    focus_handle.focus(window);
+                    focus_handle.focus(window, cx);
                     RootView { focus_handle }
                 })
             },
