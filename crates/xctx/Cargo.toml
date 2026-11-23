@@ -1,0 +1,8 @@
+[package]
+name = "xctx"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+xctx-core = { path = "../xctx-core" }

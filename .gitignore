@@ -1,4 +1,3 @@
-.build/
+target/
 xctx.app/
-PixelWorkspace.app/
 .DS_Store

@@ -1,0 +1,37 @@
+[tools]
+rust = { version = "1.100.0", components = ["rustfmt", "clippy"] }
+
+[tasks.dev]
+description = "Run the xctx app in debug mode"
+run = "cargo run -p xctx"
+
+[tasks.build]
+description = "Build the xctx app in release mode"
+run = "cargo build -p xctx --release"
+
+[tasks.test]
+description = "Run tests across the workspace"
+run = "cargo test --workspace"
+
+[tasks.fmt]
+description = "Format Rust code across the workspace"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check Rust formatting across the workspace"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Run Clippy across the workspace and all targets"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.ci]
+description = "Run formatting check, linter, and workspace tests"
+depends = ["fmt:check", "lint", "test"]
+
+[tasks.clean]
+description = "Remove build artifacts and the bundled xctx.app"
+run = """
+cargo clean
+rm -rf xctx.app
+"""

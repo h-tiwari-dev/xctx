@@ -1,47 +1,34 @@
 # xctx
 
-A native macOS workspace for agentic coding. You type a task; xctx finds the repos it touches in the folders you
-index, and opens a **space**: a worktree per repo, a `pi` agent per repo, shells, git and a browser in split panes.
-Spaces reshape (dev, debug, review), ship (push + PR) and dissolve.
+xctx is an agent multiplexer for macOS: a native desktop app built with Rust and GPUI where you describe a task and it opens a space with a worktree per repo, agents, shells, and plugin panes. See [`design/README.md`](design/README.md) for the full vision.
 
-## Run
+**Status:** This repository is currently a skeleton. It opens a single GPUI window titled `xctx` with placeholder content; spaces, panes, harness, git, and indexing are not implemented yet.
 
-```sh
-./build-app.sh && open xctx.app
-```
+## Prerequisites
 
-Requires Xcode 26 / Swift 6. Agents run `pi` (`@earendil-works/pi-coding-agent`); `lazygit`, `nvim`, `mise` and
-`gh` are used when installed.
+- macOS 13.0 or later
+- Xcode (or Xcode Command Line Tools)
+- [mise](https://mise.jdx.dev/)
 
-## Spaces
-
-- **Index** folders on Home; only git repos inside them are read, on this Mac.
-- **Type a task** in the prompt bar. The draft lists the repos it found and why. Nothing runs until **Launch** (⌘↩).
-- **Launch** makes a worktree per repo on `space/<id>`, a `mise.<id>.toml` (git-ignored) with the space's own `PORT`,
-  and an agent per repo told about its task, repo and the harness.
-- **Shapes**: dev (agents over shells), debug (agents beside shells), review (lazygit per repo): ⌥⌘1 ⌥⌘2 ⌥⌘3.
-  Reshaping keeps the same agents.
-- **Ship** (⇧⌘S) pushes and opens PRs where there are new commits and a remote, then removes the worktrees.
-  **Discard** removes the worktrees and keeps the branches.
-
-## Harness
-
-Agents drive the window from their terminals:
+Install the pinned Rust toolchain (`rustfmt` and `clippy` included) via mise:
 
 ```sh
-"$XCTX_CTL" ctl pane.mount kind=browser url=http://localhost:$PORT split=right
-"$XCTX_CTL" ctl gate.ask title="run a migration" detail="orders table"
+mise trust
+mise install
 ```
 
-Commands: `spaces.list index.search space.propose space.launch space.shape space.open pane.list pane.mount
-pane.close pane.send pane.read page.open gate.ask gate.status`. One JSON object per line over
-`~/Library/Application Support/xctx/control.sock` (owner-only).
+## Tasks
 
-## Test
+All development runs through mise tasks:
 
-```sh
-swift test       # core: git, index, spaces, pane tree
-./selftest.sh    # drives the real window against throwaway repos, with `cat` as the agent
-```
-
-Environment: `XCTX_DATA_DIR`, `XCTX_INDEX_ROOTS`, `XCTX_AGENT_CMD`, `XCTX_SELFTEST`.
+| Task | Description |
+| --- | --- |
+| `mise run dev` | Run the `xctx` app in debug mode |
+| `mise run build` | Build the `xctx` app in release mode |
+| `mise run bundle` | Assemble the release build into `xctx.app` at the repo root |
+| `mise run test` | Run tests across the workspace |
+| `mise run fmt` | Format Rust code across the workspace |
+| `mise run fmt:check` | Check Rust formatting across the workspace |
+| `mise run lint` | Run Clippy across the workspace and all targets (`-D warnings`) |
+| `mise run ci` | Run `fmt:check`, `lint`, and `test` together |
+| `mise run clean` | Remove Cargo build artifacts and `xctx.app` |

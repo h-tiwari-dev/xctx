@@ -1,0 +1,6 @@
+[package]
+name = "xctx-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,12 +1,15 @@
-#!/bin/sh
-# Build xctx.app (release) next to this script. Usage: ./build-app.sh && open xctx.app
+#!/usr/bin/env sh
+#MISE description="Assemble release build into xctx.app bundle"
+#MISE depends=["build"]
 set -eu
-cd "$(dirname "$0")"
-swift build -c release
-APP=xctx.app
+
+APP="xctx.app"
+BIN="target/release/xctx"
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$(swift build -c release --show-bin-path)/xctx" "$APP/Contents/MacOS/xctx"
+cp "$BIN" "$APP/Contents/MacOS/xctx"
+
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -14,7 +17,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <dict>
     <key>CFBundleName</key><string>xctx</string>
     <key>CFBundleDisplayName</key><string>xctx</string>
-    <key>CFBundleIdentifier</key><string>dev.htiwari.xctx</string>
+    <key>CFBundleIdentifier</key><string>dev.xctx.app</string>
     <key>CFBundleExecutable</key><string>xctx</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
@@ -26,5 +29,6 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
+
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "built $(pwd)/$APP"
