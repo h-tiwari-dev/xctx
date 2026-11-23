@@ -1,0 +1,19 @@
+Cargo.toml
+  s_34ff316a6db202::t_db773685c5260e 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "1737a0bca4033bb2efa7a2437cd25922eff5a010",
+  "prompts": {},
+  "sessions": {
+    "s_34ff316a6db202": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a209de-b15f-7684-988c-9ba95d1a4094",
+        "model": "gemini-4-neon"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
