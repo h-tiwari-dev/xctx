@@ -6210,7 +6210,14 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui_platform",
+ "serde",
+ "serde_json",
+ "tempfile",
  "xctx-core",
+ "xctx-layout",
+ "xctx-term",
+ "xctx-term-view",
+ "xctx-ui",
 ]
 
 [[package]]
@@ -6239,6 +6246,15 @@ dependencies = [
  "bitflags 2.13.2",
  "libc",
  "polling",
+]
+
+[[package]]
+name = "xctx-term-view"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "gpui",
+ "xctx-term",
 ]
 
 [[package]]

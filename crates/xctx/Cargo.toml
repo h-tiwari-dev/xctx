@@ -6,4 +6,13 @@ edition.workspace = true
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3" }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3", features = ["font-kit", "runtime_shaders"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 xctx-core = { path = "../xctx-core" }
+xctx-layout = { path = "../xctx-layout" }
+xctx-term = { path = "../xctx-term" }
+xctx-term-view = { path = "../xctx-term-view" }
+xctx-ui = { path = "../xctx-ui" }
+
+[dev-dependencies]
+tempfile = "3"
