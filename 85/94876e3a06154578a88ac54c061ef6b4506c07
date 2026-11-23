@@ -1,0 +1,38 @@
+crates/xctx-term-view/src/lib.rs
+  s_d0fea25f51315e::t_5c82cef3e5bead 13
+  s_d0fea25f51315e::t_dd98938e86ff87 1-12,14
+crates/xctx-term-view/src/keys.rs
+  s_d0fea25f51315e::t_8c4bb18a3af05b 1-140,145-235
+  s_d0fea25f51315e::t_5c82cef3e5bead 141-144
+crates/xctx-term-view/src/view.rs
+  s_d0fea25f51315e::t_5c82cef3e5bead 181,333-338,519-521,651-654,670-676,693-698,707-710,792-793
+  s_d0fea25f51315e::t_983615c38b8074 604,610-617,626,728,761-762,768,771,773,781-785,787,789,795,799-803,810,814,816-818,835-840,842-844
+  s_d0fea25f51315e::t_fe30629f47b8df 412,442-448,450-457
+  s_d0fea25f51315e::t_dd98938e86ff87 798
+  s_d0fea25f51315e::t_6c755b50d65e2c 1-180,182-332,339-411,413-441,449,458-518,522-603,605-609,618-625,627-650,655-669,677-692,699-706,711-727,729-760,763-767,769-770,772,774-780,786,788,790-791,794,796-797,804-809,811-813,815,819-834,841,845-920
+crates/xctx-term-view/src/theme.rs
+  s_d0fea25f51315e::t_e7451c5aeffb09 1-276
+crates/xctx-term-view/Cargo.toml
+  s_d0fea25f51315e::t_7c627166e71937 1-10
+crates/xctx-term-view/src/grid.rs
+  s_d0fea25f51315e::t_4e395b887ee665 1-333,339-375,379-427,432-433,438-452,468-479,485-521,530-543,548-561,568-609
+  s_d0fea25f51315e::t_5c82cef3e5bead 334-338,376-378,428-431,434-437,453-467,480-484,522-529,544-547,562-567
+Cargo.lock
+  s_d0fea25f51315e::t_1aa02b07d7a3f3 5773-5781
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "8594876e3a06154578a88ac54c061ef6b4506c07",
+  "prompts": {},
+  "sessions": {
+    "s_d0fea25f51315e": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20a34-bd33-748e-95fb-098d500fca48",
+        "model": "claude-opus-5.5"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
