@@ -1,0 +1,11 @@
+[package]
+name = "xctx-term"
+version.workspace = true
+edition.workspace = true
+description = "Terminal session backend for xctx: PTY, emulation, grid snapshots, input encoding, selection"
+
+[dependencies]
+alacritty_terminal = { version = "0.26.0", default-features = false }
+bitflags = "2"
+libc = "0.2"
+polling = "3"
