@@ -1,0 +1,39 @@
+Cargo.lock
+  s_454cbc0ae53d08::t_afecd83e0d60e5 45-68,1279-1284,3212-3220,4478-4488,4871-4880,5971-5983,6823,6826-6829
+crates/xctx-term/Cargo.toml
+  s_454cbc0ae53d08::t_98a5529ab7d315 1-11
+crates/xctx-term/src/config.rs
+  s_454cbc0ae53d08::t_be55cf1e2c1175 1-142
+crates/xctx-term/src/emulator.rs
+  s_454cbc0ae53d08::t_58f43dc7f72747 1-978
+crates/xctx-term/src/error.rs
+  s_454cbc0ae53d08::t_70cac5bf74ffce 1-60
+crates/xctx-term/src/input.rs
+  s_454cbc0ae53d08::t_6b49b88bb6ad6a 1-1055
+crates/xctx-term/src/lib.rs
+  s_454cbc0ae53d08::t_b451b4bdfa82b7 1-26
+crates/xctx-term/src/pty.rs
+  s_454cbc0ae53d08::t_df28a0b3e334cf 1-228
+crates/xctx-term/src/session.rs
+  s_454cbc0ae53d08::t_e520e6fe22f654 1-449
+crates/xctx-term/src/snapshot.rs
+  s_454cbc0ae53d08::t_f063f7b94878d0 1-457
+crates/xctx-term/tests/session.rs
+  s_454cbc0ae53d08::t_a53c44848ca886 1-290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "1bd8416719f0ded6cd9639ffcf018ed5b3429de8",
+  "prompts": {},
+  "sessions": {
+    "s_454cbc0ae53d08": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20a12-24fe-707c-a4e1-c5c56bedc009",
+        "model": "gemini-4-neon"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
