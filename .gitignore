@@ -1,3 +1,4 @@
 .build/
 xctx.app/
 PixelWorkspace.app/
+.DS_Store
