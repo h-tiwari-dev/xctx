@@ -1,0 +1,37 @@
+Cargo.lock
+  s_454cbc0ae53d08::t_01985c1bb76c59 76,131-139,155-166,386-391,419,468-478,493-496,574-597,648-653,666-671,723-733,748-774,786-810,866-874,927-932,975-983,993-1027,1047-1055,1121,1410-1415,1456-1461,1581-1593,1714,1775,1789,1797,1807,1817-1818,1820,1837,1844,1884,1957,2063,2091,2250,2462,2519-2527,2951,2963,3462-3467,3493-3502,3585-3619,3669-3696,3737-3742,3773-3787,3857-3889,3905-3910,3968-3977,4016-4030,4059,4073,4087,4169,4333-4344,4568,4897,4924-4932,4939-4950,4973,5034-5043,5209-5214,5392-5400,5587,5679,5812,6223,6245,6249
+crates/xctx-ui/Cargo.toml
+  s_454cbc0ae53d08::t_4a9e8a78cbb2a2 1-11
+crates/xctx-ui/src/components.rs
+  s_454cbc0ae53d08::t_c72073defc8dff 1-403
+crates/xctx-ui/src/lib.rs
+  s_454cbc0ae53d08::t_fb0c51656c7390 1-22
+crates/xctx-ui/src/prompt.rs
+  s_454cbc0ae53d08::t_0c27c704d75eb6 1-874
+crates/xctx-ui/src/split_view.rs
+  s_454cbc0ae53d08::t_44ae9079374618 1-608
+crates/xctx-ui/src/status_bar.rs
+  s_454cbc0ae53d08::t_fc355d16300317 1-330
+crates/xctx-ui/src/tab_bar.rs
+  s_454cbc0ae53d08::t_3ccc066915a17b 1-343
+crates/xctx-ui/src/theme.rs
+  s_454cbc0ae53d08::t_72bf96e5427379 1-263
+crates/xctx-ui/tests/render.rs
+  s_454cbc0ae53d08::t_a2644a2169e8d2 1-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "23cf5812f74876e78c2e9ec3a8d602be649e0c45",
+  "prompts": {},
+  "sessions": {
+    "s_454cbc0ae53d08": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20a12-24fe-707c-a4e1-c5c56bedc009",
+        "model": "gemini-4-neon"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
