@@ -5771,6 +5771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xctx-term-view"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "gpui",
+ "xctx-term",
+]
+
+[[package]]
 name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,10 @@
+[package]
+name = "xctx-term-view"
+version.workspace = true
+edition.workspace = true
+description = "GPUI view for an xctx-term session: grid rendering, keyboard, mouse, selection, clipboard and resize"
+
+[dependencies]
+futures = "0.3"
+gpui = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3" }
+xctx-term = { path = "../xctx-term" }
