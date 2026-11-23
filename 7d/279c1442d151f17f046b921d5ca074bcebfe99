@@ -1,0 +1,21 @@
+docs/m1.md
+  s_34ff316a6db202::t_c243dccf411a51 1-45
+AGENTS.md
+  s_34ff316a6db202::t_d263b9bbd4c088 1-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "7d279c1442d151f17f046b921d5ca074bcebfe99",
+  "prompts": {},
+  "sessions": {
+    "s_34ff316a6db202": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a209de-b15f-7684-988c-9ba95d1a4094",
+        "model": "claude-fable-5.2"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
