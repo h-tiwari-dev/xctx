@@ -1,0 +1,28 @@
+crates/xctx/src/control.rs
+  s_454cbc0ae53d08::t_b7b3c32fce702a 371,593
+  s_454cbc0ae53d08::t_a5e95f2af29f2a 1238-1241
+docs/roadmap.md
+  s_454cbc0ae53d08::t_6f34108ac9392a 31
+docs/m3.md
+  s_454cbc0ae53d08::t_9a83ab5a29b9dc 3
+crates/xctx/src/workspace.rs
+  s_454cbc0ae53d08::t_25a1431cfb7155 561
+crates/xctx/src/space_graph.rs
+  s_454cbc0ae53d08::t_a70ac71afbec2b 232-234,524-525,530,537,993,1007-1009
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "58fa701c783e14740dbf13fe4bd4f4a99b1cee2b",
+  "prompts": {},
+  "sessions": {
+    "s_454cbc0ae53d08": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20a12-24fe-707c-a4e1-c5c56bedc009",
+        "model": "gemini-4-neon"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
