@@ -1,5 +1,7 @@
 //! The Ship and Discard confirmations shown over a space, the ship summary, and the background jobs they run.
 
+use std::time::Duration;
+
 use gpui::{
     AnyElement, Context, Entity, Focusable, FontWeight, IntoElement, ParentElement, Styled, Window,
     div, hsla, prelude::*,
@@ -336,14 +338,14 @@ impl Workspace {
                     return;
                 }
             }
-            let store = this.update(cx, |this, cx| {
+            let store_and_sessions = this.update(cx, |this, cx| {
                 // Save the layout while the store is here: once it is taken, closing the tab would drop the save.
                 this.persist(&id, cx);
                 let store = this.take_store(&busy, cx)?;
-                this.close_space_tab(&id, cx);
-                Some(store)
+                let sessions = this.close_space_tab(&id, cx);
+                Some((store, sessions))
             });
-            let Ok(Some(mut store)) = store else {
+            let Ok(Some((mut store, sessions))) = store_and_sessions else {
                 let _ = this.update(cx, |this, cx| {
                     this.in_flight_spaces.remove(&id);
                     this.fail_job(
@@ -355,9 +357,23 @@ impl Workspace {
                 });
                 return;
             };
+            let space_id_for_err = id.clone();
             let (store, result) = executor
                 .spawn(async move {
-                    let result = job(&mut store);
+                    let mut all_exited = true;
+                    for session in &sessions {
+                        if !session.shutdown_and_wait(Duration::from_secs(2)) {
+                            all_exited = false;
+                        }
+                    }
+                    drop(sessions);
+                    let result = if all_exited {
+                        job(&mut store).map_err(JobError::from)
+                    } else {
+                        Err(JobError::Failed(format!(
+                            "a terminal in {space_id_for_err} did not exit in time"
+                        )))
+                    };
                     (store, result)
                 })
                 .await;
@@ -366,7 +382,7 @@ impl Workspace {
                 if result.is_ok() {
                     // The tab was closed before the job; close it again in case anything reopened it since. The
                     // store is still away, so no layout is saved for a space that is gone.
-                    this.close_space_tab(&id, cx);
+                    let _ = this.close_space_tab(&id, cx);
                 }
                 this.return_store(store, cx);
                 match result {
@@ -386,7 +402,7 @@ impl Workspace {
                         } else {
                             this.open_space(&id, window, cx);
                         }
-                        this.fail_job(&id, JobError::from(e), action, cx);
+                        this.fail_job(&id, e, action, cx);
                     }
                 }
                 cx.notify();

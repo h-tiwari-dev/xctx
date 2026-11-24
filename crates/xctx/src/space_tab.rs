@@ -2,6 +2,7 @@
 //! panes, split, close, focus, resize, zoom, reshape, persist) and how it is drawn.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
@@ -10,6 +11,7 @@ use gpui::{
 };
 use xctx_core::{Space, SpaceId, SpaceShape};
 use xctx_layout::{FocusDirection, PaneId, PaneKind, PaneRole, RolePane, Shape, SplitAxis};
+use xctx_term::TerminalSession;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
 use xctx_ui::{PaneView, SplitView, Theme, pane_kind_label};
 
@@ -537,19 +539,39 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Stop every terminal of the space and close its tab, after saving its layout. Shows Home if the space was
-    /// shown.
-    pub(crate) fn close_space_tab(&mut self, id: &SpaceId, cx: &mut Context<Self>) {
+    /// Stop every terminal of the space and close its tab, after saving its layout. Returns the
+    /// live terminal sessions so a caller (such as Ship or Discard) can wait for them to exit
+    /// before removing worktrees. Shows Home if the space was shown.
+    pub(crate) fn close_space_tab(
+        &mut self,
+        id: &SpaceId,
+        cx: &mut Context<Self>,
+    ) -> Vec<Arc<TerminalSession>> {
         if self.tabs.contains_key(id) {
             self.persist(id, cx);
         }
-        self.tabs.remove(id);
+        let sessions = self
+            .tabs
+            .remove(id)
+            .map(|tab| {
+                tab.terminals
+                    .into_values()
+                    .filter_map(|terminal| match terminal {
+                        PaneTerminal::Running { view, .. } => {
+                            Some(Arc::clone(view.read(cx).session()))
+                        }
+                        PaneTerminal::Failed(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.pending_persist.remove(id);
         self.pending_drag_saves.remove(id);
         if self.view == View::Space(id.clone()) {
             self.view = View::Home;
         }
         cx.notify();
+        sessions
     }
 
     /// The split view of the space being shown.
