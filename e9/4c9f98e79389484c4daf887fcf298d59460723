@@ -1,0 +1,25 @@
+README.md
+  s_454cbc0ae53d08::t_654b708c30d04a 7,9-10,13-14,16,18
+crates/xctx/src/control.rs
+  s_454cbc0ae53d08::t_b645f44a22f6e9 356-358,432-434,443-445
+docs/m2.md
+  s_454cbc0ae53d08::t_1a2c2c5972b593 3,106-111,114-116,119-123
+docs/roadmap.md
+  s_454cbc0ae53d08::t_2443adf278156a 21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "e94c9f98e79389484c4daf887fcf298d59460723",
+  "prompts": {},
+  "sessions": {
+    "s_454cbc0ae53d08": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20a12-24fe-707c-a4e1-c5c56bedc009",
+        "model": "gemini-4-neon"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
