@@ -1,7 +1,8 @@
 # Working in this repo
 
-xctx is a native macOS agent multiplexer written in Rust with GPUI. The vision is in `design/README.md`; the current
-milestone and what each crate owns are in `docs/m1.md`. Read both before changing anything.
+xctx is a native macOS agent multiplexer written in Rust with GPUI. The vision is in `design/README.md`, the multi-milestone
+plan is in `docs/roadmap.md`, and the active milestone (Milestone 2; Milestone 1 is complete in `docs/m1.md`) is in
+`docs/m2.md`. Read these before changing anything.
 
 ## Commands
 

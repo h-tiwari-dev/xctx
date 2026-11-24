@@ -2,7 +2,7 @@
 
 xctx is an agent multiplexer for macOS: a native desktop app built with Rust and GPUI where you describe a task and it opens a space with a worktree per repo, agents, shells, and plugin panes. See [`design/README.md`](design/README.md) for the full vision.
 
-**Status:** This repository is currently a skeleton. It opens a single GPUI window titled `xctx` with placeholder content; spaces, panes, harness, git, and indexing are not implemented yet.
+**Status:** Milestone 1 is complete — Home, repo indexing & task drafting, per-space git worktrees & `mise.<slug>.toml`, truecolor PTY terminal (`pi`, `nvim`, `lazygit`), split/zoom/reshape panes (`Dev`/`Debug`/`Review`), layout persistence & agent resume (`pi --continue`), and Ship/Discard all work end-to-end. See [`docs/roadmap.md`](docs/roadmap.md) and [`docs/m2.md`](docs/m2.md) for what comes next.
 
 ## Prerequisites
 
