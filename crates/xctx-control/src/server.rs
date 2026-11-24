@@ -222,7 +222,17 @@ impl Drop for Server {
         if ours {
             let _ = fs::remove_file(&self.path);
         }
+        unlock_socket(&self._lock);
     }
+}
+
+/// Release the socket lock explicitly rather than only by closing the file. A `flock` belongs to the open file,
+/// which a child process forked by another thread (a pane starting, say) shares until it execs; unlocking frees
+/// it for every copy, so a server binding right after this one stops is not refused.
+fn unlock_socket(lock: &File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the fd belongs to `lock`, which stays open for the duration of the call.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
 }
 
 /// The lock file that guards the socket at `path`: the same path with `.lock` appended.

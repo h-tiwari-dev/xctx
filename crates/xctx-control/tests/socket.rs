@@ -22,6 +22,21 @@ use xctx_layout::{PaneId, Shape, SplitAxis};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// Leave a socket file at `path` that nothing listens on, as a crashed window does. A child process another
+/// test forks can hold the dropped listener open until it execs, so wait until connecting is refused.
+fn stale_socket(path: &Path) -> std::io::Result<()> {
+    drop(UnixListener::bind(path)?);
+    for _ in 0..500 {
+        if UnixStream::connect(path).is_err() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(std::io::Error::other(
+        "the dropped listener never went away",
+    ))
+}
+
 fn temp() -> std::io::Result<(tempfile::TempDir, PathBuf)> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("control.sock");
@@ -326,7 +341,7 @@ fn a_live_socket_is_not_taken_over_but_a_stale_one_is() -> TestResult {
     drop(first);
 
     // A socket file nothing listens on, as a crashed window leaves behind.
-    drop(UnixListener::bind(&path)?);
+    stale_socket(&path)?;
     assert!(path.exists());
     let _second = serve(&path)?;
     assert!(Client::connect(&path)?.ping().is_ok());
@@ -353,7 +368,7 @@ fn two_servers_binding_at_once_leave_one_running_and_refuse_the_other() -> TestR
     for _ in 0..20 {
         let (_dir, path) = temp()?;
         // A stale socket both will want to clear.
-        drop(UnixListener::bind(&path)?);
+        stale_socket(&path)?;
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let racers: Vec<_> = (0..2)
             .map(|_| {
@@ -392,7 +407,7 @@ fn a_held_lock_refuses_to_bind_without_touching_the_socket() -> TestResult {
     assert!(path.with_file_name("control.sock.lock").exists());
     // The holder's socket is gone and a stale one sits in its place; a second server must leave it alone.
     std::fs::remove_file(&path)?;
-    drop(UnixListener::bind(&path)?);
+    stale_socket(&path)?;
     let before = std::fs::symlink_metadata(&path)?;
     assert!(matches!(serve(&path), Err(ControlError::AlreadyRunning(_))));
     let after = std::fs::symlink_metadata(&path)?;
