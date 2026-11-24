@@ -11,6 +11,7 @@ pub mod index;
 pub mod mise;
 pub mod mise_env;
 pub mod pi_session;
+pub mod prototype;
 pub mod redact;
 pub mod space;
 pub mod store;

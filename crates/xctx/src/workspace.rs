@@ -146,10 +146,11 @@ impl Focusable for Workspace {
 impl Workspace {
     /// The workspace over the store in the default data directory, with its active spaces as tabs.
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (store, store_error) = match Store::open_default() {
+        let (mut store, store_error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
             Err(e) => (None, Some(format!("could not open the xctx store: {e}"))),
         };
+        let imported = store.as_mut().and_then(import_prototype_spaces);
         let data_dir = store
             .as_ref()
             .map(|store| store.dir().to_path_buf())
@@ -274,6 +275,9 @@ impl Workspace {
         workspace.start_parent_agent(window, cx);
         if let Some(e) = workspace.inbox_error.clone() {
             workspace.error(e, cx);
+        }
+        if let Some(message) = imported {
+            workspace.info(message, cx);
         }
         workspace.refresh_spaces();
         workspace.check_mise_at_startup(cx);
@@ -701,6 +705,34 @@ impl Render for Workspace {
                     .children(dialog),
             )
             .child(self.render_status_bar(cx))
+    }
+}
+
+/// Bring in the spaces of the Swift prototype (PixelWorkspace) on the real data directory, once: spaces already
+/// in the store are skipped. Nothing happens when `XCTX_DATA_DIR` moves the data directory (tests and throwaway
+/// runs). Returns what to tell the user, if anything.
+fn import_prototype_spaces(store: &mut Store) -> Option<String> {
+    if std::env::var_os(xctx_core::store::DATA_DIR_ENV).is_some_and(|d| !d.is_empty()) {
+        return None;
+    }
+    let path = xctx_core::prototype::prototype_store_path(std::env::var_os("HOME"))?;
+    match xctx_core::prototype::import_prototype(store, &path) {
+        Ok(report) if !report.imported.is_empty() => {
+            let names: Vec<&str> = report.imported.iter().map(|id| id.as_str()).collect();
+            Some(format!(
+                "imported {} from the PixelWorkspace prototype: {}",
+                if names.len() == 1 {
+                    "a space".to_owned()
+                } else {
+                    format!("{} spaces", names.len())
+                },
+                names.join(", ")
+            ))
+        }
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "could not import the PixelWorkspace prototype's spaces: {e}"
+        )),
     }
 }
 
