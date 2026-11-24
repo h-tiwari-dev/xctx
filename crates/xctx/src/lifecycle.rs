@@ -96,8 +96,14 @@ pub struct LaunchedSpace {
 
 /// Launch `draft` (worktrees, mise files, the space in the store) and save its first layout. Fails, with nothing
 /// left behind, when the launch fails. A layout that cannot be saved is a warning, since the worktrees exist.
-pub fn launch_space(store: &mut Store, draft: SpaceDraft) -> Result<LaunchedSpace, String> {
-    let space = xctx_core::launch(store, draft).map_err(|e| format!("launch failed: {e}"))?;
+/// The space's `PORT` avoids the active spaces' ports and `attempt_ports` (those live attempts hold).
+pub fn launch_space(
+    store: &mut Store,
+    draft: SpaceDraft,
+    attempt_ports: Vec<u16>,
+) -> Result<LaunchedSpace, String> {
+    let space = xctx_core::launch_avoiding(store, draft, attempt_ports)
+        .map_err(|e| format!("launch failed: {e}"))?;
     let (layout, panes) = SpaceLayout::launch(layout_shape(space.shape), &repo_names(&space))
         .map_err(|e| format!("launched {} but could not lay it out: {e}", space.id))?;
     let warning = save_layout(store, &space.id, &layout).err();

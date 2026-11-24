@@ -2,7 +2,7 @@
 //! and the fork, adopt and discard jobs, run in the background the way Ship and Discard are.
 //!
 //! What the attempt UI calls:
-//! - [`Workspace::fork_attempts`] to fork a writer (the fork dialog and an approved Inbox proposal);
+//! - [`Workspace::fork_attempts_then`] to fork a writer (the fork dialog and an approved Inbox proposal);
 //! - [`Workspace::adopt_attempt`] and [`Workspace::discard_attempt`] from the review sheet;
 //! - [`Workspace::attempt_terminal`] for the terminal to show when the attempt strip switches to an attempt, and
 //!   [`Workspace::attempt_set`] for the records the strip and the review sheet are drawn from.
@@ -28,7 +28,7 @@ use crate::attempts::{
 use crate::space_graph::{agent_role_name, graph_error, scratch_dir_for};
 use crate::space_tab::PaneTerminal;
 use crate::spawn::{AgentStart, AttemptPane, PaneAgent, attempt_launch, pane_worktree};
-use crate::workspace::{Workspace, in_flight_message};
+use crate::workspace::{Workspace, in_flight_message, wait_message};
 
 /// How long a stopped attempt's agent gets to exit before its worktree is removed.
 const ATTEMPT_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -135,15 +135,11 @@ impl Workspace {
     // ---------------------------------------------------------------------------------------------------------
     // Attempt terminals
 
-    // The attempt UI (fork dialog, attempt strip, review sheet) calls this; it lands with the Wave 3 UI.
-    #[allow(dead_code)]
     /// The attempts of space `id`, loading them on first use: what the attempt strip and review sheet show.
     pub(crate) fn attempt_set(&mut self, id: &SpaceId) -> Result<&AttemptSet, String> {
         self.attempts.load(id)
     }
 
-    // The attempt UI (fork dialog, attempt strip, review sheet) calls this; it lands with the Wave 3 UI.
-    #[allow(dead_code)]
     /// The agent terminal of attempt `number` of open space `id`, once it has started.
     pub(crate) fn attempt_terminal(
         &self,
@@ -348,43 +344,35 @@ impl Workspace {
     // ---------------------------------------------------------------------------------------------------------
     // Fork
 
-    // The attempt UI (fork dialog, attempt strip, review sheet) calls this; it lands with the Wave 3 UI.
-    #[allow(dead_code)]
     /// Fork the writer `agent` of space `id` into one attempt per entry of `instructions` (each optionally told
     /// what to try), in the background: worktrees from a snapshot of the writer's, a `PORT` each, a copy of the
-    /// space's scratch folder, and an agent forked from the writer's session. Refused, with the reason shown,
-    /// while another job has the store or the space. Returns whether the job started.
-    pub(crate) fn fork_attempts(
-        &mut self,
-        id: &SpaceId,
-        agent: &AgentNodeId,
-        instructions: Vec<Option<String>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.fork_attempts_then(id, agent, instructions, |_, _, _| {}, window, cx)
-    }
-
-    /// [`Workspace::fork_attempts`], then `done` with whether the attempts were forked (it is not called when the
-    /// job did not start).
+    /// space's scratch folder, and an agent forked from the writer's session. Then call `done` with whether the
+    /// attempts were forked, or why not (it is not called when the job did not start). Refused, with the reason
+    /// returned, while another job has the store or the space. Every failure is also shown in the status bar.
     pub(crate) fn fork_attempts_then(
         &mut self,
         id: &SpaceId,
         agent: &AgentNodeId,
         instructions: Vec<Option<String>>,
-        done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
+        done: impl FnOnce(&mut Self, Result<(), String>, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Result<(), String> {
         let prep = match self.prepare_fork(id, agent, instructions) {
             Ok(prep) => prep,
             Err(e) => {
-                self.error(e, cx);
-                return false;
+                self.error(e.clone(), cx);
+                return Err(e);
             }
         };
+        let why_no_store = self
+            .busy
+            .as_deref()
+            .map(wait_message)
+            .or_else(|| self.store_error.clone())
+            .unwrap_or_else(|| "the store is not available".to_owned());
         let Some(store) = self.take_store(&format!("forking attempts of {id}"), cx) else {
-            return false;
+            return Err(why_no_store);
         };
         let mut taken: Vec<u16> = store.port_allocations().into_keys().collect();
         let spaces: Vec<SpaceId> = self.spaces.iter().map(|s| s.id.clone()).collect();
@@ -393,8 +381,8 @@ impl Workspace {
             Ok(ports) => ports,
             Err(e) => {
                 self.return_store(store, cx);
-                self.error(e, cx);
-                return false;
+                self.error(e.clone(), cx);
+                return Err(e);
             }
         };
         self.attempt_jobs.insert(id.clone());
@@ -429,20 +417,19 @@ impl Workspace {
                 let forked = match result {
                     Ok(worktrees) => this.record_forked(&id, &plan, worktrees, &source, window, cx),
                     Err(e) => {
-                        this.error(
-                            format!("could not fork attempts of {} in {id}: {e}", plan.agent),
-                            cx,
-                        );
-                        false
+                        let message =
+                            format!("could not fork attempts of {} in {id}: {e}", plan.agent);
+                        this.error(message.clone(), cx);
+                        Err(message)
                     }
                 };
-                done(this, forked, cx);
+                done(this, forked, window, cx);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
-        true
+        Ok(())
     }
 
     /// Check a fork of `agent` in `id` and plan it: the agent must be a writer with a `pi` session to fork.
@@ -500,8 +487,8 @@ impl Workspace {
     }
 
     /// The worktrees of a fork were made: record them, then start their agents (opening the space's tab when it
-    /// is not open, which starts them). When they cannot be recorded, they are removed again. Returns whether
-    /// the attempts were recorded.
+    /// is not open, which starts them). When they cannot be recorded, they are removed again, and the reason is
+    /// returned (and shown).
     fn record_forked(
         &mut self,
         id: &SpaceId,
@@ -510,7 +497,7 @@ impl Workspace {
         source: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Result<(), String> {
         let at = now();
         let made = self.attempts.change(id, |set| {
             set.record_fork(plan, worktrees.clone(), source, at)
@@ -518,7 +505,8 @@ impl Workspace {
         let made = match made {
             Ok(made) => made,
             Err(e) => {
-                self.error(format!("could not record the attempts of {id}: {e}"), cx);
+                let message = format!("could not record the attempts of {id}: {e}");
+                self.error(message.clone(), cx);
                 let slug = id.as_str().to_owned();
                 cx.background_executor()
                     .spawn(async move {
@@ -527,7 +515,7 @@ impl Workspace {
                         }
                     })
                     .detach();
-                return false;
+                return Err(message);
             }
         };
         if self.tabs.contains_key(id) {
@@ -543,7 +531,7 @@ impl Workspace {
             format!("Forked {count} {noun} of {} in {id}", plan.agent),
             cx,
         );
-        true
+        Ok(())
     }
 
     /// Approve the attempt proposal in Inbox item `item`: fork the attempts it asks for, and mark it approved
@@ -575,9 +563,9 @@ impl Workspace {
             &proposal.space,
             &AgentNodeId::new(proposal.agent.clone()),
             instructions,
-            move |this, forked, cx| {
+            move |this, forked, _window, cx| {
                 this.widen_approvals.remove(&approved);
-                if forked
+                if forked.is_ok()
                     && let Some(inbox) = this.inbox.as_mut()
                     && let Err(e) = inbox.approve(&approved)
                 {
@@ -587,7 +575,7 @@ impl Workspace {
             window,
             cx,
         );
-        if !started {
+        if started.is_err() {
             self.widen_approvals.remove(&item);
         }
         cx.notify();
@@ -596,21 +584,21 @@ impl Workspace {
     // ---------------------------------------------------------------------------------------------------------
     // Adopt and discard
 
-    // The attempt UI (fork dialog, attempt strip, review sheet) calls this; it lands with the Wave 3 UI.
-    #[allow(dead_code)]
-    /// Adopt attempt `number` of space `id`: merge its work into the space's branch in the background (refused,
-    /// changing nothing, when the space changed since the fork or the merge would conflict; the reason is shown
-    /// as git and xctx give it), mark it adopted, stop its agent and remove its worktree, and continue the
-    /// writer's pane from the winning session (`pi --fork <winner> --session-id xctx-<slug>-<agent>-adopted-<n>`
-    /// in the space's worktree). The other attempts stay for the user to discard. Returns whether the job
-    /// started.
+    /// Adopt attempt `number` of space `id` in the background: stop its agent and wait for it to exit, so the
+    /// snapshot holds all its work, then merge that work into the space's branch (refused, changing nothing, when
+    /// the space changed since the fork or the merge would conflict; the reason is given as git and xctx word it,
+    /// and the agent starts again). Then mark it adopted, remove its worktree, and continue the writer's pane
+    /// from the winning session (`pi --fork <winner> --session-id xctx-<slug>-<agent>-adopted-<n>` in the
+    /// space's worktree). The other attempts stay for the user to discard. When the job ends, the review sheet
+    /// hears how (see [`Workspace::attempt_job_done`]). Returns why it did not start, if it did not; every
+    /// failure is also shown in the status bar.
     pub(crate) fn adopt_attempt(
         &mut self,
         id: &SpaceId,
         number: u32,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Result<(), String> {
         let prepared = self.attempt_job_refusal(id).map_or_else(
             || {
                 let space = self
@@ -629,19 +617,26 @@ impl Workspace {
         let (space, attempt) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
-                self.error(e, cx);
-                return false;
+                self.error(e.clone(), cx);
+                return Err(e);
             }
         };
         self.attempt_jobs.insert(id.clone());
+        // Its agent stops first: work it wrote during the merge would not be in the snapshot and would be lost.
+        let session = self.stop_attempt_terminal(id, number, cx);
         let executor = cx.background_executor().clone();
         let id = id.clone();
         cx.spawn_in(window, async move |this, cx| {
             let worktree = attempt.worktree.clone();
             let result = executor
-                .spawn(async move { xctx_core::adopt_attempt(&space, &worktree) })
+                .spawn(async move {
+                    if !stop_and_wait(session) {
+                        return Err("its agent did not exit in time".to_owned());
+                    }
+                    xctx_core::adopt_attempt(&space, &worktree).map_err(|e| e.to_string())
+                })
                 .await;
-            let session = this.update(cx, |this, cx| match result {
+            let report = this.update_in(cx, |this, window, cx| match result {
                 Ok(report) => {
                     let marked = this
                         .attempts
@@ -652,25 +647,27 @@ impl Workspace {
                             cx,
                         );
                     }
-                    Some((report, this.stop_attempt_terminal(&id, number, cx)))
+                    Some(report)
                 }
                 Err(e) => {
                     this.attempt_jobs.remove(&id);
-                    this.error(format!("could not adopt attempt {number} of {id}: {e}"), cx);
+                    let message = format!("could not adopt attempt {number} of {id}: {e}");
+                    this.error(message.clone(), cx);
+                    // Nothing was merged: its agent carries on.
+                    if this.tabs.contains_key(&id) {
+                        this.spawn_attempt_terminal(&id, &attempt, window, cx);
+                    }
+                    this.attempt_job_done(&id, number, Err(message), window, cx);
                     None
                 }
             });
-            let Ok(Some((report, session))) = session else {
+            let Ok(Some(report)) = report else {
                 return;
             };
             let slug = id.as_str().to_owned();
             let worktree = attempt.worktree.clone();
             let removed = executor
-                .spawn(async move {
-                    // The attempt is merged; its worktree goes even if its agent is slow to exit.
-                    let _ = stop_and_wait(session);
-                    remove_attempt(&slug, &worktree)
-                })
+                .spawn(async move { remove_attempt(&slug, &worktree) })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attempt_jobs.remove(&id);
@@ -702,12 +699,13 @@ impl Workspace {
                     format!("Adopted attempt {number} into {id} ({how}){rest}"),
                     cx,
                 );
+                this.attempt_job_done(&id, number, Ok(()), window, cx);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
-        true
+        Ok(())
     }
 
     /// After `attempt` was adopted: its writer runs `xctx-<slug>-<agent>-adopted-<n>` from now on, forked from the
@@ -763,18 +761,17 @@ impl Workspace {
         self.spawn_pane(id, &pane, &AgentStart::Continue, window, cx);
     }
 
-    // The attempt UI (fork dialog, attempt strip, review sheet) calls this; it lands with the Wave 3 UI.
-    #[allow(dead_code)]
     /// Discard attempt `number` of space `id`: stop its agent and wait for it to exit, then remove its worktree,
     /// branch, mise file and scratch folder in the background, and mark it discarded. When removing fails, its
-    /// agent starts again. Returns whether the job started.
+    /// agent starts again. When the job ends, the review sheet hears how (see [`Workspace::attempt_job_done`]).
+    /// Returns why it did not start, if it did not; every failure is also shown in the status bar.
     pub(crate) fn discard_attempt(
         &mut self,
         id: &SpaceId,
         number: u32,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Result<(), String> {
         let prepared = self.attempt_job_refusal(id).map_or_else(
             || {
                 let attempt = self
@@ -796,8 +793,8 @@ impl Workspace {
         let attempt = match prepared {
             Ok(attempt) => attempt,
             Err(e) => {
-                self.error(e, cx);
-                return false;
+                self.error(e.clone(), cx);
+                return Err(e);
             }
         };
         self.attempt_jobs.insert(id.clone());
@@ -817,33 +814,38 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attempt_jobs.remove(&id);
-                match result {
+                let outcome = match result {
                     Ok(()) => {
                         match this
                             .attempts
                             .change(&id, |set| set.mark_discarded(number, now()).map(|_| ()))
                         {
-                            Ok(()) => this.info(format!("Discarded attempt {number} of {id}"), cx),
+                            Ok(()) => {
+                                this.info(format!("Discarded attempt {number} of {id}"), cx);
+                                Ok(())
+                            }
                             Err(e) => {
-                                this.error(format!("removed attempt {number} of {id}, but {e}"), cx)
+                                let message = format!("removed attempt {number} of {id}, but {e}");
+                                this.error(message.clone(), cx);
+                                Err(message)
                             }
                         }
                     }
                     Err(e) => {
-                        this.error(
-                            format!("could not discard attempt {number} of {id}: {e}"),
-                            cx,
-                        );
+                        let message = format!("could not discard attempt {number} of {id}: {e}");
+                        this.error(message.clone(), cx);
                         if this.tabs.contains_key(&id) {
                             this.spawn_attempt_terminal(&id, &attempt, window, cx);
                         }
+                        Err(message)
                     }
-                }
+                };
+                this.attempt_job_done(&id, number, outcome, window, cx);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
-        true
+        Ok(())
     }
 }

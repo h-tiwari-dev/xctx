@@ -52,6 +52,10 @@ actions!(
         LaunchDraft,
         /// Close the open dialog.
         DismissDialog,
+        /// Open the fork dialog for the focused writer of the space being shown (or its only writer).
+        ForkAttempts,
+        /// Open the review sheet on the latest round of attempts of the space being shown.
+        ReviewAttempts,
     ]
 );
 
@@ -86,6 +90,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-ctrl-down", ResizeDown, ws),
         KeyBinding::new("cmd-shift-z", ToggleZoom, ws),
         KeyBinding::new("cmd-g", ToggleGraph, ws),
+        KeyBinding::new("cmd-shift-f", ForkAttempts, ws),
+        KeyBinding::new("cmd-shift-r", ReviewAttempts, ws),
         KeyBinding::new("cmd-0", ShowHome, ws),
         KeyBinding::new("cmd-enter", LaunchDraft, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
@@ -105,6 +111,8 @@ pub fn space_key_hints() -> Vec<KeyHint> {
         KeyHint::new("⌘⌃←→↑↓", "resize"),
         KeyHint::new("⌘⇧Z", "zoom"),
         KeyHint::new("⌘G", "graph"),
+        KeyHint::new("⌘⇧F", "fork"),
+        KeyHint::new("⌘⇧R", "review"),
         KeyHint::new("⌘0", "home"),
     ]
 }

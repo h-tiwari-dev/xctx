@@ -24,9 +24,9 @@ use crate::home::HomeDraft;
 use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
-    FocusRight, FocusUp, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight, ResizeUp,
-    ShowHome, SplitDown, SplitRight, ToggleGraph, ToggleZoom, WORKSPACE_CONTEXT, home_key_hints,
-    space_key_hints,
+    FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
+    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph, ToggleZoom,
+    WORKSPACE_CONTEXT, home_key_hints, space_key_hints,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
@@ -655,6 +655,14 @@ impl Render for Workspace {
             .on_action(Self::pane_shortcut::<ToggleGraph>(
                 cx,
                 |this, window, cx| this.toggle_graph(window, cx),
+            ))
+            .on_action(Self::pane_shortcut::<ForkAttempts>(
+                cx,
+                |this, window, cx| this.fork_from_keys(window, cx),
+            ))
+            .on_action(Self::pane_shortcut::<ReviewAttempts>(
+                cx,
+                |this, window, cx| this.open_review(window, cx),
             ))
             .on_action(cx.listener(|this, _: &ShowHome, window, cx| this.show_home(window, cx)))
             .on_action(cx.listener(|this, action: &ActivateTab, window, cx| {

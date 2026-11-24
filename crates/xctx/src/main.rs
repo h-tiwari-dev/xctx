@@ -3,6 +3,7 @@
 
 mod agent_session;
 mod attempt_jobs;
+mod attempt_ui;
 mod attempts;
 mod control;
 mod dialogs;

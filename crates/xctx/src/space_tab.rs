@@ -75,6 +75,9 @@ pub(crate) struct SpaceTab {
     /// The agent terminal of each live attempt, by attempt number. They are not in the layout; the attempt strip
     /// switches to them (see [`Workspace::attempt_terminal`]).
     pub(crate) attempt_terminals: HashMap<u32, PaneTerminal>,
+    /// The attempt whose agent the pane area shows instead of the split view (chosen on the attempt strip), if
+    /// any. The space's own panes keep running meanwhile.
+    pub(crate) shown_attempt: Option<u32>,
 }
 
 impl SpaceTab {
@@ -87,6 +90,7 @@ impl SpaceTab {
             graph_open: false,
             shared_tab: SharedTab::default(),
             attempt_terminals: HashMap::new(),
+            shown_attempt: None,
         }
     }
 }
@@ -315,11 +319,23 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Give keyboard focus to the focused pane's terminal of the space being shown.
+    /// Give keyboard focus to the focused pane's terminal of the space being shown, or to the terminal of the
+    /// attempt it shows instead (see [`SpaceTab::shown_attempt`]).
     pub(crate) fn focus_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else {
             return;
         };
+        if let Some(number) = tab.shown_attempt {
+            match self.attempt_terminal(&tab.space.id, number) {
+                Some(view) => {
+                    let handle = view.focus_handle(cx);
+                    handle.focus(window, cx);
+                }
+                // The hidden panes must not take the keys.
+                None => self.focus_handle.focus(window, cx),
+            }
+            return;
+        }
         let focused = tab.layout.focused();
         match tab.terminals.get(&focused) {
             Some(PaneTerminal::Running { view, .. }) => {
@@ -767,9 +783,10 @@ impl Workspace {
         sessions
     }
 
-    /// The split view of the space being shown, with the agent graph panel beside it when open.
+    /// The pane area of the space being shown (its split view, under the attempt strip when it has attempts),
+    /// with the agent graph panel beside it when open.
     pub(crate) fn render_space(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
-        let split = self.render_split(tab, cx);
+        let split = self.render_space_body(tab, cx);
         if !tab.graph_open {
             return split;
         }
@@ -781,7 +798,8 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_split(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
+    /// The split view of `tab`'s panes.
+    pub(crate) fn render_split(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
         let panes = tab
             .layout

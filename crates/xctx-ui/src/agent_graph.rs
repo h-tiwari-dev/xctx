@@ -4,6 +4,7 @@
 //! The panel draws an [`AgentGraph`] the app passes in and reports what the user did through callbacks with the
 //! agent's [`AgentNodeId`] (or the [`HelperKind`] to add). It keeps no state.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{App, FontWeight, SharedString, Window, div, prelude::*, px};
@@ -80,6 +81,7 @@ struct CardHandlers {
     on_resume: Option<NodeHandler>,
     on_talk: Option<NodeHandler>,
     on_remove: Option<NodeHandler>,
+    on_fork: Option<NodeHandler>,
 }
 
 /// The Agent Graph panel: Orchestrator on top, Writers in the middle, Helpers and the add-helper buttons below.
@@ -87,12 +89,14 @@ struct CardHandlers {
 /// Test selectors: `graph-pause-<id>`, `graph-resume-<id>`, `graph-talk-<id>`, `graph-remove-<id>` on each
 /// card's buttons and `graph-add-<kind>` ([`helper_kind_name`]) on the add buttons. Talk appears only for an
 /// agent bound to a pane, and Remove only for helpers: a writer belongs to one of the space's repos and the panel
-/// cannot add it back.
+/// cannot add it back. `graph-fork-<id>` is the "Fork…" button on writers, shown with
+/// [`AgentGraphView::on_fork`], and `graph-note-<id>` a card's note ([`AgentGraphView::notes`]).
 #[derive(IntoElement)]
 pub struct AgentGraphView {
     graph: AgentGraph,
     handlers: CardHandlers,
     on_add_helper: Option<HelperHandler>,
+    notes: HashMap<AgentNodeId, SharedString>,
 }
 
 impl AgentGraphView {
@@ -102,7 +106,24 @@ impl AgentGraphView {
             graph,
             handlers: CardHandlers::default(),
             on_add_helper: None,
+            notes: HashMap::new(),
         }
+    }
+
+    /// Show a "Fork…" button on each writer's card and call `handler` with the writer's id when it is clicked.
+    pub fn on_fork(
+        mut self,
+        handler: impl Fn(&AgentNodeId, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.handlers.on_fork = Some(Rc::new(handler));
+        self
+    }
+
+    /// A small line of text under each named agent's card details, such as a writer's attempt lineage
+    /// ("attempts: #1 adopted, #2 discarded").
+    pub fn notes(mut self, notes: HashMap<AgentNodeId, SharedString>) -> Self {
+        self.notes = notes;
+        self
     }
 
     /// Call `handler` with an agent's id when its Pause button is clicked.
@@ -183,6 +204,7 @@ fn card_button(
 fn agent_card(
     node: &AgentNode,
     handlers: &CardHandlers,
+    note: Option<&SharedString>,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let tone = agent_state_tone(&node.state);
@@ -236,6 +258,25 @@ fn agent_card(
             ButtonVariant::Ghost,
             handlers.on_talk.as_ref(),
         )
+    });
+    let fork = (node.role.is_writer() && handlers.on_fork.is_some()).then(|| {
+        card_button(
+            "fork",
+            "Fork…",
+            node,
+            ButtonVariant::Ghost,
+            handlers.on_fork.as_ref(),
+        )
+    });
+    let note = note.cloned().map(|note| {
+        let selector = format!("graph-note-{}", node.id);
+        div()
+            .debug_selector(move || selector)
+            .min_w_0()
+            .truncate()
+            .text_size(Theme::TEXT_XS)
+            .text_color(theme.text_subtle)
+            .child(note)
     });
     let remove = matches!(node.role, AgentRole::Helper { .. }).then(|| {
         card_button(
@@ -298,6 +339,7 @@ fn agent_card(
                 ),
         )
         .children(reason)
+        .children(note)
         .child(
             div()
                 .flex()
@@ -307,6 +349,7 @@ fn agent_card(
                 .children(pause)
                 .children(resume)
                 .children(talk)
+                .children(fork)
                 .child(div().flex_1())
                 .children(remove),
         )
@@ -345,7 +388,7 @@ impl RenderOnce for AgentGraphView {
         let orchestrator = self
             .graph
             .orchestrator()
-            .map(|node| agent_card(node, handlers, &theme));
+            .map(|node| agent_card(node, handlers, self.notes.get(&node.id), &theme));
 
         let writers: Vec<&AgentNode> = self.graph.writers().collect();
         let contract_links = self
@@ -359,7 +402,9 @@ impl RenderOnce for AgentGraphView {
             if index > 0 && contract_links > 0 {
                 writer_row.push(contract_link(&theme).into_any_element());
             }
-            writer_row.push(agent_card(node, handlers, &theme).into_any_element());
+            writer_row.push(
+                agent_card(node, handlers, self.notes.get(&node.id), &theme).into_any_element(),
+            );
         }
         let contract_badge = (writers.len() > 1 && contract_links > 0).then(|| {
             let text = if contract_links == 1 {
@@ -373,7 +418,7 @@ impl RenderOnce for AgentGraphView {
         let helpers: Vec<_> = self
             .graph
             .helpers()
-            .map(|node| agent_card(node, handlers, &theme))
+            .map(|node| agent_card(node, handlers, self.notes.get(&node.id), &theme))
             .collect();
         let add_buttons = HELPER_KINDS.into_iter().map(|kind| {
             let selector = format!("graph-add-{}", helper_kind_name(kind));

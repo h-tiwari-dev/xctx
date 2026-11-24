@@ -393,6 +393,16 @@ fn launch_repo(
 /// folder name get unique [`SpaceRepo::name`]s. The space is saved to `store` as active. All or nothing: if any step
 /// fails, what was made is removed again and the store is unchanged.
 pub fn launch(store: &mut Store, draft: SpaceDraft) -> Result<Space> {
+    launch_avoiding(store, draft, [])
+}
+
+/// [`launch`], with the space's `PORT` also avoiding `taken_ports`: ports in use that the store does not record,
+/// such as those of competing attempts (see [`Store::allocate_port_avoiding`]).
+pub fn launch_avoiding(
+    store: &mut Store,
+    draft: SpaceDraft,
+    taken_ports: impl IntoIterator<Item = u16>,
+) -> Result<Space> {
     if draft.repos.is_empty() {
         return Err(Error::EmptyDraft);
     }
@@ -424,7 +434,7 @@ pub fn launch(store: &mut Store, draft: SpaceDraft) -> Result<Space> {
     if let Some(e) = lookup_error {
         return Err(e);
     }
-    let port = store.allocate_port()?;
+    let port = store.allocate_port_avoiding(taken_ports)?;
     let mut made: Vec<SpaceRepo> = Vec::new();
     for (draft_repo, main) in &targets {
         match launch_repo(draft_repo, main, &slug, &draft.title, port) {

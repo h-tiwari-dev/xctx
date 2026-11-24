@@ -205,11 +205,14 @@ impl Workspace {
         let Some(mut store) = self.take_store(&format!("launching {}", draft.title), cx) else {
             return false;
         };
+        // The new space's PORT must not be one a live attempt holds.
+        let spaces: Vec<xctx_core::SpaceId> = self.spaces.iter().map(|s| s.id.clone()).collect();
+        let attempt_ports = self.attempts.live_ports(&spaces);
         let executor = cx.background_executor().clone();
         cx.spawn_in(window, async move |this, cx| {
             let (store, result) = executor
                 .spawn(async move {
-                    let result = launch_space(&mut store, draft);
+                    let result = launch_space(&mut store, draft, attempt_ports);
                     (store, result)
                 })
                 .await;

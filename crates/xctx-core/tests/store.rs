@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use common::{TestResult, make_repos, temp_root};
 use serde_json::json;
 use xctx_core::space::{DraftRepo, SpaceDraft, SpaceShape};
-use xctx_core::{Space, SpaceId, Store, launch};
+use xctx_core::{Space, SpaceId, Store, launch, launch_avoiding};
 
 #[test]
 fn spaces_roots_ports_and_layouts_survive_reopening() -> TestResult {
@@ -38,6 +38,9 @@ fn spaces_roots_ports_and_layouts_survive_reopening() -> TestResult {
     );
     assert_eq!(reopened.port_allocations().get(&4001), Some(&space.id));
     assert_eq!(reopened.allocate_port()?, 4002);
+    // Ports the store does not record (attempts') are avoided when given.
+    assert_eq!(reopened.allocate_port_avoiding([4002, 4003])?, 4004);
+    assert_eq!(reopened.allocate_port_avoiding([4001])?, 4002);
     assert_eq!(reopened.load_layout(&space.id)?, Some(layout));
     assert_eq!(reopened.load_layout(&SpaceId::new("other"))?, None);
     assert_eq!(reopened.unique_slug("checkout retry"), "checkout-retry-2");
@@ -52,6 +55,25 @@ fn spaces_roots_ports_and_layouts_survive_reopening() -> TestResult {
     );
     assert_eq!(store.remove_space(&space.id)?, None);
     assert!(Store::open(&data)?.spaces().is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_launch_avoids_ports_the_store_does_not_record() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let mut draft = SpaceDraft::new("checkout retry");
+    draft.add_repo(DraftRepo::new(repos.checkout_web.clone(), "name"));
+    // An attempt of another space holds 4001 and 4002.
+    let space = launch_avoiding(&mut store, draft, [4001, 4002])?;
+    assert_eq!(space.port, 4003);
+    let mise = std::fs::read_to_string(
+        space.repos[0]
+            .worktree
+            .join(format!("mise.{}.toml", space.id)),
+    )?;
+    assert!(mise.contains("4003"), "{mise}");
     Ok(())
 }
 

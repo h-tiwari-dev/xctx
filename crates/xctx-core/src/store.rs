@@ -215,7 +215,13 @@ impl Store {
     /// The lowest port in [`space::PORT_RANGE`] no active space holds. Shipped and discarded spaces give their port
     /// back.
     pub fn allocate_port(&self) -> Result<u16> {
-        space::allocate_port(self.active_spaces().map(|s| s.port))
+        self.allocate_port_avoiding([])
+    }
+
+    /// [`Store::allocate_port`], also avoiding `taken`: ports the store does not know about, such as those of
+    /// competing attempts, which are recorded beside each space rather than in the store.
+    pub fn allocate_port_avoiding(&self, taken: impl IntoIterator<Item = u16>) -> Result<u16> {
+        space::allocate_port(self.active_spaces().map(|s| s.port).chain(taken))
     }
 
     fn layout_path(&self, id: &SpaceId) -> PathBuf {
