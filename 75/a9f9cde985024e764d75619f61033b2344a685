@@ -1,0 +1,23 @@
+AGENTS.md
+  s_454cbc0ae53d08::t_db97d25287e302 4-5
+docs/roadmap.md
+  s_454cbc0ae53d08::t_2ba5a3c14ec391 31-32
+docs/m3.md
+  s_454cbc0ae53d08::t_d6144d3e4c7115 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "75a9f9cde985024e764d75619f61033b2344a685",
+  "prompts": {},
+  "sessions": {
+    "s_454cbc0ae53d08": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20a12-24fe-707c-a4e1-c5c56bedc009",
+        "model": "gemini-4-neon"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
