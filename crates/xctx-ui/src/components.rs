@@ -290,7 +290,13 @@ impl Pill {
         self
     }
 
-    /// Call `handler` when the pill is clicked.
+    /// Dim the pill and ignore clicks; see [`Button::disabled`].
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.button = self.button.disabled(disabled);
+        self
+    }
+
+    /// Call `handler` when the pill is clicked (not while disabled).
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,

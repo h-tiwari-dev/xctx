@@ -15,23 +15,35 @@ pub const FORK_HINT: &str = "Each attempt gets its own worktree on attempt/<slug
 /// What an attempt row says when it has neither an input nor an instruction.
 pub const FORK_NO_INSTRUCTION: &str = "Same task as the writer";
 
+/// What the dialog says instead of the count pills when the space has no room for another attempt.
+pub const FORK_FULL: &str =
+    "This space already has the maximum live attempts. Discard or adopt one first.";
+
+/// What the dialog says while a fork runs: closing it does not stop the fork.
+pub const FORK_BUSY_HINT: &str =
+    "Forking… Closing this dialog does not stop the fork; it reports in the status bar.";
+
 /// What the dialog shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkDialogView {
-    /// The writer agent being forked, as labelled in the space, e.g. "pi · api".
+    /// The writer agent being forked, as labelled in the space, e.g. "pi · api". Drawn as given: already masked.
     pub writer: SharedString,
-    /// The repo the writer works in.
+    /// The repo the writer works in. Drawn as given: already masked.
     pub repo: SharedString,
     /// How many attempts to fork, from 1 to `max`.
     pub count: u32,
-    /// The most attempts the user may pick (`xctx_attempt::MAX_ATTEMPTS`).
+    /// The space's remaining capacity: how many more live attempts it may have
+    /// (`xctx_attempt::MAX_ATTEMPTS` minus the live attempts it has). With 0 the dialog draws no count pills,
+    /// says the space is full ([`FORK_FULL`]) and Fork is disabled.
     pub max: u32,
     /// Each attempt's instruction, by attempt (index 0 is attempt 1). Missing or empty entries mean "the same
-    /// task". Shown only for rows the app gave no input for.
+    /// task". Shown only for rows the app gave no input for. Drawn as given: already masked.
     pub instructions: Vec<SharedString>,
-    /// The fork is in progress: every control but Cancel is disabled.
+    /// The fork is in progress: the count pills and Fork are disabled, Cancel reads "Close" and a hint says the
+    /// fork carries on ([`FORK_BUSY_HINT`]). The dialog cannot lock the app's instruction inputs: the app must
+    /// make them read-only meanwhile.
     pub busy: bool,
-    /// Why the last fork failed, shown in the danger colour.
+    /// Why the last fork failed, shown in the danger colour. Drawn as given: already masked.
     pub error: Option<SharedString>,
 }
 
@@ -50,7 +62,9 @@ type CountHandler = Rc<dyn Fn(u32, &mut Window, &mut App)>;
 /// The fork dialog. The app owns the instruction inputs and passes them with
 /// [`ForkDialog::instruction_inputs`]; rows without one show the instruction from the view.
 ///
-/// Selectors for tests: `fork-count-<n>`, `fork-cancel`, `fork-confirm`.
+/// Selectors for tests: `fork-count-<n>`, `fork-cancel`, `fork-confirm`, `fork-row-<n>`, `fork-instruction-<n>`
+/// (a row's instruction text) or `fork-same-task-<n>` (its fallback text), `fork-full`, `fork-busy-hint` and
+/// `fork-error`.
 #[derive(IntoElement)]
 pub struct ForkDialog {
     view: ForkDialogView,
@@ -91,7 +105,7 @@ impl ForkDialog {
         self
     }
 
-    /// Call `handler` when Cancel is clicked.
+    /// Call `handler` when Cancel (or, while busy, Close) is clicked. The fork, if running, carries on.
     pub fn on_cancel(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_cancel = Some(Rc::new(handler));
         self
@@ -108,9 +122,9 @@ impl ForkDialog {
         self.view.count.clamp(1, self.view.max.max(1))
     }
 
-    /// Whether Fork is enabled: no fork is in progress.
+    /// Whether Fork is enabled: no fork is in progress and the space has room for another attempt.
     pub fn can_fork(&self) -> bool {
-        !self.view.busy
+        !self.view.busy && self.view.max > 0
     }
 }
 
@@ -129,12 +143,14 @@ impl RenderOnce for ForkDialog {
         let count = self.count();
         let can_fork = self.can_fork();
         let busy = self.view.busy;
-        let max = self.view.max.max(1);
+        let max = self.view.max;
+        let full = max == 0;
         let view = self.view;
 
         let pills = (1..=max).map(|n| {
             let mut pill = Pill::new(SharedString::from(format!("fork-count-{n}")), n.to_string())
                 .selected(n == count)
+                .disabled(busy)
                 .selector(format!("fork-count-{n}"));
             if let Some(handler) = self.on_count.clone().filter(|_| !busy) {
                 pill = pill.on_click(move |_, window, cx| handler(n, window, cx));
@@ -143,7 +159,8 @@ impl RenderOnce for ForkDialog {
         });
 
         let mut inputs = self.instruction_inputs.into_iter();
-        let rows: Vec<_> = (1..=count)
+        let row_count = if full { 0 } else { count };
+        let rows: Vec<_> = (1..=row_count)
             .map(|n| {
                 let body: AnyElement = match inputs.next() {
                     Some(input) => div().flex_1().min_w_0().child(input).into_any_element(),
@@ -153,12 +170,13 @@ impl RenderOnce for ForkDialog {
                             .get(n as usize - 1)
                             .filter(|text| !text.trim().is_empty())
                             .cloned();
-                        let color = if text.is_some() {
-                            theme.text
+                        let (color, selector) = if text.is_some() {
+                            (theme.text, format!("fork-instruction-{n}"))
                         } else {
-                            theme.text_subtle
+                            (theme.text_subtle, format!("fork-same-task-{n}"))
                         };
                         div()
+                            .debug_selector(move || selector)
                             .flex_1()
                             .min_w_0()
                             .text_size(Theme::TEXT_SM)
@@ -188,6 +206,7 @@ impl RenderOnce for ForkDialog {
 
         let error = view.error.clone().map(|text| {
             div()
+                .debug_selector(|| "fork-error".to_owned())
                 .text_size(Theme::TEXT_SM)
                 .text_color(theme.danger)
                 .child(text)
@@ -208,7 +227,7 @@ impl RenderOnce for ForkDialog {
         if let Some(handler) = self.on_fork {
             fork = fork.on_click(move |_, window, cx| handler(window, cx));
         }
-        let mut cancel = Button::new("fork-cancel", "Cancel")
+        let mut cancel = Button::new("fork-cancel", if busy { "Close" } else { "Cancel" })
             .variant(ButtonVariant::Ghost)
             .size(ButtonSize::Large)
             .selector("fork-cancel");
@@ -279,7 +298,17 @@ impl RenderOnce for ForkDialog {
                     .items_center()
                     .gap(Theme::SPACE_2)
                     .child(label("Attempts", &theme))
-                    .child(div().flex().gap(Theme::SPACE_1).children(pills)),
+                    .child(if full {
+                        div()
+                            .debug_selector(|| "fork-full".to_owned())
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(Theme::TEXT_SM)
+                            .text_color(theme.warning)
+                            .child(FORK_FULL)
+                    } else {
+                        div().flex().gap(Theme::SPACE_1).children(pills)
+                    }),
             )
             .child(
                 div()
@@ -299,14 +328,22 @@ impl RenderOnce for ForkDialog {
                     .pt(Theme::SPACE_2)
                     .border_t_1()
                     .border_color(theme.divider)
-                    .child(
+                    .child(if busy {
+                        div()
+                            .debug_selector(|| "fork-busy-hint".to_owned())
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(Theme::TEXT_XS)
+                            .text_color(theme.text_muted)
+                            .child(FORK_BUSY_HINT)
+                    } else {
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_size(Theme::TEXT_XS)
                             .text_color(theme.text_subtle)
-                            .child(FORK_HINT),
-                    )
+                            .child(FORK_HINT)
+                    })
                     .child(cancel)
                     .child(fork),
             )
@@ -341,6 +378,13 @@ mod tests {
     fn fork_is_disabled_while_busy() {
         assert!(ForkDialog::new(view(2, 4, false)).can_fork());
         assert!(!ForkDialog::new(view(2, 4, true)).can_fork());
+    }
+
+    #[test]
+    fn fork_is_disabled_when_the_space_is_full() {
+        assert!(ForkDialog::new(view(1, 1, false)).can_fork());
+        assert!(!ForkDialog::new(view(1, 0, false)).can_fork());
+        assert!(!ForkDialog::new(view(2, 0, false)).can_fork());
     }
 
     #[test]

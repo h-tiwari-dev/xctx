@@ -52,9 +52,10 @@ impl AttemptChipState {
         matches!(self, Self::Running | Self::Done | Self::Failed)
     }
 
-    /// Whether the strip lets the user switch the panes to it. A discarded attempt has nothing left to show.
+    /// Whether the strip lets the user switch the panes to it: only live attempts. An adopted or discarded
+    /// attempt's worktree and agent are gone, so there is nothing left to show.
     pub fn can_select(self) -> bool {
-        self != Self::Discarded
+        self.is_live()
     }
 }
 
@@ -77,10 +78,12 @@ pub struct AttemptChip {
     /// The attempt's number within its space, from 1.
     pub number: u32,
     /// What the chip says, e.g. "Attempt 2" or the attempt's instruction. Cut to [`CHIP_LABEL_MAX`] characters.
+    /// Drawn as given: already masked.
     pub label: SharedString,
     /// Its state.
     pub state: AttemptChipState,
-    /// Whether the panes show this attempt now.
+    /// Whether the panes show this attempt now. The active chip (or the Space chip) is marked with a leading
+    /// "▸" as well as the accent.
     pub active: bool,
 }
 
@@ -88,14 +91,18 @@ type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 type SelectHandler = Rc<dyn Fn(Option<u32>, &mut Window, &mut App)>;
 
 /// The strip of a space's attempts. The leading "Space" chip stands for the space itself and is active when no
-/// attempt is. Clicking a chip calls [`AttemptStrip::on_select`] (except on discarded attempts); Review shows
-/// only with [`AttemptStrip::can_review`], and "Fork…" only with [`AttemptStrip::on_fork`].
+/// attempt is. Clicking a chip calls [`AttemptStrip::on_select`] (only on live attempts, see
+/// [`AttemptChipState::can_select`]); Review shows only with [`AttemptStrip::can_review`], and "Fork…" only with
+/// [`AttemptStrip::on_fork`]. While [`AttemptStrip::busy`] both are disabled; "Fork…" is also disabled without
+/// [`AttemptStrip::can_fork`].
 ///
 /// Selectors for tests: `strip-space`, `strip-attempt-<n>`, `strip-review`, `strip-fork`.
 #[derive(IntoElement)]
 pub struct AttemptStrip {
     chips: Vec<AttemptChip>,
     can_review: bool,
+    busy: bool,
+    can_fork: bool,
     on_select: Option<SelectHandler>,
     on_review: Option<Handler>,
     on_fork: Option<Handler>,
@@ -107,6 +114,8 @@ impl AttemptStrip {
         Self {
             chips,
             can_review: false,
+            busy: false,
+            can_fork: true,
             on_select: None,
             on_review: None,
             on_fork: None,
@@ -119,6 +128,18 @@ impl AttemptStrip {
         self
     }
 
+    /// Disable Review and "Fork…" while an attempt job (a fork, adopt or discard) runs for the space.
+    pub fn busy(mut self, busy: bool) -> Self {
+        self.busy = busy;
+        self
+    }
+
+    /// Whether the space has room for another attempt (true by default); "Fork…" is disabled when it has not.
+    pub fn can_fork(mut self, can_fork: bool) -> Self {
+        self.can_fork = can_fork;
+        self
+    }
+
     /// Call `handler` with the chip clicked: `None` for the space itself, else the attempt's number.
     pub fn on_select(
         mut self,
@@ -128,13 +149,13 @@ impl AttemptStrip {
         self
     }
 
-    /// Call `handler` when Review is clicked.
+    /// Call `handler` when Review is clicked (not while busy).
     pub fn on_review(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_review = Some(Rc::new(handler));
         self
     }
 
-    /// Show a "Fork…" button and call `handler` when it is clicked.
+    /// Show a "Fork…" button and call `handler` when it is clicked (not while busy or without room).
     pub fn on_fork(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_fork = Some(Rc::new(handler));
         self
@@ -185,7 +206,7 @@ impl RenderOnce for AttemptStrip {
             } else {
                 FontWeight::MEDIUM
             })
-            .child("Space");
+            .child(if space_active { "▸ Space" } else { "Space" });
         if let Some(handler) = self.on_select.clone() {
             let hover = theme.surface_hover;
             space = space
@@ -207,6 +228,10 @@ impl RenderOnce for AttemptStrip {
                 };
                 let mut element = chip_shell(selector.clone().into(), chip.active, &theme)
                     .debug_selector(move || selector)
+                    .children(
+                        chip.active
+                            .then(|| div().text_color(theme.accent).child("▸")),
+                    )
                     .child(
                         div()
                             .text_color(theme.text_subtle)
@@ -224,8 +249,12 @@ impl RenderOnce for AttemptStrip {
                             .child(truncate_label(&chip.label, CHIP_LABEL_MAX)),
                     )
                     .child(Badge::new(chip.state.label()).tone(chip.state.tone()));
-                if chip.state == AttemptChipState::Discarded {
-                    element = element.opacity(0.5);
+                if !chip.state.is_live() {
+                    element = element.opacity(if chip.state == AttemptChipState::Discarded {
+                        0.5
+                    } else {
+                        0.8
+                    });
                 }
                 if let Some(handler) = self.on_select.clone().filter(|_| chip.state.can_select()) {
                     let hover = theme.surface_hover;
@@ -238,16 +267,20 @@ impl RenderOnce for AttemptStrip {
             })
             .collect();
 
+        let busy = self.busy;
         let review = self.on_review.filter(|_| self.can_review).map(|handler| {
             Button::new("strip-review", "Review")
                 .variant(ButtonVariant::Primary)
                 .size(ButtonSize::Regular)
+                .disabled(busy)
                 .selector("strip-review")
                 .on_click(move |_, window, cx| handler(window, cx))
         });
+        let can_fork = self.can_fork;
         let fork = self.on_fork.map(|handler| {
             Button::new("strip-fork", "Fork…")
                 .variant(ButtonVariant::Ghost)
+                .disabled(busy || !can_fork)
                 .selector("strip-fork")
                 .on_click(move |_, window, cx| handler(window, cx))
         });
@@ -292,9 +325,8 @@ mod tests {
         }
         for state in [Adopted, Discarded] {
             assert!(!state.is_live(), "{state:?}");
+            assert!(!state.can_select(), "{state:?}");
         }
-        assert!(Adopted.can_select());
-        assert!(!Discarded.can_select());
     }
 
     #[test]

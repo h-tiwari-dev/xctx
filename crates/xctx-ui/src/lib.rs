@@ -31,7 +31,10 @@ pub use attempt_strip::{
     AttemptChip, AttemptChipState, AttemptStrip, CHIP_LABEL_MAX, truncate_label,
 };
 pub use components::{Badge, Button, ButtonColors, ButtonSize, ButtonVariant, Pill};
-pub use fork_dialog::{FORK_HINT, FORK_NO_INSTRUCTION, ForkDialog, ForkDialogView, fork_label};
+pub use fork_dialog::{
+    FORK_BUSY_HINT, FORK_FULL, FORK_HINT, FORK_NO_INSTRUCTION, ForkDialog, ForkDialogView,
+    fork_label,
+};
 pub use inbox::{INBOX_EMPTY, InboxAction, InboxEntry, InboxKind, InboxPanel};
 pub use loop_bar::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_TURNS, LOOP_STAGES, LoopAction, LoopBar, autonomy_label,
@@ -41,8 +44,10 @@ pub use parent_agent::{AgentStatus, DRAWER_HEIGHT, PARENT_AGENT_ROLE, ParentAgen
 pub use plan_gate::{PLAN_GATE_HINT, PLAN_NEEDS_REPO, PlanGateCard, PlanGateView, PlanRepo};
 pub use prompt::{PromptBuffer, PromptEvent, PromptInput};
 pub use review_sheet::{
-    DIFF_LINE_LIMIT, DiffView, FileRow, REVIEW_NO_SUMMARY, ReproView, ReviewColumn, ReviewSheet,
-    ReviewView, diff_line_tone, diffstat_label, shows_adopt, shows_discard, tests_line, tests_tone,
+    DIFF_CHAR_LIMIT, DIFF_LINE_CHARS, DIFF_LINE_LIMIT, DiffExcerpt, DiffView, FILE_ROW_LIMIT,
+    FileRow, REVIEW_CHANGES_PENDING, REVIEW_EMPTY, REVIEW_NO_SUMMARY, REVIEW_WORKTREE_REMOVED,
+    ReproView, ReviewColumn, ReviewSheet, ReviewView, cut_line, diff_excerpt, diff_line_tone,
+    diffstat_label, files_note, shows_adopt, shows_discard, tests_line, tests_tone,
 };
 pub use shared_space::{
     CHANNEL_EMPTY, CONTRACT_EMPTY, SHARED_TABS, SharedSpacePanel, SharedTab, finding_location,

@@ -106,11 +106,14 @@ fn repro_view(repro: Repro) -> ReproView {
     }
 }
 
-/// The review sheet's view of `comparison` (already masked): `busy` is the attempt being adopted or discarded (any
-/// number disables every action), `error` why the last action failed, and `diff` the file diff open.
+/// The review sheet's view of `comparison` (already masked): `busy` whether an attempt job runs for the space
+/// (disables every action), `working` the attempt being adopted or discarded, `confirm_discard` the attempt
+/// whose Discard awaits its confirming click, `error` why the last action failed, and `diff` the file diff open.
 pub fn review_view(
     comparison: &Comparison,
-    busy: Option<u32>,
+    busy: bool,
+    working: Option<u32>,
+    confirm_discard: Option<u32>,
     error: Option<String>,
     diff: Option<DiffView>,
 ) -> ReviewView {
@@ -147,6 +150,8 @@ pub fn review_view(
             .collect(),
         adopted: comparison.adopted,
         busy,
+        working,
+        confirm_discard,
         error: error.map(SharedString::from),
         diff,
     }
@@ -224,6 +229,8 @@ pub(crate) struct ReviewState {
     changes: BTreeMap<u32, Vec<FileChange>>,
     /// The attempt the user asked to adopt or discard, while its job runs.
     acting: Option<u32>,
+    /// The attempt whose Discard was clicked once and awaits "Confirm discard".
+    confirm_discard: Option<u32>,
     error: Option<String>,
     diff: Option<DiffView>,
     /// Which computation of the changes is the latest; results of older ones are dropped.
@@ -407,7 +414,11 @@ impl Workspace {
             writer: fork.writer.clone().into(),
             repo: fork.repo.clone().into(),
             count: fork.count,
-            max: MAX_ATTEMPTS,
+            max: MAX_ATTEMPTS.saturating_sub(
+                self.attempts
+                    .get(&fork.space)
+                    .map_or(0, |set| set.live().count() as u32),
+            ),
             instructions: Vec::new(),
             busy: fork.running,
             error: fork.error.clone().map(SharedString::from),
@@ -474,6 +485,8 @@ impl Workspace {
         let (select, review, fork) = (entity.clone(), entity.clone(), entity);
         let strip = AttemptStrip::new(strip_chips(set, shown, &self.redactor))
             .can_review(can_review(set))
+            .busy(self.attempt_jobs.contains(&tab.space.id))
+            .can_fork((set.live().count() as u32) < MAX_ATTEMPTS)
             .on_select(move |number, window, cx| {
                 let _ = select.update(cx, |this, cx| this.select_attempt(number, window, cx));
             })
@@ -606,6 +619,7 @@ impl Workspace {
             round,
             changes: BTreeMap::new(),
             acting: None,
+            confirm_discard: None,
             error: None,
             diff: None,
             generation: 0,
@@ -677,6 +691,14 @@ impl Workspace {
     }
 
     /// Adopt (`adopt`) or discard attempt `number` from the review sheet.
+    /// Ask for (or, with `None`, withdraw) the confirming click on attempt `number`'s Discard.
+    fn set_review_confirm_discard(&mut self, number: Option<u32>, cx: &mut Context<Self>) {
+        if let Some(Dialog::Review(review)) = self.dialog.as_mut() {
+            review.confirm_discard = number;
+            cx.notify();
+        }
+    }
+
     fn review_action(
         &mut self,
         number: u32,
@@ -691,6 +713,7 @@ impl Workspace {
             return;
         }
         review.acting = Some(number);
+        review.confirm_discard = None;
         review.error = None;
         let space = review.space.clone();
         let started = if adopt {
@@ -851,13 +874,19 @@ impl Workspace {
                 adopted: None,
             },
         };
-        let busy = self
-            .attempt_jobs
-            .contains(&review.space)
-            .then(|| review.acting.unwrap_or(0));
-        let view = review_view(&comparison, busy, review.error.clone(), review.diff.clone());
+        let busy = self.attempt_jobs.contains(&review.space);
+        let view = review_view(
+            &comparison,
+            busy,
+            review.acting.filter(|_| busy),
+            review.confirm_discard,
+            review.error.clone(),
+            review.diff.clone(),
+        );
         let entity = cx.entity().downgrade();
-        let (adopt, discard, file, close_diff, close) = (
+        let (adopt, request, discard, keep, file, close_diff, close) = (
+            entity.clone(),
+            entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
@@ -876,6 +905,15 @@ impl Workspace {
                     .on_adopt(move |number, window, cx| {
                         let _ = adopt
                             .update(cx, |this, cx| this.review_action(number, true, window, cx));
+                    })
+                    .on_discard_request(move |number, _, cx| {
+                        let _ = request.update(cx, |this, cx| {
+                            this.set_review_confirm_discard(Some(number), cx)
+                        });
+                    })
+                    .on_cancel_discard(move |_, _, cx| {
+                        let _ =
+                            keep.update(cx, |this, cx| this.set_review_confirm_discard(None, cx));
                     })
                     .on_discard(move |number, window, cx| {
                         let _ = discard
@@ -1047,9 +1085,18 @@ mod tests {
         .into_iter()
         .collect();
         let comparison = xctx_attempt::comparison(&set, 1, &changes, &Redactor::default());
-        let view = review_view(&comparison, Some(2), Some("refused".into()), None);
+        let view = review_view(
+            &comparison,
+            true,
+            Some(2),
+            Some(1),
+            Some("refused".into()),
+            None,
+        );
         assert_eq!(view.round, 1);
-        assert_eq!(view.busy, Some(2));
+        assert!(view.busy);
+        assert_eq!(view.working, Some(2));
+        assert_eq!(view.confirm_discard, Some(1));
         assert_eq!(view.error.as_ref().map(|e| e.as_ref()), Some("refused"));
         let first = &view.columns[0];
         assert_eq!(first.state, AttemptChipState::Done);
