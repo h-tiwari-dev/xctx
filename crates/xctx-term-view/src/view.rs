@@ -41,18 +41,6 @@ pub enum TerminalViewEvent {
     Focused,
 }
 
-/// A left-button selection in progress.
-#[derive(Debug, Clone, Copy)]
-struct SelectionDrag {
-    /// Where the button went down.
-    anchor: ViewportPoint,
-    /// Which half of the anchor cell.
-    anchor_side: Side,
-    /// Whether the selection exists yet. A plain click only starts one once the pointer
-    /// moves, so clicking never leaves an empty selection behind.
-    started: bool,
-}
-
 /// A button press reported to the program, whose motion and release are reported too.
 #[derive(Debug, Clone, Copy)]
 struct ReportedPress {
@@ -89,7 +77,9 @@ pub struct TerminalView {
     bounds: Option<Bounds<Pixels>>,
     /// The size last sent to the session.
     grid_size: (u16, u16),
-    selection_drag: Option<SelectionDrag>,
+    /// Whether a left-button selection drag is in progress. The selection starts on mouse-down,
+    /// so it stays anchored to the text under the pointer while output scrolls the screen.
+    selection_dragging: bool,
     reported_press: Option<ReportedPress>,
     /// The cell of the last hover motion report, so each cell is reported once.
     last_hover_point: Option<ViewportPoint>,
@@ -201,7 +191,7 @@ impl TerminalView {
             metrics: None,
             bounds: None,
             grid_size,
-            selection_drag: None,
+            selection_dragging: false,
             reported_press: None,
             last_hover_point: None,
             scroll_remainder: 0.0,
@@ -287,7 +277,7 @@ impl TerminalView {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
         if modifiers.platform {
@@ -308,7 +298,9 @@ impl TerminalView {
             return;
         }
 
-        let Some(key_event) = key_event_for_keystroke(keystroke, event.is_held) else {
+        let Some(key_event) =
+            key_event_for_keystroke(keystroke, event.is_held, window.capslock().on)
+        else {
             return;
         };
         let Some(bytes) = input::encode_key(&key_event, &self.session.modes()) else {
@@ -368,31 +360,16 @@ impl TerminalView {
             _ => Some(SelectionMode::Line),
         };
         match mode {
-            Some(mode) => {
-                self.session.start_selection(mode, point, side);
-                self.selection_drag = Some(SelectionDrag {
-                    anchor: point,
-                    anchor_side: side,
-                    started: true,
-                });
-            }
+            Some(mode) => self.session.start_selection(mode, point, side),
             None if event.modifiers.shift && self.session.selected_text().is_some() => {
                 self.session.update_selection(point, side);
-                self.selection_drag = Some(SelectionDrag {
-                    anchor: point,
-                    anchor_side: side,
-                    started: true,
-                });
             }
-            None => {
-                self.session.clear_selection();
-                self.selection_drag = Some(SelectionDrag {
-                    anchor: point,
-                    anchor_side: side,
-                    started: false,
-                });
-            }
+            // Empty until the pointer moves; cleared on release if it never does.
+            None => self
+                .session
+                .start_selection(SelectionMode::Cell, point, side),
         }
+        self.selection_dragging = true;
         cx.notify();
     }
 
@@ -414,17 +391,9 @@ impl TerminalView {
             return;
         }
 
-        if let Some(drag) = self.selection_drag.as_mut() {
+        if self.selection_dragging {
             if event.pressed_button != Some(gpui::MouseButton::Left) {
                 return;
-            }
-            if !drag.started {
-                if point == drag.anchor && side == drag.anchor_side {
-                    return;
-                }
-                self.session
-                    .start_selection(SelectionMode::Cell, drag.anchor, drag.anchor_side);
-                drag.started = true;
             }
             // Dragging past the top or bottom edge scrolls the history under the selection.
             if let Some(bounds) = self.bounds {
@@ -457,9 +426,14 @@ impl TerminalView {
         self.write_report(input::encode_mouse(&report, &modes));
     }
 
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, _cx: &mut Context<Self>) {
-        if event.button == gpui::MouseButton::Left {
-            self.selection_drag = None;
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if event.button == gpui::MouseButton::Left && self.selection_dragging {
+            self.selection_dragging = false;
+            // A click without a drag leaves no selection behind.
+            if self.session.selected_text().is_none() {
+                self.session.clear_selection();
+                cx.notify();
+            }
         }
         let Some(press) = self.reported_press else {
             return;

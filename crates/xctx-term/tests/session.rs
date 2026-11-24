@@ -33,6 +33,20 @@ fn wait_for_text(session: &TerminalSession, predicate: impl Fn(&str) -> bool) ->
     }
 }
 
+/// Receives events until one matches `predicate` or [`TIMEOUT`] passes, returning the match.
+fn wait_for_event(
+    events: &Receiver<TerminalEvent>,
+    predicate: impl Fn(&TerminalEvent) -> bool,
+) -> Option<TerminalEvent> {
+    let deadline = Instant::now() + TIMEOUT;
+    while let Ok(event) = events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if predicate(&event) {
+            return Some(event);
+        }
+    }
+    None
+}
+
 fn process_is_gone(pid: u32) -> bool {
     let pid = libc::pid_t::try_from(pid).expect("pid fits");
     // A zombie still answers kill(pid, 0); only a reaped pid gives ESRCH.
@@ -81,16 +95,11 @@ fn exit_status_and_event_are_reported() {
     let status = session.exit_status().expect("status collected");
     assert_eq!(status.code(), Some(3));
 
-    let deadline = Instant::now() + TIMEOUT;
-    let mut saw_exit = false;
-    while let Ok(event) = events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        if let TerminalEvent::Exited(Some(status)) = event {
-            assert_eq!(status.code(), Some(3));
-            saw_exit = true;
-            break;
-        }
-    }
-    assert!(saw_exit, "no Exited event");
+    let exit = wait_for_event(&events, |event| matches!(event, TerminalEvent::Exited(_)));
+    let Some(TerminalEvent::Exited(Some(status))) = exit else {
+        panic!("no Exited event with a status: {exit:?}");
+    };
+    assert_eq!(status.code(), Some(3));
     assert!(
         wait_until_gone(session.pid(), TIMEOUT),
         "child left as a zombie"
@@ -100,11 +109,9 @@ fn exit_status_and_event_are_reported() {
 #[test]
 fn wakeup_events_arrive_for_output() {
     let (session, events) = spawn(sh("echo hi"));
-    let saw_wakeup = events
-        .iter()
-        .take_while(|event| !matches!(event, TerminalEvent::Exited(_)))
-        .any(|event| event == TerminalEvent::Wakeup);
-    assert!(saw_wakeup);
+    // The waiter and reader threads race, so Exited may arrive before the Wakeup for "hi".
+    let wakeup = wait_for_event(&events, |event| *event == TerminalEvent::Wakeup);
+    assert_eq!(wakeup, Some(TerminalEvent::Wakeup));
     drop(session);
 }
 
@@ -202,6 +209,60 @@ fn drop_kills_a_program_that_ignores_hangup() {
     assert!(
         wait_until_gone(pid, Duration::from_secs(6)),
         "program survived drop"
+    );
+}
+
+#[test]
+fn shutdown_and_wait_returns_once_a_cooperative_program_exits() {
+    let (session, _events) = spawn(TerminalConfig::new("/bin/sleep").args(["30"]));
+    let pid = session.pid();
+    let started = Instant::now();
+    assert!(session.shutdown_and_wait(Duration::from_secs(5)));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "waited past the exit"
+    );
+    assert!(!session.is_alive());
+    assert!(process_is_gone(pid), "program not reaped");
+}
+
+#[test]
+fn shutdown_and_wait_kills_a_program_that_ignores_hangup() {
+    let (session, _events) = spawn(sh(r#"trap '' HUP; echo ready; sleep 30"#));
+    wait_for_text(&session, |text| text.contains("ready"));
+    let pid = session.pid();
+    let timeout = Duration::from_millis(300);
+    let started = Instant::now();
+    assert!(session.shutdown_and_wait(timeout));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= timeout, "killed before the timeout: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "waited too long: {elapsed:?}"
+    );
+    assert!(!session.is_alive());
+    assert!(process_is_gone(pid), "program not reaped");
+}
+
+#[test]
+fn shutdown_and_wait_kills_a_foreground_job_in_its_own_process_group() {
+    // With job control on, the shell runs the inner program in a new process group and makes
+    // it the terminal's foreground group; killing the shell's group alone would leave it.
+    let (session, _events) = spawn(sh(
+        r#"trap '' HUP; set -m; /bin/sh -c 'echo "fg:$$"; exec /bin/sleep 30'; echo done"#,
+    ));
+    let text = wait_for_text(&session, |text| {
+        text.lines().any(|line| line.starts_with("fg:"))
+    });
+    let job: u32 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("fg:"))
+        .and_then(|pid| pid.trim().parse().ok())
+        .expect("job pid");
+    assert!(session.shutdown_and_wait(Duration::from_millis(300)));
+    assert!(
+        wait_until_gone(job, Duration::from_secs(5)),
+        "foreground job survived"
     );
 }
 

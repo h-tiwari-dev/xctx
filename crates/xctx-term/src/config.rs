@@ -8,8 +8,9 @@ use crate::snapshot::Rgb;
 /// Everything needed to start a [`crate::TerminalSession`].
 ///
 /// The child inherits the parent's environment with `env` applied on top. `env` starts with
-/// `TERM=xterm-256color` and `COLORTERM=truecolor`; overwrite or remove those entries to change
-/// them.
+/// `TERM=xterm-256color` and `COLORTERM=truecolor`, plus `LANG=en_US.UTF-8` when the parent has
+/// neither `LANG` nor `LC_CTYPE` set (as when the app is launched from Finder or the Dock), so
+/// shells and pagers handle UTF-8; overwrite or remove those entries to change them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalConfig {
     /// Program to run, as a path or a name looked up in `PATH`.
@@ -47,6 +48,9 @@ impl TerminalConfig {
         let mut env = BTreeMap::new();
         env.insert("TERM".to_owned(), "xterm-256color".to_owned());
         env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+        if let Some(lang) = default_lang(|key| std::env::var_os(key).is_some()) {
+            env.insert("LANG".to_owned(), lang.to_owned());
+        }
         Self {
             program: program.into(),
             args: Vec::new(),
@@ -107,6 +111,16 @@ impl TerminalConfig {
     }
 }
 
+/// The `LANG` to add to the child's environment, or `None` when the parent already chose a
+/// locale. `is_set` reports whether a variable is present in the parent environment.
+fn default_lang(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
+    if is_set("LANG") || is_set("LC_CTYPE") {
+        None
+    } else {
+        Some("en_US.UTF-8")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +137,13 @@ mod tests {
             Some("truecolor")
         );
         assert_eq!((config.cols, config.rows), (80, 24));
+    }
+
+    #[test]
+    fn default_lang_is_utf8_only_when_no_locale_is_inherited() {
+        assert_eq!(default_lang(|_| false), Some("en_US.UTF-8"));
+        assert_eq!(default_lang(|key| key == "LANG"), None);
+        assert_eq!(default_lang(|key| key == "LC_CTYPE"), None);
     }
 
     #[test]

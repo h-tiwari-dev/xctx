@@ -11,6 +11,7 @@ use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSi
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side as AlacrittySide};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::term::cell::{Cell as AlacrittyCell, Flags};
 use alacritty_terminal::term::color::COUNT as COLOR_COUNT;
 use alacritty_terminal::term::{Config as AlacrittyConfig, Term, TermMode};
@@ -35,7 +36,8 @@ pub enum TerminalEvent {
     TitleChanged(Option<String>),
     /// The program rang the bell.
     Bell,
-    /// The program asked to put text on the clipboard (OSC 52).
+    /// The program asked to put text on the system clipboard (OSC 52 with selector `c` or
+    /// none). Requests for the primary selection (`p`, `s`) are ignored.
     ClipboardStore(String),
     /// The program exited. `None` when the status could not be collected.
     Exited(Option<ExitStatus>),
@@ -125,7 +127,9 @@ impl EventListener for EventSink {
             }
             AlacrittyEvent::ResetTitle => Pending::Event(TerminalEvent::TitleChanged(None)),
             AlacrittyEvent::Bell => Pending::Event(TerminalEvent::Bell),
-            AlacrittyEvent::ClipboardStore(_, text) => {
+            // OSC 52 with selector `c` (or none, which the parser reads as `c`) targets the
+            // clipboard; `p` and `s` target the X11 primary selection, which macOS lacks.
+            AlacrittyEvent::ClipboardStore(ClipboardType::Clipboard, text) => {
                 Pending::Event(TerminalEvent::ClipboardStore(text))
             }
             _ => return,
@@ -797,6 +801,22 @@ mod tests {
             ]
         );
         assert_eq!(emulator.snapshot().title.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn osc52_clipboard_store_targets_only_the_clipboard() {
+        let mut emulator = emulator(10, 2);
+        // "aGk=" is base64 for "hi".
+        emulator.advance(b"\x1b]52;c;aGk=\x07\x1b]52;;aGk=\x07");
+        assert_eq!(
+            emulator.take_events(),
+            vec![
+                TerminalEvent::ClipboardStore("hi".to_owned()),
+                TerminalEvent::ClipboardStore("hi".to_owned())
+            ]
+        );
+        emulator.advance(b"\x1b]52;p;aGk=\x07\x1b]52;s;aGk=\x07");
+        assert_eq!(emulator.take_events(), vec![]);
     }
 
     #[test]
