@@ -5,6 +5,10 @@ rust = { version = "1.100.0", components = ["rustfmt", "clippy"] }
 description = "Run the xctx app in debug mode"
 run = "cargo run -p xctx"
 
+[tasks.ctl]
+description = "Run xctx-ctl against the running xctx window (arguments are passed through)"
+run = "cargo run -q -p xctx-control --bin xctx-ctl --"
+
 [tasks.build]
 description = "Build the xctx app in release mode"
 run = "cargo build -p xctx --release"
