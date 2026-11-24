@@ -368,7 +368,7 @@ fn mise_checks(spaces: &[Space]) -> Vec<MiseCheck> {
         .flat_map(|space| {
             space.repos.iter().map(|repo| MiseCheck {
                 space: space.id.clone(),
-                mise_env: space.effective_mise_env().to_owned(),
+                mise_env: space.effective_mise_env(),
                 repo: repo.name.clone(),
                 dir: repo.worktree.clone(),
             })
@@ -590,7 +590,7 @@ impl Workspace {
                 contract_set(state, &space.id, &p, redactor)
             }),
             Call::ContractAgree(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
-                contract_agree(state, &space.id, &p.agent, redactor)
+                contract_agree(state, &space.id, &p.agent, p.version, redactor)
             }),
             other => Err(RpcError::internal(format!(
                 "{}: not a masked read",
@@ -1235,7 +1235,10 @@ mod tests {
             .collect();
         assert_eq!(
             envs,
-            [("rate-limit", "rate-limit"), ("prod-bug", "production")]
+            [
+                ("rate-limit", "rate-limit"),
+                ("prod-bug", "production,prod-bug"),
+            ]
         );
         Ok(())
     }

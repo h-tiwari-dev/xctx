@@ -229,7 +229,9 @@ pub fn channel_error(id: &SpaceId, error: ChannelError) -> RpcError {
         | ChannelError::InvalidArtifactPath { .. } => {
             RpcError::invalid_params(format!("{id}: {error}"))
         }
-        ChannelError::NoContract => RpcError::conflict(format!("{id}: {error}")),
+        ChannelError::NoContract | ChannelError::StaleContract { .. } => {
+            RpcError::conflict(format!("{id}: {error}"))
+        }
         ChannelError::FindingNotFound(_) => RpcError::not_found(format!("{id}: {error}")),
         other => RpcError::internal(format!("{id}: {other}")),
     }
@@ -519,18 +521,20 @@ pub fn contract_set(
     Ok(contract_get(state, redactor))
 }
 
-/// `contract.agree`: record that `agent` agrees to the current contract. Returns it, secrets masked.
+/// `contract.agree`: record that `agent` agrees to the current contract (or to `expected_version`, refusing
+/// stale revisions with a conflict). Returns it, secrets masked.
 pub fn contract_agree(
     state: &mut SpaceGraphState,
     id: &SpaceId,
     agent: &str,
+    expected_version: Option<u32>,
     redactor: &Redactor,
 ) -> Result<ContractResult, RpcError> {
     let agent = agent_name(Some(agent))
         .ok_or_else(|| RpcError::invalid_params("contract.agree: agent is empty"))?;
     state
         .shared_mut()
-        .agree_contract(agent)
+        .agree_contract_version(agent, expected_version)
         .map_err(|e| channel_error(id, e))?;
     Ok(contract_get(state, redactor))
 }
@@ -986,7 +990,7 @@ mod tests {
         let mut state = SpaceGraphState::open(data.path(), &space)?;
         let redactor = Redactor::new([("API_TOKEN".to_owned(), "tok-1234".to_owned())]);
         assert_eq!(contract_get(&state, &redactor).contract, None);
-        let agree_first = contract_agree(&mut state, &space.id, "writer-web", &redactor);
+        let agree_first = contract_agree(&mut state, &space.id, "writer-web", None, &redactor);
         assert_eq!(code(agree_first), Some(ErrorCode::Conflict));
 
         let set = ContractSetParams {
@@ -1000,7 +1004,9 @@ mod tests {
         let contract = result.contract.ok_or("no contract")?;
         assert_eq!(contract.version, 1);
         assert_eq!(contract.spec, "X-RateLimit-Key: [REDACTED:API_TOKEN]");
-        let agreed = contract_agree(&mut state, &space.id, "writer-web", &redactor)?;
+        let stale = contract_agree(&mut state, &space.id, "writer-web", Some(99), &redactor);
+        assert_eq!(code(stale), Some(ErrorCode::Conflict));
+        let agreed = contract_agree(&mut state, &space.id, "writer-web", Some(1), &redactor)?;
         assert_eq!(
             agreed.contract.map(|c| c.agreed_by),
             Some(vec!["writer-api".to_owned(), "writer-web".to_owned()])
