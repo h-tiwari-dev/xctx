@@ -142,6 +142,7 @@ pub struct Button {
     selected: bool,
     disabled: bool,
     rounded_full: bool,
+    selector: Option<String>,
     on_click: Option<ClickHandler>,
 }
 
@@ -156,8 +157,16 @@ impl Button {
             selected: false,
             disabled: false,
             rounded_full: false,
+            selector: None,
             on_click: None,
         }
+    }
+
+    /// Name the button for GPUI's test `debug_bounds`, so a test can find and click it. Recorded only in test
+    /// builds.
+    pub fn selector(mut self, selector: impl Into<String>) -> Self {
+        self.selector = Some(selector.into());
+        self
     }
 
     /// Set how prominent the button is.
@@ -232,6 +241,9 @@ impl RenderOnce for Button {
             .font_weight(weight)
             .whitespace_nowrap()
             .child(self.label);
+        if let Some(selector) = self.selector {
+            button = button.debug_selector(|| selector);
+        }
         if self.disabled {
             button = button.opacity(0.45);
         } else {
@@ -269,6 +281,12 @@ impl Pill {
     /// Show the pill as the current choice.
     pub fn selected(mut self, selected: bool) -> Self {
         self.button = self.button.selected(selected);
+        self
+    }
+
+    /// Name the pill for GPUI's test `debug_bounds`; see [`Button::selector`].
+    pub fn selector(mut self, selector: impl Into<String>) -> Self {
+        self.button = self.button.selector(selector);
         self
     }
 
