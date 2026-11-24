@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use xctx_channel::ScratchDir;
 use xctx_core::Space;
 use xctx_layout::{PaneKind, PaneRole};
 use xctx_term::TerminalConfig;
@@ -288,6 +289,39 @@ pub struct PaneLaunch {
     pub notice: Option<String>,
 }
 
+/// The environment variable naming the agent a pane runs as, by its id in the space's graph.
+pub const AGENT_ID_ENV: &str = "XCTX_AGENT_ID";
+
+/// The environment variable naming the role of the agent a pane runs as: `orchestrator`, `writer` or
+/// `helper:<kind>`.
+pub const AGENT_ROLE_ENV: &str = "XCTX_AGENT_ROLE";
+
+/// The environment variable naming the space's scratch directory, `/tmp/xctx-scratch/<slug>`, which is removed
+/// on Ship or Discard.
+pub const SCRATCH_DIR_ENV: &str = "XCTX_SCRATCH_DIR";
+
+/// The agent of a space's graph a pane runs as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneAgent {
+    /// Its id in the graph, given to the pane as [`AGENT_ID_ENV`].
+    pub id: String,
+    /// Its role, given to the pane as [`AGENT_ROLE_ENV`].
+    pub role: String,
+}
+
+impl PaneLaunch {
+    /// The same launch, run as `agent` when there is one: [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`] are set.
+    pub fn with_agent(mut self, agent: Option<&PaneAgent>) -> PaneLaunch {
+        if let Some(agent) = agent {
+            self.config = self
+                .config
+                .env(AGENT_ID_ENV, agent.id.clone())
+                .env(AGENT_ROLE_ENV, agent.role.clone());
+        }
+        self
+    }
+}
+
 /// The worktree a pane of `role` works in: its repo's worktree, else the space's first repo's.
 pub fn pane_worktree<'a>(space: &'a Space, role: &PaneRole) -> Option<&'a Path> {
     space
@@ -300,7 +334,9 @@ pub fn pane_worktree<'a>(space: &'a Space, role: &PaneRole) -> Option<&'a Path> 
 
 /// The config that starts a pane of `role` in `space`: its program (`pi` for agents, `lazygit` for git panes,
 /// the login shell for shells), run in the repo's worktree with the space's `PORT`, `XCTX_SPACE` and
-/// `MISE_ENV`, and `XCTX_CONTROL_SOCKET` when the control socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice.
+/// `MISE_ENV`, the space's scratch directory as [`SCRATCH_DIR_ENV`], and `XCTX_CONTROL_SOCKET` when the control
+/// socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice. The agent a pane
+/// runs as is added with [`PaneLaunch::with_agent`].
 pub fn pane_launch(
     space: &Space,
     role: &PaneRole,
@@ -349,6 +385,9 @@ pub fn pane_launch(
     }
     for (key, value) in space.env() {
         config = config.env(key, value);
+    }
+    if let Ok(scratch) = ScratchDir::for_space(space.id.as_str()) {
+        config = config.env(SCRATCH_DIR_ENV, scratch.root().to_string_lossy());
     }
     if let Some(control) = &search.control {
         config = config.env(
@@ -727,5 +766,45 @@ mod tests {
             search.pane_path(Some(Path::new("/Users/me/.pi/agent/bin/pi"))),
             "/usr/bin:/opt/homebrew/bin:/Users/me/.pi/agent/bin:/Users/me/.local/bin:/usr/local/bin"
         );
+    }
+
+    #[test]
+    fn panes_get_their_agent_and_the_spaces_scratch_dir() -> TestResult {
+        let root = tempfile::tempdir()?;
+        executable(&root.path().join("bin/pi"))?;
+        let space = space(root.path());
+        let search = search(root.path());
+        let agent = PaneAgent {
+            id: "writer-api".to_owned(),
+            role: "writer".to_owned(),
+        };
+        let launch = pane_launch(
+            &space,
+            &role(PaneKind::Agent, "api"),
+            &AgentStart::Continue,
+            &search,
+        )
+        .with_agent(Some(&agent));
+        assert_eq!(env(&launch, AGENT_ID_ENV), Some("writer-api"));
+        assert_eq!(env(&launch, AGENT_ROLE_ENV), Some("writer"));
+        assert_eq!(
+            env(&launch, SCRATCH_DIR_ENV),
+            Some("/tmp/xctx-scratch/fix-retry")
+        );
+
+        let shell = pane_launch(
+            &space,
+            &role(PaneKind::Shell, "web"),
+            &AgentStart::Continue,
+            &search,
+        )
+        .with_agent(None);
+        assert_eq!(env(&shell, AGENT_ID_ENV), None);
+        assert_eq!(env(&shell, AGENT_ROLE_ENV), None);
+        assert_eq!(
+            env(&shell, SCRATCH_DIR_ENV),
+            Some("/tmp/xctx-scratch/fix-retry")
+        );
+        Ok(())
     }
 }

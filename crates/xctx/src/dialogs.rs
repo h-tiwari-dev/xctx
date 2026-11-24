@@ -13,6 +13,7 @@ use crate::keymap::DIALOG_CONTEXT;
 use crate::lifecycle::{
     dirty_repos, discard_message, discard_space, ship_report_lines, ship_space,
 };
+use crate::space_graph::clean_scratch;
 use crate::workspace::{View, Workspace, in_flight_message, wait_message};
 
 /// An open dialog.
@@ -387,6 +388,9 @@ impl Workspace {
                 this.return_store(store, cx);
                 match result {
                     Ok(value) => {
+                        if !this.spaces.iter().any(|s| s.id == id) {
+                            this.space_ended(&id, cx);
+                        }
                         done(this, value, cx);
                         if this.dialog.is_none() {
                             let focus = this.task_prompt.focus_handle(cx);
@@ -409,6 +413,18 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// The space `id` was shipped or discarded: drop its agent graph from memory and remove its scratch
+    /// directory in the background, best effort (a leftover directory under `/tmp` harms nothing).
+    fn space_ended(&mut self, id: &SpaceId, cx: &mut Context<Self>) {
+        self.graphs.forget(id);
+        let slug = id.as_str().to_owned();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = clean_scratch(&slug);
+            })
+            .detach();
     }
 
     fn fail_job(&mut self, id: &SpaceId, error: JobError, action: &str, cx: &mut Context<Self>) {

@@ -9,13 +9,15 @@ use gpui::{
     AnyElement, App, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled,
     Subscription, Window, div,
 };
+use xctx_channel::ScratchDir;
 use xctx_control::{ErrorCode, RpcError};
 use xctx_core::{Space, SpaceId, SpaceShape};
+use xctx_graph::AgentNodeId;
 use xctx_layout::LayoutError;
 use xctx_layout::{FocusDirection, PaneId, PaneKind, PaneRole, RolePane, Shape, SplitAxis};
 use xctx_term::TerminalSession;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
-use xctx_ui::{PaneView, SplitView, Theme, pane_kind_label};
+use xctx_ui::{PaneView, SharedTab, SplitView, Theme, pane_kind_label};
 
 use crate::lifecycle::reshape_space;
 use crate::persist::{restore_layout, save_layout};
@@ -65,6 +67,23 @@ pub(crate) struct SpaceTab {
     pub(crate) space: Space,
     pub(crate) layout: SpaceLayout,
     pub(crate) terminals: HashMap<PaneId, PaneTerminal>,
+    /// Whether the agent graph panel is open beside the panes.
+    pub(crate) graph_open: bool,
+    /// The tab of the Shared Space panel shown in the graph panel.
+    pub(crate) shared_tab: SharedTab,
+}
+
+impl SpaceTab {
+    /// A tab for `space` laid out as `layout`, with no terminals started yet and the graph panel closed.
+    fn new(space: Space, layout: SpaceLayout) -> SpaceTab {
+        SpaceTab {
+            space,
+            layout,
+            terminals: HashMap::new(),
+            graph_open: false,
+            shared_tab: SharedTab::default(),
+        }
+    }
 }
 
 impl SpaceTab {
@@ -113,7 +132,8 @@ impl Workspace {
         }
     }
 
-    fn active_space_id(&self) -> Option<SpaceId> {
+    /// The space being shown, if one is.
+    pub(crate) fn active_space_id(&self) -> Option<SpaceId> {
         match &self.view {
             View::Space(id) => Some(id.clone()),
             View::Home => None,
@@ -157,14 +177,8 @@ impl Workspace {
             }
         };
         let panes = restored.layout.panes();
-        self.tabs.insert(
-            id.clone(),
-            SpaceTab {
-                space,
-                layout: restored.layout,
-                terminals: HashMap::new(),
-            },
-        );
+        self.tabs
+            .insert(id.clone(), SpaceTab::new(space, restored.layout));
         for pane in &panes {
             self.spawn_pane(id, pane, &AgentStart::Continue, window, cx);
         }
@@ -186,20 +200,14 @@ impl Workspace {
     ) {
         let id = space.id.clone();
         let start = AgentStart::Task(space.task.clone());
-        self.tabs.insert(
-            id.clone(),
-            SpaceTab {
-                space,
-                layout,
-                terminals: HashMap::new(),
-            },
-        );
+        self.tabs.insert(id.clone(), SpaceTab::new(space, layout));
         for pane in &panes {
             self.spawn_pane(&id, pane, &start, window, cx);
         }
     }
 
-    /// Start the program of `pane` in the space's tab.
+    /// Start the program of `pane` in the space's tab, as the agent of the space's graph it runs (see
+    /// [`Workspace::pane_agent_of`]), with the space's scratch directory made if it is missing.
     fn spawn_pane(
         &mut self,
         id: &SpaceId,
@@ -208,10 +216,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let agent = self.pane_agent_of(id, pane);
         let Some(tab) = self.tabs.get(id) else {
             return;
         };
-        let launch = pane_launch(&tab.space, &pane.role, start, &self.search);
+        if let Ok(scratch) = ScratchDir::for_space(id.as_str()) {
+            // Best effort: agents may write there with their own tools, which need the directory.
+            let _ = std::fs::create_dir_all(scratch.root());
+        }
+        let launch =
+            pane_launch(&tab.space, &pane.role, start, &self.search).with_agent(agent.as_ref());
         let program = launch.config.program.clone();
         let terminal = match TerminalView::spawn(
             launch.config,
@@ -403,6 +417,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<PaneId, RpcError> {
+        self.split_for_agent(id, target, axis, kind, repo, None, window, cx)
+    }
+
+    /// Split as [`Workspace::split_in`] does, binding the new pane to `agent` of the space's graph (when given)
+    /// before it starts, so it runs as that agent.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn split_for_agent(
+        &mut self,
+        id: &SpaceId,
+        target: Option<PaneId>,
+        axis: SplitAxis,
+        kind: PaneKind,
+        repo: Option<String>,
+        agent: Option<AgentNodeId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<PaneId, RpcError> {
         let tab = self.open_tab_mut(id)?;
         if let Some(repo) = &repo
             && !tab.space.repos.iter().any(|r| &r.name == repo)
@@ -426,6 +457,11 @@ impl Workspace {
             .map(|other| other.role)
             .collect();
         let start = split_agent_start(&tab.space, &pane.role, &others);
+        if let Some(agent) = &agent
+            && let Err(e) = self.bind_agent_pane(id, agent, pane.id)
+        {
+            self.show_op_error(e, cx);
+        }
         self.spawn_pane(id, &pane, &start, window, cx);
         self.layout_changed(id, window, cx);
         Ok(pane.id)
@@ -471,6 +507,7 @@ impl Workspace {
         }
         tab.layout.close(pane).map_err(|e| layout_error(id, e))?;
         tab.terminals.remove(&pane);
+        self.sync_agent_panes(id);
         self.layout_changed(id, window, cx);
         Ok(())
     }
@@ -661,6 +698,7 @@ impl Workspace {
         for pane in &result.removed {
             tab.terminals.remove(&pane.id);
         }
+        self.sync_agent_panes(id);
         for pane in &result.added {
             self.spawn_pane(id, pane, &AgentStart::Continue, window, cx);
         }
@@ -710,8 +748,21 @@ impl Workspace {
         sessions
     }
 
-    /// The split view of the space being shown.
+    /// The split view of the space being shown, with the agent graph panel beside it when open.
     pub(crate) fn render_space(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
+        let split = self.render_split(tab, cx);
+        if !tab.graph_open {
+            return split;
+        }
+        div()
+            .flex()
+            .size_full()
+            .child(div().flex_1().min_w_0().h_full().child(split))
+            .child(self.render_graph_panel(tab, cx))
+            .into_any_element()
+    }
+
+    fn render_split(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
         let panes = tab
             .layout

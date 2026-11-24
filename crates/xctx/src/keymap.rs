@@ -44,6 +44,8 @@ actions!(
         ResizeDown,
         /// Zoom the focused pane, or end the zoom.
         ToggleZoom,
+        /// Open or close the agent graph panel of the space being shown.
+        ToggleGraph,
         /// Show Home.
         ShowHome,
         /// Launch the draft shown on Home.
@@ -83,6 +85,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-ctrl-up", ResizeUp, ws),
         KeyBinding::new("cmd-ctrl-down", ResizeDown, ws),
         KeyBinding::new("cmd-shift-z", ToggleZoom, ws),
+        KeyBinding::new("cmd-g", ToggleGraph, ws),
         KeyBinding::new("cmd-0", ShowHome, ws),
         KeyBinding::new("cmd-enter", LaunchDraft, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
@@ -101,6 +104,7 @@ pub fn space_key_hints() -> Vec<KeyHint> {
         KeyHint::new("⌘⌥←→↑↓", "focus"),
         KeyHint::new("⌘⌃←→↑↓", "resize"),
         KeyHint::new("⌘⇧Z", "zoom"),
+        KeyHint::new("⌘G", "graph"),
         KeyHint::new("⌘0", "home"),
     ]
 }

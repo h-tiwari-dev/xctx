@@ -14,7 +14,8 @@ use serde_json::Value;
 use xctx_control::protocol::{
     Ack, DraftRepoSummary, InboxItemSummary, InboxListParams, InboxListResult, InboxPostParams,
     InboxPostResult, LayoutInfo, PaneSplitResult, PaneZoomResult, PingResult, RepoSummary,
-    SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary, StatusSetParams,
+    SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary, SpaceWidenProposeParams,
+    SpaceWidenProposeResult, StatusSetParams,
 };
 use xctx_control::{
     Call, Incoming, Responder, RpcError, Server, ServerConfig, StatusLevel, socket_path,
@@ -22,18 +23,29 @@ use xctx_control::{
 use xctx_core::{
     DraftRepo, EnvReport, MiseRunner, Redactor, RepoIndex, Space, SpaceDraft, SpaceId,
 };
-use xctx_inbox::{Filter, Inbox, ItemBody, Level, Notice, PlanGate, Source, welcome_notice};
+use xctx_graph::{LoopDecision, LoopStage};
+use xctx_inbox::{
+    Filter, Inbox, ItemBody, Level, Notice, PlanGate, Source, SpaceWiden, welcome_notice,
+};
 use xctx_layout::PaneKind;
 use xctx_ui::StatusBanner;
 
 use crate::lifecycle::{home_dir, repo_for_draft};
 use crate::persist::restore_layout;
+use crate::space_graph::{
+    SpaceGraphState, add_lane, channel_list, channel_post, contract_agree, contract_get,
+    contract_set, loop_advance, loop_approval_notice, loop_set_autonomy, remove_lane,
+    set_agent_paused,
+};
 use crate::space_layout::{SpaceLayout, layout_shape};
 use crate::spawn::{ControlEnv, ctl_dir_next_to};
 use crate::workspace::{Workspace, wait_message};
 
-/// The reason given to repos an agent named in `space.draft`.
+/// The reason given to repos an agent named in `space.draft` or `space.widen_propose`.
 pub const NAMED_BY_AGENT: &str = "named by the agent";
+
+/// Why a widening was asked for, when the agent gave no rationale.
+pub const WIDEN_DEFAULT_REASON: &str = "requested by an agent";
 
 /// The longest status message shown, in characters; longer ones are cut with an ellipsis.
 pub const MAX_STATUS_CHARS: usize = 300;
@@ -54,10 +66,11 @@ pub(crate) struct PendingDraft {
     responder: Responder,
 }
 
-/// An `inbox.list` that arrived before the startup mise check learned the secret values to mask, answered once
+/// A request whose answer shows stored text to an agent (`inbox.list`, `channel.list`, `contract.get`,
+/// `contract.agree`) that arrived before the startup mise check learned the secret values to mask, answered once
 /// it has.
-pub(crate) struct PendingInboxList {
-    params: InboxListParams,
+pub(crate) struct PendingMaskedRead {
+    call: Call,
     responder: Responder,
 }
 
@@ -160,27 +173,100 @@ pub fn draft_for(
     }
     let mut draft = SpaceDraft::new(task);
     for name in named {
-        let repo = match index.repos().iter().find(|r| &r.name == name) {
-            Some(found) => DraftRepo::new(found.path.clone(), NAMED_BY_AGENT),
-            None => {
-                let mut repo = repo_for_draft(name, home).map_err(|e| {
-                    let known: Vec<&str> = index.repos().iter().map(|r| r.name.as_str()).collect();
-                    RpcError::invalid_params(format!(
-                        "{name} is not an indexed repo ({e}); indexed repos: {}",
-                        if known.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            known.join(", ")
-                        }
-                    ))
-                })?;
-                repo.reason = NAMED_BY_AGENT.to_owned();
-                repo
-            }
-        };
-        draft.add_repo(repo);
+        draft.add_repo(named_repo(index, name, home)?);
     }
     Ok(draft)
+}
+
+/// The repo an agent named: an indexed repo called `name`, else the repo at the path `name`.
+pub fn named_repo(
+    index: &RepoIndex,
+    name: &str,
+    home: Option<&Path>,
+) -> Result<DraftRepo, RpcError> {
+    if let Some(found) = index.repos().iter().find(|r| r.name == name) {
+        return Ok(DraftRepo::new(found.path.clone(), NAMED_BY_AGENT));
+    }
+    let mut repo = repo_for_draft(name, home).map_err(|e| {
+        let known: Vec<&str> = index.repos().iter().map(|r| r.name.as_str()).collect();
+        RpcError::invalid_params(format!(
+            "{name} is not an indexed repo ({e}); indexed repos: {}",
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(", ")
+            }
+        ))
+    })?;
+    repo.reason = NAMED_BY_AGENT.to_owned();
+    Ok(repo)
+}
+
+/// Whether two repo paths are the same directory, comparing canonical paths when both resolve.
+fn same_repo(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// The widening `space.widen_propose` asks the user for: the named repos (by indexed name, else as a path) the
+/// active space does not have yet, and production when asked. Invalid when it names nothing, a conflict when the
+/// space already has everything asked for. Never widens; the Inbox item does once the user approves it.
+pub fn widen_proposal(
+    spaces: &[Space],
+    in_flight: impl Fn(&SpaceId) -> bool,
+    index: &RepoIndex,
+    params: &SpaceWidenProposeParams,
+    home: Option<&Path>,
+) -> Result<SpaceWiden, RpcError> {
+    let id = resolve_space(spaces, in_flight, &params.space)?;
+    let space = spaces
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+    let names: Vec<&str> = params
+        .repos
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.is_empty() && !params.production {
+        return Err(RpcError::invalid_params(
+            "space.widen_propose: name repos to add, or ask for production=true",
+        ));
+    }
+    let mut add_repos: Vec<DraftRepo> = Vec::new();
+    for name in names {
+        let repo = named_repo(index, name, home)?;
+        let known = space.repos.iter().any(|r| same_repo(&r.repo, &repo.path))
+            || add_repos.iter().any(|r| same_repo(&r.path, &repo.path));
+        if !known {
+            add_repos.push(repo);
+        }
+    }
+    let production = params.production && !space.production;
+    if add_repos.is_empty() && !production {
+        return Err(RpcError::conflict(format!(
+            "space {id} already has everything asked for"
+        )));
+    }
+    let reason = params
+        .rationale
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or(WIDEN_DEFAULT_REASON)
+        .to_owned();
+    Ok(SpaceWiden {
+        space: id,
+        add_repos,
+        production,
+        reason,
+    })
 }
 
 /// What `space.draft` answers once its Plan Gate is posted.
@@ -405,13 +491,16 @@ impl Workspace {
                     to_json(Ok(Ack {}))
                 }
             }
-            Call::InboxList(params) => {
+            call @ (Call::InboxList(_)
+            | Call::ChannelList(_)
+            | Call::ContractGet(_)
+            | Call::ContractAgree(_)) => {
                 if !self.mise_ready {
-                    self.pending_inbox_lists
-                        .push(PendingInboxList { params, responder });
+                    self.pending_masked_reads
+                        .push(PendingMaskedRead { call, responder });
                     return;
                 }
-                to_json(self.control_inbox_list(&params))
+                self.answer_masked_read(call, cx)
             }
             Call::InboxPost(p) => to_json(self.control_inbox_post(&p, cx)),
             Call::SpaceDraft(params) => {
@@ -422,25 +511,157 @@ impl Workspace {
                 }
                 to_json(self.control_draft(&params, cx))
             }
-            Call::GraphGet(_)
-            | Call::GraphPause(_)
-            | Call::GraphResume(_)
-            | Call::GraphAddLane(_)
-            | Call::GraphRemoveLane(_)
-            | Call::ChannelPost(_)
-            | Call::ChannelList(_)
-            | Call::ContractGet(_)
-            | Call::ContractSet(_)
-            | Call::ContractAgree(_)
-            | Call::LoopStatus(_)
-            | Call::LoopAdvance(_)
-            | Call::LoopSetAutonomy(_)
-            | Call::SpaceWidenPropose(_) => Err(RpcError::internal(format!(
-                "{}: not implemented yet (M3 Wave 3)",
-                call.method()
-            ))),
+            Call::GraphGet(p) => {
+                self.graph_call(&p.space, cx, |state, _, _| Ok(state.doc().clone()))
+            }
+            Call::GraphPause(p) => self.graph_call(&p.space, cx, |state, space, _| {
+                set_agent_paused(state, &space.id, &p.agent, true)
+            }),
+            Call::GraphResume(p) => self.graph_call(&p.space, cx, |state, space, _| {
+                set_agent_paused(state, &space.id, &p.agent, false)
+            }),
+            Call::GraphAddLane(p) => {
+                self.graph_call(&p.space, cx, |state, space, _| add_lane(state, space, &p))
+            }
+            Call::GraphRemoveLane(p) => self.graph_call(&p.space, cx, |state, space, _| {
+                remove_lane(state, &space.id, &p.agent).map(|_| Ack {})
+            }),
+            Call::ChannelPost(p) => self.graph_call(&p.space, cx, |state, space, _| {
+                channel_post(state, &space.id, &p)
+            }),
+            Call::ContractSet(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
+                contract_set(state, &space.id, &p, redactor)
+            }),
+            Call::LoopStatus(p) => {
+                self.graph_call(&p.space, cx, |state, _, _| Ok(state.loop_run().clone()))
+            }
+            Call::LoopAdvance(p) => {
+                let advanced = self.with_space_graph(&p.space, |state, space, _| {
+                    loop_advance(state, &space.id, p.checks_passed).map(|r| (space.id.clone(), r))
+                });
+                if let Ok((id, result)) = &advanced
+                    && let LoopDecision::NeedsApproval(stage) = result.decision
+                {
+                    self.post_loop_approval(id, stage, cx);
+                }
+                cx.notify();
+                to_json(advanced.map(|(_, result)| result))
+            }
+            Call::LoopSetAutonomy(p) => {
+                self.graph_call(&p.space, cx, |state, _, _| loop_set_autonomy(state, &p))
+            }
+            Call::SpaceWidenPropose(p) => to_json(self.control_widen_propose(&p, cx)),
         };
         responder.respond(result);
+    }
+
+    /// Answer a request that shows masked stored text (see [`PendingMaskedRead`]).
+    fn answer_masked_read(
+        &mut self,
+        call: Call,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, RpcError> {
+        match call {
+            Call::InboxList(params) => to_json(self.control_inbox_list(&params)),
+            Call::ChannelList(p) => self.graph_call(&p.space, cx, |state, _, redactor| {
+                channel_list(state, &p, redactor)
+            }),
+            Call::ContractGet(p) => self.graph_call(&p.space, cx, |state, _, redactor| {
+                Ok(contract_get(state, redactor))
+            }),
+            Call::ContractAgree(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
+                contract_agree(state, &space.id, &p.agent, redactor)
+            }),
+            other => Err(RpcError::internal(format!(
+                "{}: not a masked read",
+                other.method()
+            ))),
+        }
+    }
+
+    /// Run `op` on the graph state of the active space `name` (loading it on first use), redraw, and encode its
+    /// result.
+    fn graph_call<T: Serialize>(
+        &mut self,
+        name: &str,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(&mut SpaceGraphState, &Space, &Redactor) -> Result<T, RpcError>,
+    ) -> Result<Value, RpcError> {
+        let result = self.with_space_graph(name, op);
+        cx.notify();
+        to_json(result)
+    }
+
+    /// Run `op` on the graph state of the active space `name`, loading it on first use. Not found for a space
+    /// that is not active, a conflict while it is shipped or discarded.
+    pub(crate) fn with_space_graph<T>(
+        &mut self,
+        name: &str,
+        op: impl FnOnce(&mut SpaceGraphState, &Space, &Redactor) -> Result<T, RpcError>,
+    ) -> Result<T, RpcError> {
+        let id = resolve_space(&self.spaces, |id| self.in_flight_spaces.contains(id), name)?;
+        let space = self
+            .tabs
+            .get(&id)
+            .map(|tab| &tab.space)
+            .or_else(|| self.spaces.iter().find(|s| s.id == id))
+            .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+        let state = self.graphs.load(space).map_err(RpcError::internal)?;
+        op(state, space, &self.redactor)
+    }
+
+    /// The loop of space `id` waits for the user to approve moving to `stage`: say so in the Inbox and the status
+    /// bar.
+    pub(crate) fn post_loop_approval(
+        &mut self,
+        id: &SpaceId,
+        stage: LoopStage,
+        cx: &mut Context<Self>,
+    ) {
+        let notice = loop_approval_notice(id, stage);
+        let title = notice.title.clone();
+        if let Some(inbox) = self.inbox.as_mut()
+            && let Err(e) = inbox.post(ItemBody::Notice(notice), Some(id.clone()), Source::App)
+        {
+            self.error(format!("could not post to the Inbox: {e}"), cx);
+            return;
+        }
+        self.info(title, cx);
+    }
+
+    /// `space.widen_propose`: post the widening to the Inbox for the user to approve. Never widens.
+    fn control_widen_propose(
+        &mut self,
+        params: &SpaceWidenProposeParams,
+        cx: &mut Context<Self>,
+    ) -> Result<SpaceWidenProposeResult, RpcError> {
+        if self.scanning && params.repos.as_ref().is_some_and(|r| !r.is_empty()) {
+            return Err(RpcError::conflict(
+                "the repo index is still being built; try again in a moment",
+            ));
+        }
+        let widen = widen_proposal(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            &self.index,
+            params,
+            home_dir().as_deref(),
+        )?;
+        let id = widen.space.clone();
+        let Some(inbox) = self.inbox.as_mut() else {
+            return Err(self.inbox_unavailable());
+        };
+        let item = inbox
+            .post(ItemBody::SpaceWiden(widen), Some(id.clone()), Source::Agent)
+            .map_err(|e| RpcError::internal(format!("could not post to the Inbox: {e}")))?;
+        self.info(
+            format!("A request to widen {id} is waiting in the Inbox for your approval"),
+            cx,
+        );
+        cx.notify();
+        Ok(SpaceWidenProposeResult {
+            inbox_item: item.as_str().to_owned(),
+        })
     }
 
     /// Answer the drafts that waited for the repo index.
@@ -454,22 +675,22 @@ impl Workspace {
         }
     }
 
-    /// Answer the `inbox.list` requests that waited for the startup mise check.
-    pub(crate) fn flush_inbox_lists(&mut self) {
-        for pending in std::mem::take(&mut self.pending_inbox_lists) {
+    /// Answer the masked reads that waited for the startup mise check.
+    fn flush_masked_reads(&mut self, cx: &mut Context<Self>) {
+        for pending in std::mem::take(&mut self.pending_masked_reads) {
             if pending.responder.is_cancelled() {
                 continue;
             }
-            let result = to_json(self.control_inbox_list(&pending.params));
+            let result = self.answer_masked_read(pending.call, cx);
             pending.responder.respond(result);
         }
     }
 
     /// The startup mise check has finished (or there was nothing to check): the secrets it found are masked, so
-    /// `inbox.list` may answer.
-    fn startup_mise_checked(&mut self) {
+    /// masked reads may answer.
+    fn startup_mise_checked(&mut self, cx: &mut Context<Self>) {
         self.mise_ready = true;
-        self.flush_inbox_lists();
+        self.flush_masked_reads(cx);
     }
 
     /// `inbox.list`: the Inbox items, with secrets masked.
@@ -606,8 +827,8 @@ impl Workspace {
         self.run_mise_check(spaces, false, cx);
     }
 
-    /// Check every active space with mise, as [`Workspace::check_mise`] does, once at startup: `inbox.list`
-    /// requests wait until it has finished, so none is answered before the secrets to mask are known.
+    /// Check every active space with mise, as [`Workspace::check_mise`] does, once at startup: masked reads
+    /// (see [`PendingMaskedRead`]) wait until it has finished, so none is answered before the secrets to mask are known.
     pub(crate) fn check_mise_at_startup(&mut self, cx: &mut Context<Self>) {
         let spaces = self.spaces.clone();
         self.run_mise_check(spaces, true, cx);
@@ -616,7 +837,7 @@ impl Workspace {
     fn run_mise_check(&mut self, spaces: Vec<Space>, startup: bool, cx: &mut Context<Self>) {
         let Some(mise) = self.search.find("mise") else {
             if startup {
-                self.startup_mise_checked();
+                self.startup_mise_checked(cx);
             }
             return;
         };
@@ -633,7 +854,7 @@ impl Workspace {
             .collect();
         if checks.is_empty() {
             if startup {
-                self.startup_mise_checked();
+                self.startup_mise_checked(cx);
             }
             return;
         }
@@ -658,7 +879,7 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 this.apply_mise_findings(findings, cx);
                 if startup {
-                    this.startup_mise_checked();
+                    this.startup_mise_checked(cx);
                 }
             });
         })
@@ -833,6 +1054,91 @@ mod tests {
         assert_eq!(draft.repos.len(), 1);
         assert_eq!(draft.repos[0].name, "payments");
         assert_eq!(draft.repos[0].reason, NAMED_BY_AGENT);
+        Ok(())
+    }
+
+    #[test]
+    fn widen_proposals_name_new_repos_or_production_and_never_nothing() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let web = root.path().join("web");
+        fs::create_dir_all(&web)?;
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&web)
+            .status()?;
+        assert!(status.success());
+        let spaces = [space("rate-limit")];
+        let index = RepoIndex::default();
+        let params = |repos: Option<Vec<String>>, production: bool| SpaceWidenProposeParams {
+            space: "rate-limit".into(),
+            repos,
+            production,
+            rationale: Some("  the web client sends the header ".into()),
+        };
+        let web_path = web.to_string_lossy().into_owned();
+
+        let widen = widen_proposal(
+            &spaces,
+            |_| false,
+            &index,
+            &params(Some(vec![web_path.clone(), web_path.clone()]), false),
+            None,
+        )?;
+        assert_eq!(widen.space, SpaceId::new("rate-limit"));
+        assert_eq!(widen.add_repos.len(), 1);
+        assert_eq!(widen.add_repos[0].name, "web");
+        assert_eq!(widen.add_repos[0].reason, NAMED_BY_AGENT);
+        assert!(!widen.production);
+        assert_eq!(widen.reason, "the web client sends the header");
+
+        let production = widen_proposal(&spaces, |_| false, &index, &params(None, true), None)?;
+        assert!(production.add_repos.is_empty() && production.production);
+
+        let nothing = widen_proposal(
+            &spaces,
+            |_| false,
+            &index,
+            &params(Some(vec![" ".into()]), false),
+            None,
+        );
+        assert_eq!(
+            nothing.err().and_then(|e| e.kind()),
+            Some(ErrorCode::InvalidParams)
+        );
+        let unknown = widen_proposal(
+            &spaces,
+            |_| false,
+            &index,
+            &params(Some(vec!["no-such-repo".into()]), false),
+            None,
+        );
+        assert_eq!(
+            unknown.err().and_then(|e| e.kind()),
+            Some(ErrorCode::InvalidParams)
+        );
+        let in_flight = widen_proposal(&spaces, |_| true, &index, &params(None, true), None);
+        assert_eq!(
+            in_flight.err().and_then(|e| e.kind()),
+            Some(ErrorCode::Conflict)
+        );
+        let missing = widen_proposal(&[], |_| false, &index, &params(None, true), None);
+        assert_eq!(
+            missing.err().and_then(|e| e.kind()),
+            Some(ErrorCode::NotFound)
+        );
+        let mut on_production = space("rate-limit");
+        on_production.production = true;
+        let already = widen_proposal(
+            &[on_production],
+            |_| false,
+            &index,
+            &params(None, true),
+            None,
+        );
+        assert_eq!(
+            already.err().and_then(|e| e.kind()),
+            Some(ErrorCode::Conflict)
+        );
         Ok(())
     }
 

@@ -8,15 +8,19 @@ use gpui::{
     Context, Div, Entity, Focusable, FontWeight, ParentElement, SharedString, Styled, Subscription,
     Window, div, prelude::*,
 };
-use xctx_core::{DraftRepo, Redactor, RepoIndex, SpaceDraft, SpaceId, mise};
-use xctx_inbox::{Filter, Inbox, InboxItem, ItemBody, ItemId, ItemKind, Source};
-use xctx_layout::Shape;
+use xctx_control::RpcError;
+use xctx_core::{
+    DraftRepo, Redactor, RepoIndex, Space, SpaceDraft, SpaceId, WidenReport, WidenRequest, mise,
+};
+use xctx_inbox::{Filter, Inbox, InboxItem, ItemBody, ItemId, ItemKind, Source, SpaceWiden};
+use xctx_layout::{PaneKind, Shape, SplitAxis};
 use xctx_ui::{
     Button, ButtonVariant, InboxAction, InboxEntry, InboxKind, InboxPanel, PlanGateCard,
     PlanGateView, PlanRepo, PromptEvent, PromptInput, Theme,
 };
 
 use crate::lifecycle::{ADDED_BY_HAND, home_dir, repo_for_draft};
+use crate::space_graph::add_writer_lanes;
 use crate::space_layout::{layout_shape, space_shape};
 use crate::workspace::Workspace;
 
@@ -178,6 +182,62 @@ pub fn drop_repo_by_display(draft: &mut SpaceDraft, path: &str) {
     draft.repos.retain(|r| r.path.to_string_lossy() != path);
 }
 
+/// What `xctx_core::widen` is asked to do for an approved widening.
+pub fn widen_request(widen: &SpaceWiden) -> WidenRequest {
+    WidenRequest {
+        repos: widen.add_repos.clone(),
+        production: widen.production,
+    }
+}
+
+/// Why the widening in Inbox item `item` of space `space` cannot be approved now, if it cannot: the same request
+/// is being approved already (`approving`), or the space is not active or is being shipped or discarded.
+pub fn widen_refusal(
+    approving: &HashSet<ItemId>,
+    item: &ItemId,
+    spaces: &[Space],
+    in_flight: impl Fn(&SpaceId) -> bool,
+    space: &SpaceId,
+) -> Option<String> {
+    if approving.contains(item) {
+        return Some(format!(
+            "the request to widen {space} is being approved already"
+        ));
+    }
+    if in_flight(space) {
+        return Some(format!(
+            "{space} is being shipped or discarded; it cannot be widened"
+        ));
+    }
+    if !spaces.iter().any(|s| &s.id == space) {
+        return Some(format!(
+            "{space} is not an active space; it cannot be widened"
+        ));
+    }
+    None
+}
+
+/// What the status bar says once space `id` is widened; `production_requested` is whether the widening asked
+/// for production (a space may have run with it before).
+pub fn widen_message(id: &SpaceId, report: &WidenReport, production_requested: bool) -> String {
+    let mut parts = Vec::new();
+    if !report.added_repos.is_empty() {
+        let names: Vec<&str> = report.added_repos.iter().map(|r| r.name.as_str()).collect();
+        parts.push(format!("added {}", names.join(", ")));
+    }
+    if production_requested && report.production_enabled {
+        parts.push(
+            "new panes run with MISE_ENV=production; panes started before now need a restart"
+                .to_owned(),
+        );
+    }
+    if parts.is_empty() {
+        format!("{id} already had everything asked for")
+    } else {
+        format!("Widened {id}: {}", parts.join("; "))
+    }
+}
+
 // -------------------------------------------------------------------------------------------------------------
 // The workspace side
 
@@ -227,10 +287,7 @@ impl Workspace {
                 self.plan_review = Some(id);
                 cx.notify();
             }
-            InboxAction::Approve => self.info(
-                "Widening a running space is not supported yet; the request stays in the Inbox",
-                cx,
-            ),
+            InboxAction::Approve => self.approve_widen(id, window, cx),
             InboxAction::Reject => {
                 self.change_inbox(cx, |inbox| inbox.reject(&id, None));
             }
@@ -332,6 +389,112 @@ impl Workspace {
             self.plan_launches.failed(&id);
         }
         cx.notify();
+    }
+
+    /// Approve a request to widen a space: add the worktrees (and switch to production) in the background, then
+    /// mark it approved, give each new repo a writer and, when the space is open, an agent pane, and check the
+    /// space with mise again. Refused while the same request is being approved or the space is not active.
+    fn approve_widen(&mut self, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.inbox.as_ref().and_then(|inbox| inbox.get(&id)) else {
+            return;
+        };
+        let ItemBody::SpaceWiden(widen) = &item.body else {
+            self.info("only requests to widen a space are approved here", cx);
+            return;
+        };
+        if !item.is_pending() {
+            return;
+        }
+        let widen = widen.clone();
+        let space_id = widen.space.clone();
+        if let Some(why) = widen_refusal(
+            &self.widen_approvals,
+            &id,
+            &self.spaces,
+            |s| self.in_flight_spaces.contains(s),
+            &space_id,
+        ) {
+            self.error(why, cx);
+            return;
+        }
+        let Some(mut store) = self.take_store(&format!("widening {space_id}"), cx) else {
+            return;
+        };
+        self.widen_approvals.insert(id.clone());
+        let request = widen_request(&widen);
+        let production = widen.production;
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let job_id = space_id.clone();
+            let (store, result) = executor
+                .spawn(async move {
+                    let result = xctx_core::widen(&mut store, &job_id, request);
+                    (store, result)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.return_store(store, cx);
+                this.widen_approvals.remove(&id);
+                match result {
+                    Ok(report) => {
+                        this.space_widened(&id, &space_id, &report, production, window, cx)
+                    }
+                    Err(e) => this.error(format!("could not widen {space_id}: {e}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The widening of `space_id` asked for by Inbox item `item` is done: mark it approved, give each added repo a
+    /// writer and (when the space is open) an agent pane, check the space with mise again, and say what changed.
+    fn space_widened(
+        &mut self,
+        item: &ItemId,
+        space_id: &SpaceId,
+        report: &WidenReport,
+        production: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.change_inbox(cx, |inbox| inbox.approve(item));
+        let Some(space) = self.spaces.iter().find(|s| &s.id == space_id).cloned() else {
+            return;
+        };
+        let open = match self.tabs.get_mut(space_id) {
+            Some(tab) => {
+                tab.space = space.clone();
+                true
+            }
+            None => false,
+        };
+        let lanes = self
+            .graphs
+            .load(&space)
+            .map_err(RpcError::internal)
+            .and_then(|state| add_writer_lanes(state, space_id, &report.added_repos));
+        if let Err(e) = lanes {
+            self.error(e.message, cx);
+        }
+        if open {
+            for repo in &report.added_repos {
+                if let Err(e) = self.split_in(
+                    space_id,
+                    None,
+                    SplitAxis::Horizontal,
+                    PaneKind::Agent,
+                    Some(repo.name.clone()),
+                    window,
+                    cx,
+                ) {
+                    self.show_op_error(e, cx);
+                }
+            }
+        }
+        self.check_mise(vec![space], cx);
+        self.info(widen_message(space_id, report, production), cx);
     }
 
     fn reject_plan(&mut self, cx: &mut Context<Self>) {
@@ -538,11 +701,56 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use xctx_core::RequiredVar;
-    use xctx_inbox::{MissingEnvVar, Notice, PlanGate, SpaceWiden};
+    use xctx_inbox::{MissingEnvVar, Notice, PlanGate};
 
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn widen_requests_carry_repos_and_production_and_say_what_changed() {
+        let widen = SpaceWiden {
+            space: SpaceId::new("s"),
+            add_repos: vec![DraftRepo::new("/code/web", "named by the agent")],
+            production: true,
+            reason: "needs prod data".into(),
+        };
+        let request = widen_request(&widen);
+        assert_eq!(request.repos, widen.add_repos);
+        assert!(request.production);
+
+        let id = SpaceId::new("s");
+        let report = WidenReport {
+            added_repos: Vec::new(),
+            production_enabled: true,
+        };
+        assert_eq!(
+            widen_message(&id, &report, true),
+            "Widened s: new panes run with MISE_ENV=production; panes started before now need a restart"
+        );
+        assert_eq!(
+            widen_message(&id, &report, false),
+            "s already had everything asked for"
+        );
+    }
+
+    #[test]
+    fn widening_is_refused_twice_or_for_spaces_that_are_not_active() {
+        let id = SpaceId::new("s");
+        let item = ItemId::new("i1");
+        let none = HashSet::new();
+        assert!(
+            widen_refusal(&none, &item, &[], |_| false, &id)
+                .is_some_and(|w| w.contains("not an active space"))
+        );
+        let busy = HashSet::from([item.clone()]);
+        assert!(
+            widen_refusal(&busy, &item, &[], |_| false, &id).is_some_and(|w| w.contains("already"))
+        );
+        assert!(
+            widen_refusal(&none, &item, &[], |_| true, &id).is_some_and(|w| w.contains("shipped"))
+        );
+    }
 
     #[test]
     fn entries_are_pending_redacted_and_marked() -> TestResult {

@@ -266,3 +266,105 @@ fn shipping_without_a_remote_keeps_the_work_on_the_branch() -> TestResult {
     assert_eq!(store.load_layout(&space.id)?, None);
     Ok(())
 }
+
+#[test]
+fn an_approved_widen_request_adds_a_worktree_and_a_writer() -> TestResult {
+    use xctx_control::protocol::SpaceWidenProposeParams;
+    use xctx_inbox::{Inbox, ItemBody, ItemState, Source};
+
+    use crate::control::widen_proposal;
+    use crate::inbox_view::{widen_message, widen_refusal, widen_request};
+    use crate::space_graph::{SpaceGraphState, add_writer_lanes};
+
+    let fixture = Fixture::new()?;
+    let mut store = fixture.store()?;
+    store.add_root(fixture.root.join("code"))?;
+    let index = scan_index(store.roots().to_vec());
+    let mut draft = index.draft("make payments checkout retry safe");
+    draft.repos.retain(|r| r.path == fixture.payments);
+    assert_eq!(draft.repos.len(), 1);
+    let space = launch_space(&mut store, draft)?.space;
+    let mut graph = SpaceGraphState::open(&fixture.data_dir(), &space)?;
+    assert_eq!(graph.graph().writers().count(), 1);
+
+    // Propose: an Inbox item, and nothing widened yet.
+    let spaces: Vec<_> = store.active_spaces().cloned().collect();
+    let params = SpaceWidenProposeParams {
+        space: space.id.as_str().to_owned(),
+        repos: Some(vec!["web".to_owned()]),
+        production: false,
+        rationale: Some("the web client reads the retry header".to_owned()),
+    };
+    let widen = widen_proposal(&spaces, |_| false, &index, &params, None)?;
+    assert_eq!(widen.add_repos.len(), 1);
+    let mut inbox = Inbox::open(fixture.root.join("inbox"))?;
+    let item = inbox.post(
+        ItemBody::SpaceWiden(widen),
+        Some(space.id.clone()),
+        Source::Agent,
+    )?;
+    assert_eq!(
+        store
+            .active_spaces()
+            .find(|s| s.id == space.id)
+            .map(|s| s.repos.len()),
+        Some(1)
+    );
+
+    // Approve: the steps the Inbox runs, in order.
+    let approving = std::collections::HashSet::new();
+    assert_eq!(
+        widen_refusal(&approving, &item, &spaces, |_| false, &space.id),
+        None
+    );
+    let refused = std::collections::HashSet::from([item.clone()]);
+    assert!(widen_refusal(&refused, &item, &spaces, |_| false, &space.id).is_some());
+    let request = match &inbox.get(&item).ok_or("the item is gone")?.body {
+        ItemBody::SpaceWiden(widen) => widen_request(widen),
+        other => return Err(format!("not a widen request: {other:?}").into()),
+    };
+    let report = xctx_core::widen(&mut store, &space.id, request)?;
+    inbox.approve(&item)?;
+    add_writer_lanes(&mut graph, &space.id, &report.added_repos)?;
+
+    let widened = store
+        .active_spaces()
+        .find(|s| s.id == space.id)
+        .cloned()
+        .ok_or("the space is gone")?;
+    assert_eq!(widened.repos.len(), 2);
+    let web = widened
+        .repos
+        .iter()
+        .find(|r| r.name == "web")
+        .ok_or("web was not added")?;
+    assert!(web.worktree.is_dir(), "{}", web.worktree.display());
+    assert_eq!(web.branch, space.branch());
+    assert_eq!(inbox.get(&item).map(|i| i.state), Some(ItemState::Approved));
+    let writers: Vec<Option<&str>> = graph.graph().writers().map(|w| w.role.repo()).collect();
+    assert_eq!(writers, [Some("payments"), Some("web")]);
+    let reloaded = SpaceGraphState::open(&fixture.data_dir(), &widened)?;
+    assert_eq!(reloaded.graph(), graph.graph());
+    assert_eq!(
+        widen_message(&space.id, &report, false),
+        format!("Widened {}: added web", space.id)
+    );
+
+    // A second approval of the same repos changes nothing.
+    assert!(
+        xctx_core::widen(
+            &mut store,
+            &space.id,
+            xctx_core::WidenRequest {
+                repos: report
+                    .added_repos
+                    .iter()
+                    .map(|r| xctx_core::DraftRepo::new(r.repo.clone(), "again"))
+                    .collect(),
+                production: false,
+            },
+        )
+        .is_err()
+    );
+    Ok(())
+}

@@ -3,6 +3,7 @@
 
 mod control;
 mod dialogs;
+mod graph_panel;
 mod home;
 mod inbox_view;
 mod keymap;
@@ -11,6 +12,7 @@ mod lifecycle;
 mod lifecycle_tests;
 mod parent_agent;
 mod persist;
+mod space_graph;
 mod space_layout;
 mod space_tab;
 mod spawn;

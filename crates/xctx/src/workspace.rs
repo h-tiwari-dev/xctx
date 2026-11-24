@@ -16,18 +16,19 @@ use xctx_ui::{
     BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme,
 };
 
-use crate::control::{Control, PendingDraft, PendingInboxList};
+use crate::control::{Control, PendingDraft, PendingMaskedRead};
 use crate::dialogs::Dialog;
 use crate::home::HomeDraft;
 use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight, ResizeUp,
-    ShowHome, SplitDown, SplitRight, ToggleZoom, WORKSPACE_CONTEXT, home_key_hints,
+    ShowHome, SplitDown, SplitRight, ToggleGraph, ToggleZoom, WORKSPACE_CONTEXT, home_key_hints,
     space_key_hints,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
+use crate::space_graph::SpaceGraphs;
 use crate::space_layout::layout_shape;
 use crate::space_tab::SpaceTab;
 use crate::spawn::ProgramSearch;
@@ -93,8 +94,13 @@ pub(crate) struct Workspace {
     pub(crate) pending_control_drafts: Vec<PendingDraft>,
     /// Whether the startup mise check has finished, so the redactor knows the secrets it found.
     pub(crate) mise_ready: bool,
-    /// `inbox.list` requests waiting for the startup mise check.
-    pub(crate) pending_inbox_lists: Vec<PendingInboxList>,
+    /// Requests showing masked stored text (`inbox.list`, `channel.list`, `contract.get`, `contract.agree`)
+    /// waiting for the startup mise check.
+    pub(crate) pending_masked_reads: Vec<PendingMaskedRead>,
+    /// Each space's agent graph, loop and shared space, loaded when first needed.
+    pub(crate) graphs: SpaceGraphs,
+    /// The space widening requests being approved now, so none is approved twice.
+    pub(crate) widen_approvals: HashSet<ItemId>,
     /// The Inbox; `None` when it could not be opened.
     pub(crate) inbox: Option<Inbox>,
     /// Why the Inbox could not be opened.
@@ -129,6 +135,10 @@ impl Workspace {
             Ok(store) => (Some(store), None),
             Err(e) => (None, Some(format!("could not open the xctx store: {e}"))),
         };
+        let data_dir = store
+            .as_ref()
+            .map(|store| store.dir().to_path_buf())
+            .or_else(|| xctx_core::store::data_dir().ok());
         let (inbox, inbox_error) = Workspace::open_inbox();
         let task_prompt = cx.new(|cx| {
             PromptInput::new(cx)
@@ -220,7 +230,9 @@ impl Workspace {
             control: None,
             pending_control_drafts: Vec::new(),
             mise_ready: false,
-            pending_inbox_lists: Vec::new(),
+            pending_masked_reads: Vec::new(),
+            graphs: SpaceGraphs::new(data_dir),
+            widen_approvals: HashSet::new(),
             inbox,
             inbox_error,
             redactor: Redactor::default(),
@@ -489,8 +501,10 @@ impl Workspace {
             })
             .collect();
         let shape = self.active_tab().map(|tab| layout_shape(tab.space.shape));
+        let graph_open = self.active_tab().is_some_and(|tab| tab.graph_open);
         let entity = cx.entity().downgrade();
-        let (home, select, reshape, ship, discard) = (
+        let (home, select, reshape, ship, discard, graph) = (
+            entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
@@ -501,6 +515,14 @@ impl Workspace {
             .home_active(active.is_none())
             .tabs(tabs)
             .active_shape(shape)
+            .graph_open(graph_open)
+            .on_graph(move |window, cx| {
+                let _ = graph.update(cx, |this, cx| {
+                    if this.dialog.is_none() {
+                        this.toggle_graph(window, cx);
+                    }
+                });
+            })
             .on_home(move |window, cx| {
                 let _ = home.update(cx, |this, cx| this.show_home(window, cx));
             })
@@ -612,6 +634,10 @@ impl Render for Workspace {
             .on_action(Self::pane_shortcut::<ToggleZoom>(cx, |this, window, cx| {
                 this.toggle_zoom(window, cx)
             }))
+            .on_action(Self::pane_shortcut::<ToggleGraph>(
+                cx,
+                |this, window, cx| this.toggle_graph(window, cx),
+            ))
             .on_action(cx.listener(|this, _: &ShowHome, window, cx| this.show_home(window, cx)))
             .on_action(cx.listener(|this, action: &ActivateTab, window, cx| {
                 if this.dialog.is_none() {
