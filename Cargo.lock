@@ -6244,6 +6244,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xctx-inbox"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "xctx-core",
+]
+
+[[package]]
 name = "xctx-layout"
 version = "0.1.0"
 dependencies = [

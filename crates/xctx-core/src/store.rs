@@ -47,7 +47,7 @@ pub fn resolve_data_dir(
 
 /// Write `bytes` to `path` through a temporary file in the same directory and a rename, so readers see either the
 /// old file or the new one. The parent directory must exist.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
