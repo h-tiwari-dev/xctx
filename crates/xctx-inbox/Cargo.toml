@@ -1,0 +1,14 @@
+[package]
+name = "xctx-inbox"
+version.workspace = true
+edition.workspace = true
+description = "The xctx Inbox: items that need the user (Plan Gates, space widenings, missing mise variables, notices), their approvals and their store on disk"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+xctx-core = { path = "../xctx-core" }
+
+[dev-dependencies]
+tempfile = "3"

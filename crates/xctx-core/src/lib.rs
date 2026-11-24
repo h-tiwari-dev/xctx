@@ -1,5 +1,5 @@
 //! The parts of xctx that need no window: git and worktrees, the repo index, the space model and its lifecycle, the
-//! per-space mise file, and the store on disk.
+//! per-space mise file, mise environment checks and secret redaction, and the store on disk.
 
 #![warn(missing_docs)]
 
@@ -7,11 +7,15 @@ pub mod error;
 pub mod git;
 pub mod index;
 pub mod mise;
+pub mod mise_env;
+pub mod redact;
 pub mod space;
 pub mod store;
 
 pub use error::{Error, Result};
 pub use index::{IndexedRepo, RepoIndex, RepoMatch};
+pub use mise_env::{EnvReport, MiseRunner, RequiredVar};
+pub use redact::Redactor;
 pub use space::{
     DiscardReport, DraftRepo, PullRequestOutcome, RemovedWorktree, RepoShipReport, ShipOptions,
     ShipOutcome, ShipReport, ShipSkipReason, Space, SpaceDraft, SpaceId, SpaceRepo, SpaceShape,
