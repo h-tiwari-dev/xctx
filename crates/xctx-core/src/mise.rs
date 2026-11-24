@@ -77,9 +77,11 @@ pub fn is_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Set `name = value` in the `[env]` of the space's mise file in `worktree`, replacing an earlier value of
-/// `name`. This is how a missing `required` variable is given for one space: the file is git-ignored and removed
-/// with the space. The file must exist (the space has launched). Returns its path.
+/// Set `name = { value = "<value>", redact = true }` in the `[env]` of the space's mise file in `worktree`,
+/// replacing an earlier value of `name`. This is how a missing `required` variable is given for one space: the
+/// file is git-ignored and removed with the space. `redact = true` makes mise report the value as a secret, so
+/// [`crate::MiseRunner::inspect`] lists it and it stays masked after the app restarts. The file must exist (the
+/// space has launched). Returns its path.
 pub fn set_space_var(worktree: &Path, slug: &str, name: &str, value: &str) -> Result<PathBuf> {
     if !is_env_var_name(name) {
         return Err(crate::Error::Io {
@@ -101,7 +103,10 @@ pub fn set_space_var(worktree: &Path, slug: &str, name: &str, value: &str) -> Re
     if !text.lines().any(|l| l.trim() == "[env]") {
         text.push_str("[env]\n");
     }
-    text.push_str(&format!("{name} = {}\n", toml_string(value)));
+    text.push_str(&format!(
+        "{name} = {{ value = {}, redact = true }}\n",
+        toml_string(value)
+    ));
     write_atomic(&path, text.as_bytes())?;
     Ok(path)
 }
@@ -212,7 +217,10 @@ mod tests {
         let text = fs::read_to_string(&path).map_err(io_error(&path))?;
         assert!(text.contains("PORT = \"4001\""), "{text}");
         assert_eq!(text.matches("STRIPE_KEY").count(), 1, "{text}");
-        assert!(text.ends_with("STRIPE_KEY = \"sk_two\"\n"), "{text}");
+        assert!(
+            text.ends_with("STRIPE_KEY = { value = \"sk_two\", redact = true }\n"),
+            "{text}"
+        );
         assert!(set_space_var(dir.path(), "s", "BAD NAME", "x").is_err());
         assert!(set_space_var(dir.path(), "missing", "A", "x").is_err());
         Ok(())

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
+use crate::mise::is_env_var_name;
 
 /// The most missing variables one inspection will step through before giving up, so a misbehaving mise cannot
 /// loop forever.
@@ -100,6 +101,9 @@ impl MiseRunner {
             for (key, value) in &self.env {
                 command.env(key, value);
             }
+            // Plain stderr: a user's CLICOLOR_FORCE would otherwise wrap "mise ERROR" in ANSI codes, and the
+            // missing-variable and boilerplate filters would miss.
+            command.env("NO_COLOR", "1").env("MISE_COLOR", "0");
             match mise_env {
                 Some(name) => command.env("MISE_ENV", name),
                 None => command.env_remove("MISE_ENV"),
@@ -186,13 +190,14 @@ fn parse_secrets(
 /// mise ERROR Version: ...
 /// ```
 ///
-/// Returns `None` when `stderr` is about something else.
+/// Returns `None` when `stderr` is about something else, or when the name it gives is not a valid environment
+/// variable name (see [`crate::mise::is_env_var_name`]), since it is later set in mise's environment.
 pub fn parse_missing_required(stderr: &str) -> Option<RequiredVar> {
     const MARK: &str = "Required environment variable '";
     let start = stderr.find(MARK)? + MARK.len();
     let rest = &stderr[start..];
     let name = &rest[..rest.find('\'')?];
-    if name.is_empty() {
+    if !is_env_var_name(name) {
         return None;
     }
     let required_in = rest.find("(Required in: ").and_then(|i| {
@@ -255,6 +260,16 @@ mod tests {
             parse_missing_required("mise ERROR Config files in /a are not trusted."),
             None
         );
+    }
+
+    #[test]
+    fn names_that_are_not_env_var_names_are_not_missing_vars() {
+        for name in ["A=B", "A B", "1A", "A\0B", ""] {
+            let stderr = format!(
+                "mise ERROR Required environment variable '{name}' is not defined. (Required in: /a/mise.toml)\n"
+            );
+            assert_eq!(parse_missing_required(&stderr), None, "{name:?}");
+        }
     }
 
     #[test]
