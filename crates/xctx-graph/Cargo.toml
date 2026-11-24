@@ -1,0 +1,11 @@
+[package]
+name = "xctx-graph"
+version.workspace = true
+edition.workspace = true
+description = "A space's agent graph (one orchestrator, at most one writer per repo, read-only helpers), its write -> test -> probe -> review loop with autonomy levels, and their store on disk"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
