@@ -11,7 +11,7 @@ use crate::keymap::DIALOG_CONTEXT;
 use crate::lifecycle::{
     dirty_repos, discard_message, discard_space, ship_report_lines, ship_space,
 };
-use crate::workspace::{View, Workspace};
+use crate::workspace::{View, Workspace, in_flight_message, wait_message};
 
 /// An open dialog.
 pub(crate) enum Dialog {
@@ -49,6 +49,23 @@ impl Dialog {
             self,
             Dialog::Ship { running: true, .. } | Dialog::Discard { running: true, .. }
         )
+    }
+
+    /// What the dialog's running job is doing, such as "shipping fix-retry"; `None` when none is running.
+    fn running_job(&self) -> Option<String> {
+        match self {
+            Dialog::Ship {
+                space,
+                running: true,
+                ..
+            } => Some(format!("shipping {space}")),
+            Dialog::Discard {
+                space,
+                running: true,
+                ..
+            } => Some(format!("discarding {space}")),
+            _ => None,
+        }
     }
 
     fn set_outcome(&mut self, outcome: Option<String>, dirty_repos: Option<Vec<String>>) {
@@ -104,13 +121,38 @@ impl JobError {
 }
 
 impl Workspace {
+    /// Whether the open dialog is about space `id`.
+    fn dialog_is_for(&self, id: &SpaceId) -> bool {
+        self.dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.space() == id)
+    }
+
+    /// When a Ship or Discard dialog cannot open for space `id` now, say why and return `true`: another dialog's
+    /// job is running, or the space's own ship or discard is.
+    fn refuse_space_dialog(&mut self, id: &SpaceId, cx: &mut Context<Self>) -> bool {
+        if let Some(job) = self.dialog.as_ref().and_then(Dialog::running_job) {
+            self.info(wait_message(&job), cx);
+            return true;
+        }
+        if self.in_flight_spaces.contains(id) {
+            self.info(in_flight_message(id), cx);
+            return true;
+        }
+        false
+    }
+
     /// Ask to ship the space being shown.
     pub(crate) fn open_ship(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab() else {
+        let Some((space, current_title)) = self
+            .active_tab()
+            .map(|tab| (tab.space.id.clone(), tab.space.title.clone()))
+        else {
             return;
         };
-        let space = tab.space.id.clone();
-        let current_title = tab.space.title.clone();
+        if self.refuse_space_dialog(&space, cx) {
+            return;
+        }
         let title = cx.new(|cx| {
             let mut input = PromptInput::new(cx).placeholder("Pull request title");
             input.set_value(&current_title, cx);
@@ -139,11 +181,14 @@ impl Workspace {
 
     /// Ask to discard the space being shown.
     pub(crate) fn open_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab() else {
+        let Some(space) = self.active_tab().map(|tab| tab.space.id.clone()) else {
             return;
         };
+        if self.refuse_space_dialog(&space, cx) {
+            return;
+        }
         self.dialog = Some(Dialog::Discard {
-            space: tab.space.id.clone(),
+            space,
             dirty: None,
             error: None,
             running: false,
@@ -198,10 +243,13 @@ impl Workspace {
             true,
             move |store| ship_space(store, &id, Some(&pr_title), &options),
             |this, report, cx| {
-                this.dialog = Some(Dialog::Shipped {
-                    space: report.space.clone(),
-                    lines: ship_report_lines(&report),
-                });
+                if this.dialog_is_for(&report.space) {
+                    this.dialog = Some(Dialog::Shipped {
+                        space: report.space.clone(),
+                        lines: ship_report_lines(&report),
+                    });
+                    this.dialog_subscription = None;
+                }
                 this.info(format!("shipped {}", report.space), cx);
             },
             "ship",
@@ -233,7 +281,10 @@ impl Workspace {
             !force,
             move |store| discard_space(store, &id, force),
             |this, report, cx| {
-                this.dialog = None;
+                if this.dialog_is_for(&report.space) {
+                    this.dialog = None;
+                    this.dialog_subscription = None;
+                }
                 this.info(discard_message(&report), cx);
             },
             "discard",
@@ -243,9 +294,9 @@ impl Workspace {
     }
 
     /// Ship or discard the space `id` in the background. With `check_dirty`, worktrees with uncommitted changes
-    /// stop it before anything is closed. Otherwise the space's terminals are stopped, the store is handed to
-    /// `job`, and on success Home is shown and `done` runs; on failure the space's panes come back and the
-    /// dialog shows the error.
+    /// stop it before anything is closed. Otherwise the space's layout is saved, its terminals are stopped, the
+    /// store is handed to `job`, and on success Home is shown and `done` runs; on failure the space's panes come
+    /// back and the dialog shows the error. The space is in [`Workspace::in_flight_spaces`] until the job ends.
     #[allow(clippy::too_many_arguments)]
     fn run_space_job<T: Send + 'static>(
         &mut self,
@@ -267,6 +318,7 @@ impl Workspace {
             );
             return;
         };
+        self.in_flight_spaces.insert(id.clone());
         let executor = cx.background_executor().clone();
         cx.spawn_in(window, async move |this, cx| {
             if check_dirty {
@@ -277,17 +329,23 @@ impl Workspace {
                     Err(e) => Some(JobError::from(e)),
                 };
                 if let Some(refusal) = refusal {
-                    let _ = this.update(cx, |this, cx| this.fail_job(&id, refusal, action, cx));
+                    let _ = this.update(cx, |this, cx| {
+                        this.in_flight_spaces.remove(&id);
+                        this.fail_job(&id, refusal, action, cx)
+                    });
                     return;
                 }
             }
             let store = this.update(cx, |this, cx| {
+                // Save the layout while the store is here: once it is taken, closing the tab would drop the save.
+                this.persist(&id, cx);
                 let store = this.take_store(&busy, cx)?;
                 this.close_space_tab(&id, cx);
                 Some(store)
             });
             let Ok(Some(mut store)) = store else {
                 let _ = this.update(cx, |this, cx| {
+                    this.in_flight_spaces.remove(&id);
                     this.fail_job(
                         &id,
                         JobError::Failed("the store is busy".into()),
@@ -304,6 +362,12 @@ impl Workspace {
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight_spaces.remove(&id);
+                if result.is_ok() {
+                    // The tab was closed before the job; close it again in case anything reopened it since. The
+                    // store is still away, so no layout is saved for a space that is gone.
+                    this.close_space_tab(&id, cx);
+                }
                 this.return_store(store, cx);
                 match result {
                     Ok(value) => {

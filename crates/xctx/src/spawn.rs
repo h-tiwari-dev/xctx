@@ -5,8 +5,13 @@
 //! tested without touching the user's `PATH` or home directory.
 
 use std::ffi::OsString;
+use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use xctx_core::Space;
 use xctx_layout::{PaneKind, PaneRole};
@@ -40,13 +45,102 @@ pub struct ProgramSearch {
 /// Where Homebrew and other package managers install programs.
 pub const SYSTEM_PROGRAM_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 
+/// How long [`login_shell_path`] waits for the login shell before giving up.
+pub const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The `PATH` the user's login shell `shell` sets up, read by running `shell -l -c 'printf %s "$PATH"'`. An app
+/// started from Finder or the Dock inherits launchd's bare `PATH`; this is where Homebrew and version managers add
+/// theirs. `None` when the shell cannot be run, fails, prints no usable `PATH`, or takes longer than `timeout` (it
+/// is then killed). Blocks for up to `timeout`.
+pub fn login_shell_path(shell: &str, timeout: Duration) -> Option<OsString> {
+    let mut child = Command::new(shell)
+        .args(["-l", "-c", "printf %s \"$PATH\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    let output = match child.stdout.take() {
+        Some(mut stdout) => {
+            // Read on a thread so a shell that never closes its output cannot block past the deadline.
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = sender.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
+            });
+            receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+                .and_then(Result::ok)
+        }
+        None => None,
+    };
+    let succeeded = output.is_some() && wait_until(&mut child, deadline);
+    if !succeeded {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    output.and_then(|bytes| parse_login_path(&bytes))
+}
+
+/// Whether `child` exits successfully before `deadline`.
+fn wait_until(child: &mut std::process::Child, deadline: Instant) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The `PATH` in what a login shell printed: its last line (start-up files may print before it), when that line
+/// names at least one absolute directory.
+pub fn parse_login_path(output: &[u8]) -> Option<OsString> {
+    let last = output
+        .rsplit(|&byte| byte == b'\n')
+        .find(|line| !line.is_empty())?;
+    let path = OsString::from_vec(last.to_vec());
+    std::env::split_paths(&path)
+        .any(|dir| dir.is_absolute())
+        .then_some(path)
+}
+
+/// `login`'s directories, then those of `inherited` that `login` lacks: the login shell's `PATH` wins, and what the
+/// process was started with (say, a terminal's activated tool directories) is kept after it.
+pub fn merge_paths(login: Option<OsString>, inherited: Option<OsString>) -> Option<OsString> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for path in [login, inherited].into_iter().flatten() {
+        for dir in std::env::split_paths(&path) {
+            if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()
+}
+
 impl ProgramSearch {
-    /// A search over this process's `PATH`, `HOME` and `SHELL`.
-    pub fn from_env() -> ProgramSearch {
+    /// A search over this process's `HOME` and `SHELL`, and a `PATH` of the login shell's `PATH` (see
+    /// [`login_shell_path`]) followed by this process's own. Runs the login shell, so it blocks for up to
+    /// [`LOGIN_SHELL_TIMEOUT`]: call it once, at startup.
+    pub fn from_login_shell() -> ProgramSearch {
+        let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty());
+        let login = login_shell_path(
+            shell.as_deref().unwrap_or(DEFAULT_SHELL),
+            LOGIN_SHELL_TIMEOUT,
+        );
         ProgramSearch::from_values(
-            std::env::var_os("PATH"),
+            merge_paths(login, std::env::var_os("PATH")),
             std::env::var_os("HOME"),
-            std::env::var("SHELL").ok(),
+            shell,
         )
     }
 
@@ -443,6 +537,44 @@ mod tests {
             pane_worktree(&space, &role(PaneKind::Shell, "gone")),
             Some(space.repos[0].worktree.as_path())
         );
+    }
+
+    #[test]
+    fn the_login_path_is_the_last_line_the_shell_printed() {
+        assert_eq!(
+            parse_login_path(b"/opt/homebrew/bin:/usr/bin"),
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin"))
+        );
+        assert_eq!(
+            parse_login_path(b"welcome back\n/usr/local/bin:/bin\n"),
+            Some(OsString::from("/usr/local/bin:/bin"))
+        );
+        assert_eq!(parse_login_path(b""), None);
+        assert_eq!(parse_login_path(b"\n\n"), None);
+        assert_eq!(parse_login_path(b"not a path"), None);
+    }
+
+    #[test]
+    fn the_login_path_comes_first_and_the_inherited_one_fills_in() {
+        assert_eq!(
+            merge_paths(
+                Some("/opt/homebrew/bin:/usr/bin".into()),
+                Some("/usr/bin:/Users/me/.cargo/bin:".into())
+            ),
+            Some(OsString::from(
+                "/opt/homebrew/bin:/usr/bin:/Users/me/.cargo/bin"
+            ))
+        );
+        assert_eq!(
+            merge_paths(None, Some("/usr/bin:/bin".into())),
+            Some(OsString::from("/usr/bin:/bin"))
+        );
+        assert_eq!(
+            merge_paths(Some("/a".into()), None),
+            Some(OsString::from("/a"))
+        );
+        assert_eq!(merge_paths(None, None), None);
+        assert_eq!(merge_paths(Some("".into()), Some("".into())), None);
     }
 
     #[test]

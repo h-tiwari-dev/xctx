@@ -83,11 +83,14 @@ pub fn default_key_hints() -> Vec<KeyHint> {
     vec![
         KeyHint::new("⌘D", "split"),
         KeyHint::new("⌘W", "close"),
-        KeyHint::new("⌘Z", "zoom"),
+        KeyHint::new("⌘⇧Z", "zoom"),
     ]
 }
 
-/// Hints as one line, `⌘D split · ⌘W close · ⌘Z zoom`.
+/// The narrowest a banner gets before the key hints give up their room, so a message never collapses to nothing.
+const BANNER_MIN_WIDTH: gpui::Pixels = px(160.0);
+
+/// Hints as one line, `⌘D split · ⌘W close · ⌘⇧Z zoom`.
 pub fn format_key_hints(hints: &[KeyHint]) -> String {
     hints
         .iter()
@@ -243,6 +246,7 @@ impl RenderOnce for StatusBar {
             div()
                 .flex()
                 .min_w_0()
+                .max_w_full()
                 .items_center()
                 .gap(Theme::SPACE_1)
                 .h(px(18.0))
@@ -251,13 +255,16 @@ impl RenderOnce for StatusBar {
                 .rounded(Theme::RADIUS_SM)
                 .bg(colors.bg)
                 .text_color(color)
-                .child(div().min_w_0().truncate().child(banner.message))
-                .children(dismiss)
+                .child(div().flex_1().min_w_0().truncate().child(banner.message))
+                .children(dismiss.map(|button| div().flex_none().child(button)))
         });
+        let has_banner = banner.is_some();
 
+        // With a banner showing, the hints shrink (and truncate) before the banner does.
         let hints = (!self.hints.is_empty()).then(|| {
             div()
-                .flex_none()
+                .when(has_banner, |hints| hints.min_w_0().truncate())
+                .when(!has_banner, |hints| hints.flex_none())
                 .text_color(theme.text_subtle)
                 .child(format_key_hints(&self.hints))
         });
@@ -287,6 +294,7 @@ impl RenderOnce for StatusBar {
                     .flex()
                     .flex_1()
                     .min_w_0()
+                    .when(has_banner, |container| container.min_w(BANNER_MIN_WIDTH))
                     .justify_end()
                     .children(banner),
             )
@@ -302,7 +310,7 @@ mod tests {
     fn default_hints_read_as_one_line() {
         assert_eq!(
             format_key_hints(&default_key_hints()),
-            "⌘D split · ⌘W close · ⌘Z zoom"
+            "⌘D split · ⌘W close · ⌘⇧Z zoom"
         );
         assert_eq!(format_key_hints(&[]), "");
         assert_eq!(format_key_hints(&[KeyHint::new("⌘T", "new")]), "⌘T new");

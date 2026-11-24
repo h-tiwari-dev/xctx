@@ -2,21 +2,26 @@
 //! they share (the store, the repo index, the open spaces, the status banner).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use gpui::{
     Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, SharedString,
     Styled, Subscription, Task, Window, div, prelude::*,
 };
-use xctx_core::{RepoIndex, Space, SpaceDraft, SpaceId, Store};
+use xctx_core::{RepoIndex, Space, SpaceId, Store};
 use xctx_layout::{FocusDirection, SplitAxis};
 use xctx_term_view::{TerminalFont, TerminalTheme};
-use xctx_ui::{PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme};
+use xctx_ui::{
+    BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme,
+};
 
 use crate::dialogs::Dialog;
+use crate::home::HomeDraft;
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
-    FocusRight, FocusUp, LaunchDraft, ResizeDown, ResizeLeft, ResizeRight, ResizeUp, ShowHome,
-    SplitDown, SplitRight, ToggleZoom, WORKSPACE_CONTEXT, home_key_hints, space_key_hints,
+    FocusRight, FocusUp, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight, ResizeUp,
+    ShowHome, SplitDown, SplitRight, ToggleZoom, WORKSPACE_CONTEXT, home_key_hints,
+    space_key_hints,
 };
 use crate::lifecycle::scan_index;
 use crate::space_layout::layout_shape;
@@ -45,12 +50,19 @@ pub(crate) struct Workspace {
     pub(crate) spaces: Vec<Space>,
     /// Spaces whose layout changed while the store was busy, saved once it is back.
     pub(crate) pending_persist: HashSet<SpaceId>,
+    /// Spaces whose divider drags are waiting for [`Workspace::persist_task`] to save them.
+    pub(crate) pending_drag_saves: HashSet<SpaceId>,
+    /// Spaces whose Ship or Discard job is running: they cannot be opened, shown, shipped or discarded until it
+    /// ends.
+    pub(crate) in_flight_spaces: HashSet<SpaceId>,
+    /// The indexed folders, as last read from the store; kept here so Home lists them while a job has the store.
+    pub(crate) roots: Vec<PathBuf>,
     pub(crate) index: RepoIndex,
     pub(crate) scanning: bool,
     scan_generation: u64,
     /// A task typed while the index was being built, drafted once it is.
     pub(crate) pending_task: Option<String>,
-    pub(crate) draft: Option<SpaceDraft>,
+    pub(crate) draft: HomeDraft,
     pub(crate) task_prompt: Entity<PromptInput>,
     pub(crate) root_input: Entity<PromptInput>,
     pub(crate) repo_input: Entity<PromptInput>,
@@ -64,6 +76,7 @@ pub(crate) struct Workspace {
     banner: Option<StatusBanner>,
     banner_generation: u64,
     banner_task: Option<Task<()>>,
+    /// The timer that saves [`Workspace::pending_drag_saves`] once divider drags pause.
     pub(crate) persist_task: Option<Task<()>>,
     pub(crate) search: ProgramSearch,
     pub(crate) terminal_font: TerminalFont,
@@ -135,11 +148,14 @@ impl Workspace {
             busy: None,
             spaces: Vec::new(),
             pending_persist: HashSet::new(),
+            pending_drag_saves: HashSet::new(),
+            in_flight_spaces: HashSet::new(),
+            roots: Vec::new(),
             index: RepoIndex::default(),
             scanning: false,
             scan_generation: 0,
             pending_task: None,
-            draft: None,
+            draft: HomeDraft::default(),
             task_prompt,
             root_input,
             repo_input,
@@ -152,11 +168,17 @@ impl Workspace {
             banner_generation: 0,
             banner_task: None,
             persist_task: None,
-            search: ProgramSearch::from_env(),
+            search: ProgramSearch::from_login_shell(),
             terminal_font: TerminalFont::default(),
             terminal_theme: TerminalTheme::default(),
             _subscriptions: subscriptions,
         };
+        // The window's close button must not end a launch, ship or discard halfway.
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            weak.update(cx, |this, cx| !this.refuse_while_busy(cx))
+                .unwrap_or(true)
+        });
         workspace.refresh_spaces();
         workspace.rescan(cx);
         let prompt_focus = workspace.task_prompt.focus_handle(cx);
@@ -171,8 +193,12 @@ impl Workspace {
         }
     }
 
-    /// Show a message in the status bar; info messages clear themselves.
+    /// Show a message in the status bar; info messages clear themselves. An info message does not replace an
+    /// error that is showing (see [`banner_replaces`]).
     pub(crate) fn set_banner(&mut self, banner: StatusBanner, cx: &mut Context<Self>) {
+        if !banner_replaces(self.banner.as_ref(), &banner) {
+            return;
+        }
         self.banner_generation += 1;
         let generation = self.banner_generation;
         self.banner_task = banner.auto_clear_after().map(|delay| {
@@ -210,7 +236,7 @@ impl Workspace {
     /// job has it or there is no store.
     pub(crate) fn take_store(&mut self, what: &str, cx: &mut Context<Self>) -> Option<Store> {
         if let Some(busy) = &self.busy {
-            self.error(format!("wait until {busy} finishes"), cx);
+            self.error(wait_message(busy), cx);
             return None;
         }
         match self.store.take() {
@@ -241,12 +267,25 @@ impl Workspace {
         cx.notify();
     }
 
+    /// When a background job holds the store, say so and return `true`: quitting or closing the window now would
+    /// stop it partway through its worktree or push operations.
+    pub(crate) fn refuse_while_busy(&mut self, cx: &mut Context<Self>) -> bool {
+        match self.busy.clone() {
+            Some(busy) => {
+                self.info(wait_message(&busy), cx);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Index the store's folders again, in the background.
     pub(crate) fn rescan(&mut self, cx: &mut Context<Self>) {
         let Some(store) = &self.store else {
             return;
         };
         let roots = store.roots().to_vec();
+        self.roots = roots.clone();
         self.scan_generation += 1;
         let generation = self.scan_generation;
         self.scanning = true;
@@ -284,8 +323,7 @@ impl Workspace {
             self.error(format!("space {id} is not active"), cx);
             return;
         }
-        self.open_space(id, window, cx);
-        if !self.tabs.contains_key(id) {
+        if !self.open_space(id, window, cx) {
             return;
         }
         if self.view != View::Space(id.clone()) {
@@ -311,11 +349,38 @@ impl Workspace {
         }
     }
 
+    /// Cmd+W: close the focused pane. On Home there is no pane, and closing the window would stop every space's
+    /// terminals, so it only says how to close the window or quit.
     fn on_close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.view {
-            View::Home => window.remove_window(),
+            View::Home => self.info(CLOSE_ON_HOME_HINT, cx),
             View::Space(_) => self.close_focused_pane(window, cx),
         }
+    }
+
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.refuse_while_busy(cx) {
+            window.remove_window();
+        }
+    }
+
+    fn quit(&mut self, cx: &mut Context<Self>) {
+        if !self.refuse_while_busy(cx) {
+            cx.quit();
+        }
+    }
+
+    /// A listener for a pane shortcut (split, close, focus, resize, zoom), which does nothing while a dialog is
+    /// open over the panes.
+    fn pane_shortcut<A: 'static>(
+        cx: &mut Context<Self>,
+        run: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl Fn(&A, &mut Window, &mut gpui::App) + 'static {
+        cx.listener(move |this, _: &A, window, cx| {
+            if this.dialog.is_none() {
+                run(this, window, cx);
+            }
+        })
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> TabBar {
@@ -414,53 +479,61 @@ impl Render for Workspace {
         div()
             .key_context(WORKSPACE_CONTEXT)
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
+            .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit(cx)))
             .on_action(
-                cx.listener(|this, _: &ClosePane, window, cx| this.on_close_pane(window, cx)),
+                cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+            .on_action(Self::pane_shortcut::<ClosePane>(cx, |this, window, cx| {
+                this.on_close_pane(window, cx)
+            }))
+            .on_action(Self::pane_shortcut::<SplitRight>(cx, |this, window, cx| {
                 this.split(SplitAxis::Horizontal, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+            .on_action(Self::pane_shortcut::<SplitDown>(cx, |this, window, cx| {
                 this.split(SplitAxis::Vertical, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
+            .on_action(Self::pane_shortcut::<FocusLeft>(cx, |this, window, cx| {
                 this.move_focus(FocusDirection::Left, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &FocusRight, window, cx| {
+            .on_action(Self::pane_shortcut::<FocusRight>(cx, |this, window, cx| {
                 this.move_focus(FocusDirection::Right, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &FocusUp, window, cx| {
+            .on_action(Self::pane_shortcut::<FocusUp>(cx, |this, window, cx| {
                 this.move_focus(FocusDirection::Up, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &FocusDown, window, cx| {
+            .on_action(Self::pane_shortcut::<FocusDown>(cx, |this, window, cx| {
                 this.move_focus(FocusDirection::Down, window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &FocusNext, window, cx| this.cycle_focus(true, window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &FocusPrev, window, cx| this.cycle_focus(false, window, cx)),
-            )
-            .on_action(cx.listener(|this, _: &ResizeLeft, window, cx| {
+            .on_action(Self::pane_shortcut::<FocusNext>(cx, |this, window, cx| {
+                this.cycle_focus(true, window, cx)
+            }))
+            .on_action(Self::pane_shortcut::<FocusPrev>(cx, |this, window, cx| {
+                this.cycle_focus(false, window, cx)
+            }))
+            .on_action(Self::pane_shortcut::<ResizeLeft>(cx, |this, window, cx| {
                 this.resize_focused(SplitAxis::Horizontal, -1.0, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ResizeRight, window, cx| {
-                this.resize_focused(SplitAxis::Horizontal, 1.0, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ResizeUp, window, cx| {
+            .on_action(Self::pane_shortcut::<ResizeRight>(
+                cx,
+                |this, window, cx| this.resize_focused(SplitAxis::Horizontal, 1.0, window, cx),
+            ))
+            .on_action(Self::pane_shortcut::<ResizeUp>(cx, |this, window, cx| {
                 this.resize_focused(SplitAxis::Vertical, -1.0, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ResizeDown, window, cx| {
+            .on_action(Self::pane_shortcut::<ResizeDown>(cx, |this, window, cx| {
                 this.resize_focused(SplitAxis::Vertical, 1.0, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom(window, cx)))
+            .on_action(Self::pane_shortcut::<ToggleZoom>(cx, |this, window, cx| {
+                this.toggle_zoom(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ShowHome, window, cx| this.show_home(window, cx)))
             .on_action(cx.listener(|this, action: &ActivateTab, window, cx| {
-                this.show_tab(action.0, window, cx)
+                if this.dialog.is_none() {
+                    this.show_tab(action.0, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &LaunchDraft, window, cx| {
-                if this.view == View::Home && this.draft.is_some() {
+                if this.view == View::Home && this.draft.get().is_some() {
                     this.launch_draft(window, cx);
                 } else {
                     cx.propagate();
@@ -485,5 +558,98 @@ impl Render for Workspace {
                     .children(dialog),
             )
             .child(self.render_status_bar(cx))
+    }
+}
+
+/// What Cmd+W on Home says instead of closing the window.
+const CLOSE_ON_HOME_HINT: &str = "Press ⌘⇧W to close window or ⌘Q to quit";
+
+/// The message shown when something has to wait for the background job `busy` (such as "shipping fix-retry").
+pub(crate) fn wait_message(busy: &str) -> String {
+    format!("Wait until {busy} finishes")
+}
+
+/// The message shown when space `id` is asked for while its ship or discard is running.
+pub(crate) fn in_flight_message(id: &SpaceId) -> String {
+    format!("{id} is being shipped or discarded")
+}
+
+/// Whether `new` may replace the banner showing, `current`: anything replaces nothing or an info message, but only
+/// another error replaces an error, so an error stays until the user dismisses it.
+pub(crate) fn banner_replaces(current: Option<&StatusBanner>, new: &StatusBanner) -> bool {
+    !(new.kind == BannerKind::Info && current.is_some_and(|b| b.kind == BannerKind::Error))
+}
+
+/// Why the tab of space `id` cannot be opened or shown now, if it cannot. A space whose ship or discard is running
+/// (`in_flight`) cannot. Otherwise an open tab can always be shown; a closed one needs the store, which holds its
+/// saved layout (opening it without would replace that layout with a fresh one). `busy` is what the background job
+/// holding the store is doing, if one is.
+pub(crate) fn open_space_refusal(
+    id: &SpaceId,
+    in_flight: bool,
+    tab_open: bool,
+    store_available: bool,
+    busy: Option<&str>,
+) -> Option<String> {
+    if in_flight {
+        return Some(in_flight_message(id));
+    }
+    if tab_open || store_available {
+        return None;
+    }
+    Some(match busy {
+        Some(busy) => wait_message(busy),
+        None => format!("the store is not available, so {id} cannot be opened"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_info_banner_does_not_replace_an_error() {
+        let info = StatusBanner::info("launched");
+        let error = StatusBanner::error("push failed");
+        assert!(banner_replaces(None, &info));
+        assert!(banner_replaces(None, &error));
+        assert!(banner_replaces(Some(&info), &info));
+        assert!(banner_replaces(Some(&info), &error));
+        assert!(banner_replaces(Some(&error), &error));
+        assert!(!banner_replaces(Some(&error), &info));
+    }
+
+    #[test]
+    fn a_closed_space_does_not_open_while_the_store_is_busy() {
+        let id = SpaceId::new("fix-retry");
+        assert_eq!(
+            open_space_refusal(&id, false, false, false, Some("launching rate limit")),
+            Some("Wait until launching rate limit finishes".to_owned())
+        );
+        assert!(
+            open_space_refusal(&id, false, false, false, None)
+                .is_some_and(|reason| reason.contains("store is not available"))
+        );
+        assert_eq!(open_space_refusal(&id, false, false, true, None), None);
+    }
+
+    #[test]
+    fn an_open_space_is_shown_while_the_store_is_busy() {
+        let id = SpaceId::new("fix-retry");
+        assert_eq!(
+            open_space_refusal(&id, false, true, false, Some("shipping other")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_space_being_shipped_or_discarded_never_opens() {
+        let id = SpaceId::new("fix-retry");
+        for (tab_open, store_available) in [(false, true), (true, true), (true, false)] {
+            assert_eq!(
+                open_space_refusal(&id, true, tab_open, store_available, None),
+                Some("fix-retry is being shipped or discarded".to_owned())
+            );
+        }
     }
 }

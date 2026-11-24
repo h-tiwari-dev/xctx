@@ -8,16 +8,16 @@ use gpui::{
     AnyElement, App, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled,
     Subscription, Window, div,
 };
-use xctx_core::{Space, SpaceId};
+use xctx_core::{Space, SpaceId, SpaceShape};
 use xctx_layout::{FocusDirection, PaneId, PaneKind, PaneRole, RolePane, Shape, SplitAxis};
 use xctx_term_view::{TerminalView, TerminalViewEvent};
 use xctx_ui::{PaneView, SplitView, Theme, pane_kind_label};
 
 use crate::lifecycle::reshape_space;
 use crate::persist::{restore_layout, save_layout};
-use crate::space_layout::{RESIZE_STEP, SpaceLayout};
+use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
 use crate::spawn::{AgentStart, pane_launch};
-use crate::workspace::{View, Workspace};
+use crate::workspace::{View, Workspace, open_space_refusal, wait_message};
 
 /// How long after the last divider drag movement the layout is saved.
 const DRAG_PERSIST_DELAY: Duration = Duration::from_millis(400);
@@ -64,6 +64,11 @@ impl SpaceTab {
     }
 }
 
+/// Whether `shape` is the shape a space in `current` already has, so reshaping to it would change nothing.
+pub(crate) fn is_current_shape(current: SpaceShape, shape: Shape) -> bool {
+    current == space_shape(shape)
+}
+
 /// The header of a pane: the program's own title when it set one, else `<repo> · <kind>`, with the exit code
 /// once it exited.
 pub(crate) fn pane_title(role: &PaneRole, terminal: Option<&PaneTerminal>) -> String {
@@ -102,24 +107,39 @@ impl Workspace {
     }
 
     /// Open the space's tab if it is not open yet: restore its saved layout (or make a fresh one) and start every
-    /// pane, agents resuming their last session.
-    pub(crate) fn open_space(&mut self, id: &SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+    /// pane, agents resuming their last session. Returns whether the tab is open. It is refused, with the reason
+    /// shown, while the space's ship or discard runs, and while the store (with the saved layout) is busy.
+    pub(crate) fn open_space(
+        &mut self,
+        id: &SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(reason) = open_space_refusal(
+            id,
+            self.in_flight_spaces.contains(id),
+            self.tabs.contains_key(id),
+            self.store.is_some(),
+            self.busy.as_deref(),
+        ) {
+            self.info(reason, cx);
+            return false;
+        }
         if self.tabs.contains_key(id) {
-            return;
+            return true;
         }
         let Some(space) = self.spaces.iter().find(|s| &s.id == id).cloned() else {
             self.error(format!("space {id} is not active"), cx);
-            return;
+            return false;
         };
-        let saved = match &self.store {
-            Some(store) => store.load_layout(id),
-            None => Ok(None),
+        let Some(store) = &self.store else {
+            return false;
         };
-        let restored = match restore_layout(saved, &space) {
+        let restored = match restore_layout(store.load_layout(id), &space) {
             Ok(restored) => restored,
             Err(e) => {
                 self.error(format!("could not lay out {id}: {e}"), cx);
-                return;
+                return false;
             }
         };
         let panes = restored.layout.panes();
@@ -138,6 +158,7 @@ impl Workspace {
             self.info(format!("{reason}; opened a fresh layout"), cx);
             self.persist(id, cx);
         }
+        true
     }
 
     /// Open a space that was just launched with its first layout, its agents given the task.
@@ -278,11 +299,16 @@ impl Workspace {
         }
     }
 
-    /// Save the layout of the space's tab shortly, once divider drags have paused.
+    /// Save the layout of the space's tab shortly, once divider drags (in this space or any other) have paused.
     fn persist_soon(&mut self, id: SpaceId, cx: &mut Context<Self>) {
+        self.pending_drag_saves.insert(id);
         self.persist_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DRAG_PERSIST_DELAY).await;
-            let _ = this.update(cx, |this, cx| this.persist(&id, cx));
+            let _ = this.update(cx, |this, cx| {
+                for id in std::mem::take(&mut this.pending_drag_saves) {
+                    this.persist(&id, cx);
+                }
+            });
         }));
     }
 
@@ -361,14 +387,19 @@ impl Workspace {
         }
     }
 
-    /// Focus `pane` of the space being shown, in the tree and its terminal.
+    /// Focus `pane` of the space being shown, in the tree and its terminal. A change of focus is saved.
     pub(crate) fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.active_space_id() else {
             return;
         };
-        if let Some(tab) = self.tabs.get_mut(&id)
-            && tab.layout.focus(pane).is_ok()
-        {
+        let Some(tab) = self.tabs.get_mut(&id) else {
+            return;
+        };
+        let changed = tab.layout.focused() != pane;
+        if tab.layout.focus(pane).is_ok() {
+            if changed {
+                self.persist(&id, cx);
+            }
             self.focus_active_pane(window, cx);
             cx.notify();
         }
@@ -385,6 +416,7 @@ impl Workspace {
             && let Some(tab) = self.tabs.get_mut(&id)
             && tab.layout.move_focus(direction).is_some()
         {
+            self.persist(&id, cx);
             self.focus_active_pane(window, cx);
             cx.notify();
         }
@@ -400,10 +432,14 @@ impl Workspace {
         if let Some(id) = self.active_space_id()
             && let Some(tab) = self.tabs.get_mut(&id)
         {
+            let before = tab.layout.focused();
             if forward {
                 tab.layout.focus_next();
             } else {
                 tab.layout.focus_prev();
+            }
+            if tab.layout.focused() != before {
+                self.persist(&id, cx);
             }
             self.focus_active_pane(window, cx);
             cx.notify();
@@ -456,13 +492,21 @@ impl Workspace {
     }
 
     /// Reshape the space being shown: agents keep running, panes the shape adds are started and panes it has no
-    /// place for are stopped. The shape and layout are saved.
+    /// place for are stopped. The shape and layout are saved. Choosing the shape the space already has does
+    /// nothing, so its split shells and divider positions are kept.
     pub(crate) fn reshape(&mut self, shape: Shape, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.active_space_id() else {
             return;
         };
+        if self
+            .tabs
+            .get(&id)
+            .is_some_and(|tab| is_current_shape(tab.space.shape, shape))
+        {
+            return;
+        }
         if let Some(busy) = &self.busy {
-            self.error(format!("wait until {busy} finishes"), cx);
+            self.error(wait_message(busy), cx);
             return;
         }
         let Some(store) = self.store.as_mut() else {
@@ -501,6 +545,7 @@ impl Workspace {
         }
         self.tabs.remove(id);
         self.pending_persist.remove(id);
+        self.pending_drag_saves.remove(id);
         if self.view == View::Space(id.clone()) {
             self.view = View::Home;
         }
@@ -569,6 +614,20 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reshaping_to_the_current_shape_is_a_no_op() {
+        let shapes = [
+            (SpaceShape::Dev, Shape::Dev),
+            (SpaceShape::Debug, Shape::Debug),
+            (SpaceShape::Review, Shape::Review),
+        ];
+        for (current, _) in shapes {
+            for (other, shape) in shapes {
+                assert_eq!(is_current_shape(current, shape), current == other);
+            }
+        }
+    }
 
     #[test]
     fn titles_fall_back_to_repo_and_kind() {

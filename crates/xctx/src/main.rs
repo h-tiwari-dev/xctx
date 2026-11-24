@@ -26,7 +26,21 @@ fn main() {
     gpui_platform::application().run(|cx: &mut App| {
         cx.set_global(Theme::dark());
         bind_keys(cx);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        // The workspace handles Quit itself when its window is active; this covers the rest.
+        cx.on_action(|_: &Quit, cx| {
+            let busy = cx
+                .windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<Workspace>())
+                .any(|window| {
+                    window
+                        .update(cx, |workspace, _, cx| workspace.refuse_while_busy(cx))
+                        .unwrap_or(false)
+                });
+            if !busy {
+                cx.quit();
+            }
+        });
         cx.set_menus(vec![Menu::new(xctx_core::APP_NAME).items([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
