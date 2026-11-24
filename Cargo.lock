@@ -6226,6 +6226,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xctx-attempt"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "xctx-core",
+]
+
+[[package]]
 name = "xctx-channel"
 version = "0.1.0"
 dependencies = [
