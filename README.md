@@ -15,7 +15,7 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
   - **Space widenings** are shown, but approving them is not supported yet.
 - **Secret redaction.** Values mise marks as secret are masked as `[REDACTED:NAME]` in everything agents and the Inbox see.
 
-Wave 4, review and hardening, is next.
+Wave 4, review and hardening, is in progress. The review findings still to fix, and where to pick up, are in [`docs/m2.md`](docs/m2.md#handoff-where-wave-4-stands).
 
 ## Prerequisites
 

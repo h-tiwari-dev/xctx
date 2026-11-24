@@ -18,7 +18,7 @@ See [`docs/m1.md`](m1.md).
   reshaping that preserves live agent panes.
 - Quit/reopen persistence (`pi --continue`), Ship (push + `gh pr create`), and Discard (remove worktrees, keep branches).
 
-### Milestone 2 — Local control socket, Parent Agent & Inbox (next)
+### Milestone 2 — Local control socket, Parent Agent & Inbox (in progress: Wave 4)
 See [`docs/m2.md`](m2.md).
 - Local Unix domain control socket (`xctx-control`) so agents can inspect and drive the window (`space.*`, `layout.*`,
   `pane.*`, `status.*`).
