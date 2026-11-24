@@ -45,7 +45,10 @@ struct Shared {
     emulator: FairMutex<Emulator>,
     process: Mutex<ProcessState>,
     process_exited: Condvar,
+    /// Set on drop: the reader stops.
     shutdown: AtomicBool,
+    /// Set by [`TerminalSession::shutdown_and_wait`]: the reader keeps draining the PTY but no longer parses.
+    discard_output: AtomicBool,
     on_event: EventCallback,
     pid: u32,
 }
@@ -101,6 +104,7 @@ impl TerminalSession {
             process: Mutex::new(ProcessState::default()),
             process_exited: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            discard_output: AtomicBool::new(false),
             on_event: Box::new(on_event),
             pid,
         });
@@ -215,7 +219,7 @@ impl TerminalSession {
 
     /// Ends the program and blocks until it has gone, for at most `timeout` plus one second.
     ///
-    /// Stops the reader, then sends SIGHUP (and SIGCONT, so stopped jobs act on it) to the
+    /// Stops parsing output, then sends SIGHUP (and SIGCONT, so stopped jobs act on it) to the
     /// program's process group and to the terminal's foreground process group if that differs
     /// (a job started by a shell). Waits up to `timeout` for the program to exit and be reaped
     /// and for the foreground group to empty; whatever remains then gets SIGKILL, followed by up
@@ -223,11 +227,13 @@ impl TerminalSession {
     /// was still running a second after SIGKILL (for example a process stuck in an
     /// uninterruptible wait).
     ///
-    /// Output arriving after this call is not parsed. The session may be dropped afterwards
-    /// as usual.
+    /// Output arriving after this call is read and thrown away, not parsed. It must still be
+    /// read: a program that writes while it exits (a TUI restoring the screen, say) would
+    /// otherwise fill the PTY's output queue, and macOS does not let a process finish exiting,
+    /// even after SIGKILL, until the output it left on its terminal has drained. The session
+    /// may be dropped afterwards as usual.
     pub fn shutdown_and_wait(&self, timeout: Duration) -> bool {
-        self.shared.shutdown.store(true, Ordering::Release);
-        let _ = self.poller.notify();
+        self.shared.discard_output.store(true, Ordering::Release);
 
         let foreground = pty::foreground_group(&self.master)
             .filter(|&group| libc::pid_t::try_from(self.shared.pid).ok() != Some(group));
@@ -456,11 +462,17 @@ fn run_reader(
     let mut events = Events::new();
 
     while !shared.shutdown.load(Ordering::Acquire) {
-        let timeout = shared
-            .emulator
-            .lock()
-            .sync_deadline()
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let discarding = shared.discard_output.load(Ordering::Acquire);
+        let timeout = if discarding {
+            // Nothing is parsed any more, so no synchronized update can expire.
+            None
+        } else {
+            shared
+                .emulator
+                .lock()
+                .sync_deadline()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        };
         events.clear();
         match poller.wait(&mut events, timeout) {
             Ok(_) => {}
@@ -472,6 +484,9 @@ fn run_reader(
         }
 
         if !events.iter().any(|event| event.key == PTY_KEY) {
+            if shared.discard_output.load(Ordering::Acquire) {
+                continue;
+            }
             // Woken by a timeout: a synchronized update may have expired.
             let flushed = {
                 let mut emulator = shared.emulator.lock();
@@ -494,6 +509,10 @@ fn run_reader(
             // EIO once every process holding the PTY slave has gone.
             Err(_) => break,
         };
+        if shared.discard_output.load(Ordering::Acquire) {
+            // Shutting down: drain so an exiting program is not held up by a full queue.
+            continue;
+        }
 
         let (changed, replies, events) = {
             let mut emulator = shared.emulator.lock();

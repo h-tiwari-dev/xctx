@@ -76,6 +76,13 @@ pub fn shown_attempt(set: &AttemptSet, shown: Option<u32>) -> Option<u32> {
     })
 }
 
+/// The worktree of the attempt the pane area shows (see [`shown_attempt`]), whose port and branch the status bar
+/// shows instead of the space's; none when it shows the space's own panes.
+pub fn shown_worktree(set: &AttemptSet, shown: Option<u32>) -> Option<&AttemptWorktree> {
+    let number = shown_attempt(set, shown)?;
+    set.get(number).map(|attempt| &attempt.worktree)
+}
+
 /// The strip's chips for `set`, the one numbered `shown` active.
 pub fn strip_chips(set: &AttemptSet, shown: Option<u32>, redactor: &Redactor) -> Vec<AttemptChip> {
     let shown = shown_attempt(set, shown);
@@ -1080,6 +1087,15 @@ mod tests {
         assert_eq!(shown_attempt(&set, None), None);
         set.mark_adopted(1, 12)?;
         assert_eq!(shown_attempt(&set, Some(1)), Some(1), "adopted still shows");
+        let shown = shown_worktree(&set, Some(1)).map(|w| (w.number, w.port, w.branch.clone()));
+        let attempt = set.get(1).map(|a| &a.worktree);
+        assert_eq!(
+            shown,
+            attempt.map(|w| (1, w.port, w.branch.clone())),
+            "the shown attempt's own port and branch"
+        );
+        assert!(shown_worktree(&set, Some(2)).is_none());
+        assert!(shown_worktree(&set, None).is_none());
         Ok(())
     }
 

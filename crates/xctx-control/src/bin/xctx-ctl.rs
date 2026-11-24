@@ -60,7 +60,7 @@ fn main() -> ExitCode {
             }
         }
         Err(ControlError::Rpc(e)) => {
-            eprintln!("xctx-ctl: {}: {}", call.method(), e.message);
+            eprintln!("{}", cli::refusal_line(call.method(), &e.message));
             ExitCode::from(1)
         }
         Err(e @ (ControlError::NotRunning(_) | ControlError::NoSocketPath(_))) => {

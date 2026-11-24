@@ -17,6 +17,7 @@ use xctx_ui::{
 };
 
 use crate::agent_session::SessionStorage;
+use crate::attempt_ui::shown_worktree;
 use crate::attempts::SpaceAttempts;
 use crate::control::{Control, PendingDraft, PendingMaskedRead};
 use crate::dialogs::Dialog;
@@ -583,11 +584,20 @@ impl Workspace {
         match self.active_tab() {
             Some(tab) => {
                 let space = &tab.space;
+                // An attempt shown in place of the space's panes runs on its own port and branch.
+                let (port, branch) = self
+                    .attempts
+                    .get(&space.id)
+                    .and_then(|set| shown_worktree(set, tab.shown_attempt))
+                    .map_or_else(
+                        || (space.port, space.branch()),
+                        |worktree| (worktree.port, worktree.branch.clone()),
+                    );
                 bar = bar
                     .space(space.id.as_str().to_owned())
                     .mise_env(space.effective_mise_env())
-                    .port(space.port)
-                    .branch(space.branch())
+                    .port(port)
+                    .branch(branch)
                     .shape(layout_shape(space.shape))
                     .zoomed(tab.layout.tree().is_zoomed())
                     .hints(space_key_hints());

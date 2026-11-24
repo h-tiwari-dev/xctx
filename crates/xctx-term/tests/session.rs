@@ -349,3 +349,42 @@ fn session_and_snapshot_can_cross_threads() {
     assert_send_sync::<TerminalSession>();
     assert_send_sync::<xctx_term::GridSnapshot>();
 }
+
+#[test]
+fn shutdown_and_wait_lets_a_program_that_writes_on_hangup_exit() {
+    // Like a TUI restoring the screen on SIGHUP: more output than the PTY queue holds. macOS
+    // keeps an exiting process (even a SIGKILLed one) until its terminal output has drained,
+    // so the session must keep reading the PTY while it waits.
+    let (session, _events) = spawn(sh(
+        r#"trap 'head -c 100000 /dev/zero | tr "\0" x; exit 0' HUP; echo ready; while :; do sleep 0.05; done"#,
+    ));
+    wait_for_text(&session, |text| text.contains("ready"));
+    let pid = session.pid();
+    let timeout = Duration::from_secs(2);
+    let started = Instant::now();
+    assert!(session.shutdown_and_wait(timeout), "program did not exit");
+    assert!(
+        started.elapsed() < timeout,
+        "program had to be killed: {:?}",
+        started.elapsed()
+    );
+    assert!(process_is_gone(pid), "program not reaped");
+}
+
+#[test]
+fn shutdown_and_wait_ends_a_program_flooding_the_terminal() {
+    let (session, _events) = spawn(sh("echo ready; sleep 0.2; exec /usr/bin/yes"));
+    wait_for_text(&session, |text| text.contains("ready"));
+    // Let `yes` fill the PTY's output queue.
+    std::thread::sleep(Duration::from_millis(400));
+    let pid = session.pid();
+    let timeout = Duration::from_secs(2);
+    let started = Instant::now();
+    assert!(session.shutdown_and_wait(timeout), "program did not exit");
+    assert!(
+        started.elapsed() < timeout,
+        "program had to be killed: {:?}",
+        started.elapsed()
+    );
+    assert!(process_is_gone(pid), "program not reaped");
+}

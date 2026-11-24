@@ -260,6 +260,20 @@ fn check_key(key: &str, arg: &str) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// The line `xctx-ctl` prints when the window refuses a call of `method`: the window's `message`, led by the
+/// method's name unless the message already names it (most of the window's refusals do).
+pub fn refusal_line(method: Method, message: &str) -> String {
+    let name = method.name();
+    let named = message
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with(':'));
+    if named {
+        format!("xctx-ctl: {message}")
+    } else {
+        format!("xctx-ctl: {name}: {message}")
+    }
+}
+
 /// The help text: usage, every method with its parameters, and the environment it reads.
 pub fn help() -> String {
     let mut out = String::from(
@@ -292,6 +306,26 @@ pub fn help() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_names_its_method_once() {
+        assert_eq!(
+            refusal_line(
+                Method::AttemptReport,
+                "attempt.report: the token does not belong to attempt 2 of s"
+            ),
+            "xctx-ctl: attempt.report: the token does not belong to attempt 2 of s"
+        );
+        assert_eq!(
+            refusal_line(Method::AttemptReport, "space s is not active"),
+            "xctx-ctl: attempt.report: space s is not active"
+        );
+        // Only the method's own name counts.
+        assert_eq!(
+            refusal_line(Method::AttemptReport, "attempt.reports: x"),
+            "xctx-ctl: attempt.report: attempt.reports: x"
+        );
+    }
     use crate::StatusLevel;
     use crate::protocol::ReproStatus;
     use crate::protocol::{
