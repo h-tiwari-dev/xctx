@@ -15,7 +15,9 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
   - **Space widenings** are shown, but approving them is not supported yet.
 - **Secret redaction.** Values mise marks as secret are masked as `[REDACTED:NAME]` in control responses and Inbox previews (including after restarts).
 
-See [`docs/m2.md`](docs/m2.md) and [`docs/roadmap.md`](docs/roadmap.md) for Milestone 3 next steps.
+**Milestone 3 (complete):** multi-agent graphs with an orchestrator, one writer per repo and read-only helpers, a shared contract and channel, write → test → probe → review loops with autonomy levels, and space widening. See [`docs/m3.md`](docs/m3.md).
+
+**Next: Milestone 4**, branching agents and competing attempts, planned in [`docs/m4.md`](docs/m4.md).
 
 ## Prerequisites
 

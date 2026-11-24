@@ -38,7 +38,8 @@ See [`docs/m3.md`](m3.md).
 - **Agent Graph View**: live GPUI view to inspect the graph, pause/resume agents, add/remove lanes, talk directly to a
   specific agent, or split/merge spaces.
 
-### Milestone 4 — Branching agents & competing attempts
+### Milestone 4 — Branching agents & competing attempts (next)
+See [`docs/m4.md`](m4.md).
 - **Git-branch an entire agent** (hidden worktree + `pi --fork` session tree + scratch state) to run competing
   attempts (Solutions 1, 2, 3) in parallel.
 - **Outcome comparison & review sheet**: compare repros, tests, and diffs side by side, discard dead ends, or merge the
