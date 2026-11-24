@@ -40,6 +40,28 @@ pub struct ProgramSearch {
     /// Where package managers install programs, tried after the home directory's tool folders:
     /// [`SYSTEM_PROGRAM_DIRS`] outside tests.
     pub system_dirs: Vec<PathBuf>,
+    /// The window's control socket and where `xctx-ctl` is, given to every pane; `None` when the socket is not
+    /// serving.
+    pub control: Option<ControlEnv>,
+}
+
+/// What panes need to drive the window: `XCTX_CONTROL_SOCKET`, and `xctx-ctl` on their `PATH`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlEnv {
+    /// The control socket, exported as [`xctx_control::CONTROL_SOCKET_ENV`].
+    pub socket: PathBuf,
+    /// The directory holding `xctx-ctl`, put first on panes' `PATH`; `None` when it was not found.
+    pub ctl_dir: Option<PathBuf>,
+}
+
+/// The name of the control CLI, installed next to the `xctx` executable.
+pub const CTL_PROGRAM: &str = "xctx-ctl";
+
+/// The directory of `xctx-ctl` when it sits next to `exe` (the running `xctx`): `target/<profile>/` in
+/// development, `xctx.app/Contents/MacOS/` in the bundle.
+pub fn ctl_dir_next_to(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    is_executable(&dir.join(CTL_PROGRAM)).then(|| dir.to_path_buf())
 }
 
 /// Where Homebrew and other package managers install programs.
@@ -161,6 +183,7 @@ impl ProgramSearch {
             home: home.filter(|h| !h.is_empty()).map(PathBuf::from),
             shell: shell.filter(|s| !s.is_empty()),
             system_dirs: SYSTEM_PROGRAM_DIRS.iter().map(PathBuf::from).collect(),
+            control: None,
         }
     }
 
@@ -193,16 +216,17 @@ impl ProgramSearch {
             .find(|candidate| is_executable(candidate))
     }
 
-    /// The `PATH` panes run with: this search's `PATH`, then the directory `program` was found in and the
+    /// The `PATH` panes run with: the `xctx-ctl` directory when the control socket is serving, this search's `PATH`,
+    /// then the directory `program` was found in and the
     /// [`ProgramSearch::extra_dirs`], without repeats. This lets a program found outside `PATH` (say `pi` in
     /// `~/.pi/agent/bin`, a node script) find its own interpreter and siblings.
     pub fn pane_path(&self, program: Option<&Path>) -> String {
         let mut dirs: Vec<PathBuf> = Vec::new();
         let program_dir = program.and_then(Path::parent).map(Path::to_path_buf);
-        for dir in self
-            .path
-            .iter()
-            .cloned()
+        let ctl_dir = self.control.as_ref().and_then(|c| c.ctl_dir.clone());
+        for dir in ctl_dir
+            .into_iter()
+            .chain(self.path.iter().cloned())
             .chain(program_dir)
             .chain(self.extra_dirs())
         {
@@ -254,7 +278,7 @@ pub fn pane_worktree<'a>(space: &'a Space, role: &PaneRole) -> Option<&'a Path> 
 
 /// The config that starts a pane of `role` in `space`: its program (`pi` for agents, `lazygit` for git panes,
 /// the login shell for shells), run in the repo's worktree with the space's `PORT`, `XCTX_SPACE` and
-/// `MISE_ENV`. A missing `pi` or `lazygit` falls back to the login shell with a notice.
+/// `MISE_ENV`, and `XCTX_CONTROL_SOCKET` when the control socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice.
 pub fn pane_launch(
     space: &Space,
     role: &PaneRole,
@@ -302,6 +326,12 @@ pub fn pane_launch(
     }
     for (key, value) in space.env() {
         config = config.env(key, value);
+    }
+    if let Some(control) = &search.control {
+        config = config.env(
+            xctx_control::CONTROL_SOCKET_ENV,
+            control.socket.to_string_lossy(),
+        );
     }
     config = config.env("PATH", search.pane_path(program.as_deref()));
     PaneLaunch { config, notice }
@@ -367,6 +397,7 @@ mod tests {
             home: Some(root.join("home")),
             shell: Some("/bin/fish".to_owned()),
             system_dirs: Vec::new(),
+            control: None,
         }
     }
 
@@ -479,6 +510,52 @@ mod tests {
     }
 
     #[test]
+    fn panes_get_the_control_socket_and_xctx_ctl_first_on_path() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let space = space(root.path());
+        let ctl_dir = root.path().join("app");
+        fs::create_dir_all(&ctl_dir)?;
+        executable(&ctl_dir.join(CTL_PROGRAM))?;
+        assert_eq!(
+            ctl_dir_next_to(&ctl_dir.join("xctx")),
+            Some(ctl_dir.clone())
+        );
+        assert_eq!(ctl_dir_next_to(&root.path().join("xctx")), None);
+
+        let mut search = search(root.path());
+        let plain = pane_launch(
+            &space,
+            &role(PaneKind::Shell, "web"),
+            &AgentStart::Continue,
+            &search,
+        );
+        assert_eq!(env(&plain, xctx_control::CONTROL_SOCKET_ENV), None);
+
+        search.control = Some(ControlEnv {
+            socket: root.path().join("control.sock"),
+            ctl_dir: Some(ctl_dir.clone()),
+        });
+        let launch = pane_launch(
+            &space,
+            &role(PaneKind::Shell, "web"),
+            &AgentStart::Continue,
+            &search,
+        );
+        let socket = root.path().join("control.sock");
+        assert_eq!(
+            env(&launch, xctx_control::CONTROL_SOCKET_ENV),
+            socket.to_str()
+        );
+        let path = env(&launch, "PATH").unwrap_or_default();
+        assert!(
+            path.starts_with(&format!("{}:", ctl_dir.display())),
+            "{path}"
+        );
+        assert_space_env(&launch, &space.repos[1].worktree);
+        Ok(())
+    }
+
+    #[test]
     fn shells_run_the_login_shell_in_the_worktree() -> TestResult {
         let root = tempfile::tempdir()?;
         let space = space(root.path());
@@ -587,6 +664,7 @@ mod tests {
             home: Some(PathBuf::from("/Users/me")),
             shell: None,
             system_dirs: SYSTEM_PROGRAM_DIRS.iter().map(PathBuf::from).collect(),
+            control: None,
         };
         assert_eq!(
             search.pane_path(Some(Path::new("/Users/me/.pi/agent/bin/pi"))),

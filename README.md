@@ -4,7 +4,14 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
 
 **Status:** Milestone 1 is complete — Home, repo indexing & task drafting, per-space git worktrees & `mise.<slug>.toml`, truecolor PTY terminal (`pi`, `nvim`, `lazygit`), split/zoom/reshape panes (`Dev`/`Debug`/`Review`), layout persistence & agent resume (`pi --continue`), and Ship/Discard all work end-to-end. See [`docs/roadmap.md`](docs/roadmap.md) and [`docs/m2.md`](docs/m2.md) for what comes next.
 
-**Milestone 2 (in progress):** Wave 1 is done. It adds the control socket and `xctx-ctl` CLI (`crates/xctx-control`), the Inbox and Plan Gate model (`crates/xctx-inbox`), and mise required-variable checks and secret redaction (`xctx-core`). The app does not open the socket or show the Inbox yet; that comes in Wave 3.
+**Milestone 2 (in progress):** Wave 1 added the control socket and `xctx-ctl` CLI (`crates/xctx-control`), the Inbox and Plan Gate model (`crates/xctx-inbox`), and mise required-variable checks and secret redaction (`xctx-core`). Wave 3 connects the socket to the app:
+
+- The app opens the control socket at startup and answers every method.
+- Every pane gets `XCTX_CONTROL_SOCKET`, and has `xctx-ctl` on its `PATH`.
+- The Inbox starts with a welcome notice.
+- Required mise variables that are not set in a space's worktrees are posted to the Inbox, and mise's secret values are masked.
+
+The Inbox panel, Plan Gate approval and the Parent Agent drawer come with Wave 2 (`m2-ui`). Until then, Plan Gates wait in the Inbox, and `xctx-ctl inbox.list` shows them.
 
 ## Prerequisites
 
@@ -25,10 +32,10 @@ All development runs through mise tasks:
 
 | Task | Description |
 | --- | --- |
-| `mise run dev` | Run the `xctx` app in debug mode |
+| `mise run dev` | Run the `xctx` app in debug mode, with `xctx-ctl` built next to it for its panes |
 | `mise run ctl <method> [key=value]...` | Run `xctx-ctl` against the running window (see below) |
-| `mise run build` | Build the `xctx` app in release mode |
-| `mise run bundle` | Assemble the release build into `xctx.app` at the repo root |
+| `mise run build` | Build the `xctx` app and `xctx-ctl` in release mode |
+| `mise run bundle` | Assemble the release build, with `xctx-ctl`, into `xctx.app` at the repo root |
 | `mise run test` | Run tests across the workspace |
 | `mise run fmt` | Format Rust code across the workspace |
 | `mise run fmt:check` | Check Rust formatting across the workspace |
@@ -54,7 +61,18 @@ mise run ctl -- --compact inbox.list all=true      # put options after --
 - The socket is `$XCTX_CONTROL_SOCKET`, else `control.sock` in the data directory (`$XCTX_DATA_DIR`, else `~/Library/Application Support/xctx`). Use `--socket <path>` to pick another one.
 - Inside a space's pane, `space=` defaults to `$XCTX_SPACE`, so `xctx-ctl pane.split axis=vertical` acts on the space you are in.
 - `xctx-ctl` prints the result as JSON. Exit status: `0` ok, `1` the window refused the request, `2` bad arguments, `3` no window is running.
+- In a pane of xctx, `xctx-ctl` is already on `PATH`, and `XCTX_CONTROL_SOCKET` points at its window.
+- A request about a space that is not open yet opens its tab first, which starts its panes. `layout.get` is the exception: it reads the saved layout and starts nothing.
 - Nothing on the socket can approve or launch. `space.draft` posts a Plan Gate to the Inbox, and the space launches only when you approve it in the window.
+
+### Trying it without touching your spaces
+
+Run the app on a throwaway data directory, then point `xctx-ctl` at that window's socket:
+
+```sh
+XCTX_DATA_DIR=/tmp/xctx-try mise run dev
+XCTX_CONTROL_SOCKET=/tmp/xctx-try/control.sock mise run ctl inbox.list   # in another terminal
+```
 
 ## Tests
 

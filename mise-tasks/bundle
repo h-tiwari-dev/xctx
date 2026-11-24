@@ -9,6 +9,8 @@ BIN="target/release/xctx"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/xctx"
+# Panes find xctx-ctl next to the app's executable.
+cp "target/release/xctx-ctl" "$APP/Contents/MacOS/xctx-ctl"
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

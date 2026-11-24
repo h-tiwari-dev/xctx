@@ -181,9 +181,21 @@ impl SpaceLayout {
 
     /// Split the focused pane along `axis` with a new shell in the same repo, which takes the focus. Returns
     /// the new pane, which needs starting.
+    #[cfg(test)]
     pub fn split_focused(&mut self, axis: SplitAxis) -> Result<RolePane, LayoutError> {
-        let target = self.tree.focused();
-        let repo = self
+        self.split(self.tree.focused(), axis, PaneKind::Shell, None)
+    }
+
+    /// Split `target` along `axis` with a new pane of `kind` in `repo` (the target's repo when `None`), which
+    /// takes the focus. Returns the new pane, which needs starting.
+    pub fn split(
+        &mut self,
+        target: PaneId,
+        axis: SplitAxis,
+        kind: PaneKind,
+        repo: Option<String>,
+    ) -> Result<RolePane, LayoutError> {
+        let target_repo = self
             .role(target)
             .map(|r| r.repo.clone())
             .ok_or(LayoutError::UnknownPane(target))?;
@@ -191,8 +203,8 @@ impl SpaceLayout {
         self.tree.split(target, axis, id, SPLIT_RATIO)?;
         self.take_pane_id();
         let role = PaneRole {
-            kind: PaneKind::Shell,
-            repo,
+            kind,
+            repo: repo.unwrap_or(target_repo),
         };
         self.roles.insert(id, role.clone());
         Ok(RolePane { id, role })
@@ -238,6 +250,12 @@ impl SpaceLayout {
     /// Zoom the focused pane, or end the zoom. Returns whether a pane is zoomed afterwards.
     pub fn toggle_zoom(&mut self) -> bool {
         self.tree.toggle_zoom()
+    }
+
+    /// Zoom `pane` (focusing it), or with `None` end the zoom. Returns the zoomed pane afterwards.
+    pub fn set_zoom(&mut self, pane: Option<PaneId>) -> Result<Option<PaneId>, LayoutError> {
+        self.tree.set_zoom(pane)?;
+        Ok(self.tree.zoomed())
     }
 
     /// Zoom `pane` (focusing it), or end the zoom if `pane` is already zoomed. Returns whether a pane is zoomed

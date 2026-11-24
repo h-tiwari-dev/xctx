@@ -8,13 +8,15 @@ use gpui::{
     Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, SharedString,
     Styled, Subscription, Task, Window, div, prelude::*,
 };
-use xctx_core::{RepoIndex, Space, SpaceId, Store};
+use xctx_core::{Redactor, RepoIndex, Space, SpaceId, Store};
+use xctx_inbox::Inbox;
 use xctx_layout::{FocusDirection, SplitAxis};
 use xctx_term_view::{TerminalFont, TerminalTheme};
 use xctx_ui::{
     BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme,
 };
 
+use crate::control::{Control, PendingDraft};
 use crate::dialogs::Dialog;
 use crate::home::HomeDraft;
 use crate::keymap::{
@@ -81,6 +83,16 @@ pub(crate) struct Workspace {
     pub(crate) search: ProgramSearch,
     pub(crate) terminal_font: TerminalFont,
     pub(crate) terminal_theme: TerminalTheme,
+    /// The control socket agents drive the window through; `None` when it could not be bound.
+    pub(crate) control: Option<Control>,
+    /// `space.draft` requests waiting for the repo index to be built.
+    pub(crate) pending_control_drafts: Vec<PendingDraft>,
+    /// The Inbox; `None` when it could not be opened.
+    pub(crate) inbox: Option<Inbox>,
+    /// Why the Inbox could not be opened.
+    pub(crate) inbox_error: Option<String>,
+    /// The secret values (from mise) masked in what agents and the Inbox see.
+    pub(crate) redactor: Redactor,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -97,6 +109,7 @@ impl Workspace {
             Ok(store) => (Some(store), None),
             Err(e) => (None, Some(format!("could not open the xctx store: {e}"))),
         };
+        let (inbox, inbox_error) = Workspace::open_inbox();
         let task_prompt = cx.new(|cx| {
             PromptInput::new(cx)
                 .placeholder("What do you want to do? e.g. add rate limiting to checkout")
@@ -171,6 +184,11 @@ impl Workspace {
             search: ProgramSearch::from_login_shell(),
             terminal_font: TerminalFont::default(),
             terminal_theme: TerminalTheme::default(),
+            control: None,
+            pending_control_drafts: Vec::new(),
+            inbox,
+            inbox_error,
+            redactor: Redactor::default(),
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -179,7 +197,13 @@ impl Workspace {
             weak.update(cx, |this, cx| !this.refuse_while_busy(cx))
                 .unwrap_or(true)
         });
+        // Before any pane starts, so every pane gets the socket.
+        workspace.start_control(window, cx);
+        if let Some(e) = workspace.inbox_error.clone() {
+            workspace.error(e, cx);
+        }
         workspace.refresh_spaces();
+        workspace.check_mise(workspace.spaces.clone(), cx);
         workspace.rescan(cx);
         let prompt_focus = workspace.task_prompt.focus_handle(cx);
         prompt_focus.focus(window, cx);
@@ -298,6 +322,7 @@ impl Workspace {
                 }
                 this.index = index;
                 this.scanning = false;
+                this.flush_control_drafts(cx);
                 if let Some(task) = this.pending_task.take() {
                     this.submit_task(task, cx);
                 }

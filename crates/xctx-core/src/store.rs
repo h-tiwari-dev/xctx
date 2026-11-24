@@ -59,14 +59,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// What `spaces.json` holds.
+/// What `spaces.json` holds. Fields it does not know are ignored, and a file without `version` (as the Swift
+/// prototype wrote, with the same `roots` and `spaces`) reads as version 1.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct StoreData {
+    #[serde(default = "first_version")]
     version: u32,
     #[serde(default)]
     roots: Vec<PathBuf>,
     #[serde(default)]
     spaces: Vec<Space>,
+}
+
+fn first_version() -> u32 {
+    1
 }
 
 /// The spaces and indexed roots, loaded from and saved to a data directory. Every change is written to disk before
@@ -309,6 +315,32 @@ mod tests {
         fs::set_permissions(dir.path(), writable).map_err(io_error(dir.path()))?;
         assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
         assert!(store.roots().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_prototype_spaces_file_without_a_version_is_read() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(io_error("tempdir"))?;
+        let legacy = br#"{
+  "inbox" : [
+
+  ],
+  "roots" : [
+    "\/Users\/me\/Documents"
+  ],
+  "spaces" : [
+
+  ]
+}"#;
+        fs::write(dir.path().join(SPACES_FILE), legacy).map_err(io_error(dir.path()))?;
+        let store = Store::open(dir.path())?;
+        assert_eq!(store.roots(), [PathBuf::from("/Users/me/Documents")]);
+        assert!(store.spaces().is_empty());
+        assert_eq!(
+            fs::read(dir.path().join(SPACES_FILE)).map_err(io_error(dir.path()))?,
+            legacy,
+            "opening does not rewrite the file"
+        );
         Ok(())
     }
 

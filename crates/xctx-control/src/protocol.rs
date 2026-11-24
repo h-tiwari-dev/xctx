@@ -422,7 +422,7 @@ impl Method {
     pub fn usage(self) -> &'static str {
         match self {
             Method::Ping | Method::SpaceList => "",
-            Method::SpaceDraft => "task=<text> [repos=<name>,<name>...]",
+            Method::SpaceDraft => "task=<text> [repos=<name>,<name>...] [rationale=<text>]",
             Method::SpaceReshape => "space=<slug> shape=dev|debug|review",
             Method::LayoutGet => "space=<slug>",
             Method::PaneSplit => {
@@ -460,6 +460,9 @@ pub struct SpaceDraftParams {
     /// Repos to include, by indexed name or path. When absent the window picks them from its repo index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repos: Option<Vec<String>>,
+    /// Why the space should look like this, shown with the Plan Gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
 }
 
 /// `space.reshape`.
@@ -875,6 +878,7 @@ mod tests {
             Call::SpaceDraft(SpaceDraftParams {
                 task: "rate limit".into(),
                 repos: Some(vec!["api".into()]),
+                rationale: Some("the limiter lives in the api".into()),
             }),
             Call::SpaceReshape(SpaceReshapeParams {
                 space: "s".into(),
