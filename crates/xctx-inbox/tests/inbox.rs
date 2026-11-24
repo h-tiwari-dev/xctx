@@ -470,3 +470,40 @@ fn a_change_that_cannot_be_written_is_not_kept() -> TestResult {
     assert!(inbox.is_fresh());
     Ok(())
 }
+
+#[test]
+fn an_attempt_proposal_is_a_gate_with_a_bounded_count() -> TestResult {
+    use xctx_inbox::AttemptProposal;
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    let proposal = |count| {
+        ItemBody::AttemptProposal(AttemptProposal {
+            space: SpaceId::new("rate-limit"),
+            agent: "writer-api".into(),
+            count,
+            instructions: vec!["token bucket".into()],
+            rationale: Some("two designs look equally good".into()),
+        })
+    };
+    let good = inbox.post(proposal(2), Some(SpaceId::new("rate-limit")), Source::Agent)?;
+    let item = inbox.get(&good).ok_or("posted")?;
+    assert_eq!(item.kind(), ItemKind::AttemptProposal);
+    assert!(item.kind().is_gate());
+    assert_eq!(item.title(), "Fork 2 attempts of writer-api in rate-limit");
+    assert!(item.detail().contains("- attempt 1: token bucket"));
+    assert!(matches!(
+        inbox.dismiss(&good),
+        Err(InboxError::WrongKind { .. })
+    ));
+    assert_eq!(inbox.approve(&good)?.state, ItemState::Approved);
+
+    for count in [0, 5] {
+        let bad = inbox.post(proposal(count), None, Source::Agent)?;
+        assert!(matches!(
+            inbox.approve(&bad),
+            Err(InboxError::BadAttemptCount { .. })
+        ));
+        assert_eq!(inbox.reject(&bad, None)?.state, ItemState::Rejected);
+    }
+    Ok(())
+}

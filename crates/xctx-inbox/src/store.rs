@@ -277,6 +277,14 @@ impl Inbox {
                 ItemBody::SpaceWiden(w) if w.add_repos.is_empty() && !w.production => {
                     Err(InboxError::EmptyWiden(item.id.clone()))
                 }
+                ItemBody::AttemptProposal(a)
+                    if a.count == 0 || a.count > xctx_core::MAX_ATTEMPTS =>
+                {
+                    Err(InboxError::BadAttemptCount {
+                        id: item.id.clone(),
+                        count: a.count,
+                    })
+                }
                 _ => Ok(()),
             },
         )

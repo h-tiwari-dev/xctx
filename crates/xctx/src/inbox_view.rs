@@ -100,6 +100,7 @@ pub fn entry_kind(kind: ItemKind) -> InboxKind {
     match kind {
         ItemKind::PlanGate => InboxKind::PlanGate,
         ItemKind::SpaceWiden => InboxKind::SpaceWiden,
+        ItemKind::AttemptProposal => InboxKind::AttemptProposal,
         ItemKind::MissingEnvVar => InboxKind::MissingEnvVar,
         ItemKind::Notice => InboxKind::Notice,
     }
@@ -325,7 +326,22 @@ impl Workspace {
                 self.plan_review = Some(id);
                 cx.notify();
             }
-            InboxAction::Approve => self.approve_widen(id, window, cx),
+            InboxAction::Approve => {
+                let kind = self
+                    .inbox
+                    .as_ref()
+                    .and_then(|i| i.get(&id))
+                    .map(|i| i.kind());
+                if kind == Some(ItemKind::AttemptProposal) {
+                    // Forking from the Inbox comes with the attempt panes (Milestone 4, Wave 3).
+                    self.info(
+                        "Forking attempts is not wired into the window yet; the request stays in the Inbox",
+                        cx,
+                    );
+                } else {
+                    self.approve_widen(id, window, cx);
+                }
+            }
             InboxAction::Reject => {
                 self.change_inbox(cx, |inbox| inbox.reject(&id, None));
             }

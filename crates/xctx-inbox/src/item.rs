@@ -83,6 +83,24 @@ pub struct SpaceWiden {
     pub reason: String,
 }
 
+/// A request to fork competing attempts of one writer. Approving it is the only way an agent's request forks:
+/// it adds agents, worktrees and ports to the space.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptProposal {
+    /// The space.
+    pub space: SpaceId,
+    /// The graph node of the writer to fork.
+    pub agent: String,
+    /// How many attempts, 1 to 4.
+    pub count: u32,
+    /// What each attempt should try differently; may be shorter than `count`.
+    #[serde(default)]
+    pub instructions: Vec<String>,
+    /// Why, from whoever asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
 /// A repo whose mise config requires a variable that is not set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingEnvVar {
@@ -118,6 +136,8 @@ pub enum ItemBody {
     PlanGate(PlanGate),
     /// See [`SpaceWiden`].
     SpaceWiden(SpaceWiden),
+    /// See [`AttemptProposal`].
+    AttemptProposal(AttemptProposal),
     /// See [`MissingEnvVar`].
     MissingEnvVar(MissingEnvVar),
     /// See [`Notice`].
@@ -132,6 +152,8 @@ pub enum ItemKind {
     PlanGate,
     /// [`ItemBody::SpaceWiden`].
     SpaceWiden,
+    /// [`ItemBody::AttemptProposal`].
+    AttemptProposal,
     /// [`ItemBody::MissingEnvVar`].
     MissingEnvVar,
     /// [`ItemBody::Notice`].
@@ -139,11 +161,13 @@ pub enum ItemKind {
 }
 
 impl ItemKind {
-    /// The name used on the control socket: `plan_gate`, `space_widen`, `missing_env_var` or `notice`.
+    /// The name used on the control socket: `plan_gate`, `space_widen`, `attempt_proposal`, `missing_env_var` or
+    /// `notice`.
     pub fn name(self) -> &'static str {
         match self {
             ItemKind::PlanGate => "plan_gate",
             ItemKind::SpaceWiden => "space_widen",
+            ItemKind::AttemptProposal => "attempt_proposal",
             ItemKind::MissingEnvVar => "missing_env_var",
             ItemKind::Notice => "notice",
         }
@@ -151,7 +175,10 @@ impl ItemKind {
 
     /// Whether items of this kind are decided by approve or reject (a gate), rather than resolved or dismissed.
     pub fn is_gate(self) -> bool {
-        matches!(self, ItemKind::PlanGate | ItemKind::SpaceWiden)
+        matches!(
+            self,
+            ItemKind::PlanGate | ItemKind::SpaceWiden | ItemKind::AttemptProposal
+        )
     }
 }
 
@@ -252,6 +279,7 @@ impl InboxItem {
         match self.body {
             ItemBody::PlanGate(_) => ItemKind::PlanGate,
             ItemBody::SpaceWiden(_) => ItemKind::SpaceWiden,
+            ItemBody::AttemptProposal(_) => ItemKind::AttemptProposal,
             ItemBody::MissingEnvVar(_) => ItemKind::MissingEnvVar,
             ItemBody::Notice(_) => ItemKind::Notice,
         }
@@ -282,6 +310,10 @@ impl InboxItem {
                     parts.push("no change".to_owned());
                 }
                 format!("Widen {}: {}", w.space, parts.join(" and "))
+            }
+            ItemBody::AttemptProposal(a) => {
+                let attempts = if a.count == 1 { "attempt" } else { "attempts" };
+                format!("Fork {} {attempts} of {} in {}", a.count, a.agent, a.space)
             }
             ItemBody::MissingEnvVar(m) => format!("{} needs {}", m.repo, m.var.name),
             ItemBody::Notice(n) => n.title.clone(),
@@ -317,6 +349,18 @@ impl InboxItem {
                             .to_owned(),
                     );
                 }
+            }
+            ItemBody::AttemptProposal(a) => {
+                if let Some(r) = &a.rationale {
+                    lines.push(r.clone());
+                }
+                for (i, instruction) in a.instructions.iter().enumerate() {
+                    lines.push(format!("- attempt {}: {instruction}", i + 1));
+                }
+                lines.push(
+                    "Each attempt gets its own worktree, PORT and a fork of the writer's session."
+                        .to_owned(),
+                );
             }
             ItemBody::MissingEnvVar(m) => {
                 if let Some(help) = &m.var.help {

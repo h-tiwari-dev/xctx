@@ -25,6 +25,10 @@ pub const SPACE_ENV: &str = "XCTX_SPACE";
 /// default for the parameter that names the calling agent (see [`agent_key`]).
 pub const AGENT_ENV: &str = "XCTX_AGENT_ID";
 
+/// The environment variable an attempt's panes have, naming the attempt. `xctx-ctl` uses it as `attempt=` for
+/// `attempt.report`.
+pub const ATTEMPT_ENV: &str = "XCTX_ATTEMPT_ID";
+
 /// Parameters that are numbers when given as `key=value`.
 const INTEGER_KEYS: &[&str] = &[
     "pane",
@@ -33,9 +37,14 @@ const INTEGER_KEYS: &[&str] = &[
     "max_iterations",
     "max_turns",
     "version",
+    "attempt",
+    "round",
+    "count",
+    "tests_passed",
+    "tests_failed",
 ];
 /// Parameters that are booleans when given as `key=value`.
-const BOOL_KEYS: &[&str] = &["all", "checks_passed", "production"];
+const BOOL_KEYS: &[&str] = &["all", "checks_passed", "production", "gave_up"];
 /// Parameters that are comma-separated lists when given as `key=value`.
 const LIST_KEYS: &[&str] = &["repos"];
 
@@ -88,13 +97,41 @@ pub fn agent_key(method: Method) -> Option<&'static str> {
     }
 }
 
+/// What `xctx-ctl` takes from its environment when a call leaves it out. Empty values count as unset.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Defaults {
+    /// `$XCTX_SPACE`: the `space=` of methods about a space.
+    pub space: Option<String>,
+    /// `$XCTX_AGENT_ID`: the caller's agent, for the parameter [`agent_key`] names.
+    pub agent: Option<String>,
+    /// `$XCTX_ATTEMPT_ID`: the `attempt=` of `attempt.report`.
+    pub attempt: Option<String>,
+}
+
 /// Parse the arguments after the program name. `default_space` is `$XCTX_SPACE` and `default_agent`
-/// `$XCTX_AGENT_ID`; an empty one counts as unset.
+/// `$XCTX_AGENT_ID`; an empty one counts as unset. See [`parse_args_with`] for the attempt default too.
 pub fn parse_args(
     args: impl IntoIterator<Item = String>,
     default_space: Option<&str>,
     default_agent: Option<&str>,
 ) -> Result<Command, UsageError> {
+    parse_args_with(
+        args,
+        &Defaults {
+            space: default_space.map(str::to_owned),
+            agent: default_agent.map(str::to_owned),
+            attempt: None,
+        },
+    )
+}
+
+/// Parse the arguments after the program name, filling what the call leaves out from `defaults`.
+pub fn parse_args_with(
+    args: impl IntoIterator<Item = String>,
+    defaults: &Defaults,
+) -> Result<Command, UsageError> {
+    let default_space = defaults.space.as_deref();
+    let default_agent = defaults.agent.as_deref();
     let mut socket = None;
     let mut compact = false;
     let mut args = args.into_iter();
@@ -142,6 +179,17 @@ pub fn parse_args(
         && let Some(agent) = default_agent.filter(|s| !s.is_empty())
     {
         params.insert(key.into(), Value::String(agent.to_owned()));
+    }
+    if m == Method::AttemptReport
+        && !params.contains_key("attempt")
+        && let Some(attempt) = defaults.attempt.as_deref().filter(|s| !s.is_empty())
+    {
+        let number: u64 = attempt.trim().parse().map_err(|_| {
+            UsageError(format!(
+                "{ATTEMPT_ENV} must be an attempt number, got {attempt:?}"
+            ))
+        })?;
+        params.insert("attempt".into(), Value::from(number));
     }
     let call = Call::parse(m.name(), Some(Value::Object(params)))?;
     Ok(Command::Call {
@@ -215,11 +263,13 @@ pub fn help() -> String {
          {CONTROL_SOCKET_ENV:<20} the socket (else control.sock in the xctx data directory)\n  \
          {SPACE_ENV:<20} the default space=, set in every pane of a space\n  \
          {AGENT_ENV:<20} the default from= (channel.post), author= (contract.set) and agent= \
-         (contract.agree), set in every agent's pane\n\n\
+         (contract.agree), set in every agent's pane\n  \
+         {ATTEMPT_ENV:<20} the default attempt= of attempt.report, set in every attempt's panes\n\n\
          The result is printed as JSON. Exit status: 0 ok, 1 the window refused or the call failed, \
          2 bad arguments, 3 no window.\n\
-         Nothing here approves, launches or widens: space.draft posts a Plan Gate and space.widen_propose a \
-         space widening, which the user approves in the window.\n"
+         Nothing here approves, launches, widens, forks or adopts: space.draft posts a Plan Gate, \
+         space.widen_propose a space widening and attempt.propose an attempt proposal, which the user \
+         approves in the window.\n"
     );
     out
 }
@@ -228,6 +278,7 @@ pub fn help() -> String {
 mod tests {
     use super::*;
     use crate::StatusLevel;
+    use crate::protocol::ReproStatus;
     use crate::protocol::{
         AgentParams, ChannelListParams, ChannelPostParams, ContractAgreeParams, ContractSetParams,
         GraphAddLaneParams, HelperKind, InboxListParams, LaneRole, LoopAdvanceParams, LoopAutonomy,
@@ -505,6 +556,60 @@ mod tests {
             Command::Call { call, .. } => Ok(call),
             other => Err(UsageError(format!("not a call: {other:?}"))),
         }
+    }
+
+    #[test]
+    fn attempt_report_takes_its_attempt_from_xctx_attempt_id() -> Result<(), UsageError> {
+        let defaults = Defaults {
+            space: Some("s".into()),
+            agent: Some("writer-api".into()),
+            attempt: Some("2".into()),
+        };
+        let parsed = parse_args_with(
+            args(
+                "attempt.report summary=done tests_passed=4 tests_failed=0 repro=fixed gave_up=no",
+            ),
+            &defaults,
+        )?;
+        let Command::Call {
+            call: Call::AttemptReport(p),
+            ..
+        } = parsed
+        else {
+            return Err(UsageError(format!("not a report: {parsed:?}")));
+        };
+        assert_eq!((p.space.as_str(), p.attempt), ("s", 2));
+        assert_eq!(
+            (p.tests_passed, p.repro, p.gave_up),
+            (Some(4), ReproStatus::Fixed, false)
+        );
+
+        let given = parse_args_with(args("attempt.report attempt=3 summary=x"), &defaults)?;
+        assert!(
+            matches!(given, Command::Call { call: Call::AttemptReport(ref p), .. } if p.attempt == 3)
+        );
+        // Only attempt.report takes the default.
+        assert!(parse_args_with(args("attempt.diff"), &defaults).is_err());
+        let bad = Defaults {
+            attempt: Some("two".into()),
+            ..defaults
+        };
+        assert!(parse_args_with(args("attempt.report summary=x"), &bad).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_proposals_take_instructions_as_json() -> Result<(), UsageError> {
+        let parsed = call(
+            r#"attempt.propose agent=writer-api count=2 instructions:=["a,b","c"]"#,
+            Some("s"),
+        )?;
+        let Call::AttemptPropose(p) = parsed else {
+            return Err(UsageError(format!("not a proposal: {parsed:?}")));
+        };
+        assert_eq!(p.count, 2);
+        assert_eq!(p.instructions, Some(vec!["a,b".to_owned(), "c".to_owned()]));
+        Ok(())
     }
 
     #[test]

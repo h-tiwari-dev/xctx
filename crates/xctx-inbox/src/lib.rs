@@ -18,7 +18,7 @@ mod store;
 
 pub use error::{InboxError, Result};
 pub use item::{
-    InboxItem, ItemBody, ItemId, ItemKind, ItemState, Level, MissingEnvVar, Notice, PlanGate,
-    Preview, Source, SpaceWiden, welcome_notice,
+    AttemptProposal, InboxItem, ItemBody, ItemId, ItemKind, ItemState, Level, MissingEnvVar,
+    Notice, PlanGate, Preview, Source, SpaceWiden, welcome_notice,
 };
 pub use store::{Filter, INBOX_FILE, Inbox, MAX_PENDING_AGENT_NOTICES, MAX_SETTLED_ITEMS};

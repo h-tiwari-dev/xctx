@@ -568,6 +568,13 @@ impl Workspace {
                 self.graph_call(&p.space, cx, |state, _, _| loop_set_autonomy(state, &p))
             }
             Call::SpaceWidenPropose(p) => to_json(self.control_widen_propose(&p, cx)),
+            // Milestone 4 Wave 3 wires attempts into the window; until then the methods answer, but refuse.
+            Call::AttemptList(_)
+            | Call::AttemptReport(_)
+            | Call::AttemptPropose(_)
+            | Call::AttemptDiff(_) => Err(RpcError::conflict(
+                "attempts are not wired into this xctx yet (Milestone 4, Wave 3)",
+            )),
         };
         responder.respond(result);
     }
