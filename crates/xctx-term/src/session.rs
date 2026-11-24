@@ -27,6 +27,12 @@ const READ_BUFFER_SIZE: usize = 64 * 1024;
 /// How long a program gets to exit after SIGHUP before the session kills its process group.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// How long [`TerminalSession::shutdown_and_wait`] waits for processes to go after SIGKILL.
+const KILL_REAP_WAIT: Duration = Duration::from_secs(1);
+
+/// How often [`TerminalSession::shutdown_and_wait`] checks whether a foreground job has gone.
+const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 #[derive(Debug, Default)]
 struct ProcessState {
     exited: bool,
@@ -64,7 +70,9 @@ impl Shared {
 ///
 /// Dropping the session stops the reader and writer, sends SIGHUP to the program's process
 /// group, and kills the group with SIGKILL if it has not exited within two seconds. The exit
-/// status is always collected, so no zombie is left behind. Dropping never blocks.
+/// status is always collected, so no zombie is left behind. Dropping never blocks; call
+/// [`TerminalSession::shutdown_and_wait`] first when the program must be gone before continuing
+/// (for example before deleting its working directory).
 pub struct TerminalSession {
     shared: Arc<Shared>,
     writer: Option<Sender<Vec<u8>>>,
@@ -82,7 +90,11 @@ impl TerminalSession {
         on_event: impl Fn(TerminalEvent) + Send + Sync + 'static,
     ) -> Result<Self, TermError> {
         let poller = Arc::new(Poller::new().map_err(TermError::Poll)?);
-        let pty::SpawnedPty { master, child } = pty::spawn(&config)?;
+        let pty::SpawnedPty {
+            master,
+            child,
+            slave,
+        } = pty::spawn(&config)?;
         let pid = child.id();
         let shared = Arc::new(Shared {
             emulator: FairMutex::new(Emulator::new(&config)),
@@ -124,6 +136,10 @@ impl TerminalSession {
         // thread when it finishes, or below if the thread cannot start.
         unsafe { poller.add_with_mode(&*reader_file, Event::readable(PTY_KEY), PollMode::Level) }
             .map_err(TermError::Poll)?;
+        // The master is registered while the slave was still open, so a program that has already
+        // exited cannot hang up the PTY before registration. Closing the parent's copy now lets
+        // the reader see end-of-file once the program and its children are gone.
+        drop(slave);
         let reader_poller = Arc::clone(&poller);
         let thread_file = Arc::clone(&reader_file);
         let spawned = thread::Builder::new()
@@ -193,6 +209,66 @@ impl TerminalSession {
                 .wait_timeout(process, deadline - now)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+        }
+        true
+    }
+
+    /// Ends the program and blocks until it has gone, for at most `timeout` plus one second.
+    ///
+    /// Stops the reader, then sends SIGHUP (and SIGCONT, so stopped jobs act on it) to the
+    /// program's process group and to the terminal's foreground process group if that differs
+    /// (a job started by a shell). Waits up to `timeout` for the program to exit and be reaped
+    /// and for the foreground group to empty; whatever remains then gets SIGKILL, followed by up
+    /// to one more second of waiting. Returns whether everything exited; false means something
+    /// was still running a second after SIGKILL (for example a process stuck in an
+    /// uninterruptible wait).
+    ///
+    /// Output arriving after this call is not parsed. The session may be dropped afterwards
+    /// as usual.
+    pub fn shutdown_and_wait(&self, timeout: Duration) -> bool {
+        self.shared.shutdown.store(true, Ordering::Release);
+        let _ = self.poller.notify();
+
+        let foreground = pty::foreground_group(&self.master)
+            .filter(|&group| libc::pid_t::try_from(self.shared.pid).ok() != Some(group));
+        for signal in [libc::SIGHUP, libc::SIGCONT] {
+            self.signal_program(foreground, signal);
+        }
+        if self.wait_for_shutdown(foreground, Instant::now() + timeout) {
+            return true;
+        }
+        self.signal_program(foreground, libc::SIGKILL);
+        self.wait_for_shutdown(foreground, Instant::now() + KILL_REAP_WAIT)
+    }
+
+    /// Sends `signal` to the program's process group, unless it has been reaped, and to
+    /// `foreground`.
+    fn signal_program(&self, foreground: Option<libc::pid_t>, signal: libc::c_int) {
+        {
+            let process = self.shared.process();
+            if !process.exited {
+                // Holding the lock guarantees the waiter has not reaped the pid yet.
+                pty::signal_group(self.shared.pid, signal);
+            }
+        }
+        if let Some(group) = foreground {
+            pty::signal_process_group(group, signal);
+        }
+    }
+
+    /// Waits until `deadline` for the program to be reaped and `foreground` to be empty.
+    fn wait_for_shutdown(&self, foreground: Option<libc::pid_t>, deadline: Instant) -> bool {
+        if !self.wait_for_exit(deadline.saturating_duration_since(Instant::now())) {
+            return false;
+        }
+        let Some(group) = foreground else {
+            return true;
+        };
+        while pty::process_group_exists(group) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(GROUP_POLL_INTERVAL);
         }
         true
     }

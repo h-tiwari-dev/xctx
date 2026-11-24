@@ -9,9 +9,14 @@ use xctx_term::input::{Key, KeyEvent, KeyEventKind, Modifiers};
 /// Option acts as Meta: Option chords send the unmodified key with Alt held (ESC prefix in
 /// legacy mode) instead of the character macOS would compose, because TUIs bind Alt chords.
 /// Without Ctrl, Option or Command, the typed text (`key_char`) is passed on, so shifted
-/// punctuation and non-ASCII layouts type what the key shows. `is_held` makes the event an
-/// auto-repeat.
-pub fn key_event_for_keystroke(keystroke: &Keystroke, is_held: bool) -> Option<KeyEvent> {
+/// punctuation and non-ASCII layouts type what the key shows. GPUI's `key_char` ignores Caps
+/// Lock, so `capslock_on` (from `Window::capslock`) uppercases typed letters, with or without
+/// Shift, as macOS does. `is_held` makes the event an auto-repeat.
+pub fn key_event_for_keystroke(
+    keystroke: &Keystroke,
+    is_held: bool,
+    capslock_on: bool,
+) -> Option<KeyEvent> {
     let gpui_modifiers = keystroke.modifiers;
     let modifiers = Modifiers {
         shift: gpui_modifiers.shift,
@@ -26,7 +31,14 @@ pub fn key_event_for_keystroke(keystroke: &Keystroke, is_held: bool) -> Option<K
         Key::Char(_) if composes_text => keystroke
             .key_char
             .clone()
-            .filter(|text| !text.is_empty() && !text.chars().any(char::is_control)),
+            .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+            .map(|text| {
+                if capslock_on {
+                    apply_capslock(&text)
+                } else {
+                    text
+                }
+            }),
         _ => None,
     };
 
@@ -41,6 +53,20 @@ pub fn key_event_for_keystroke(keystroke: &Keystroke, is_held: bool) -> Option<K
         modifiers,
         kind,
     })
+}
+
+/// `text` as typed with Caps Lock on: letters with a single-character uppercase form are
+/// uppercased; everything else is unchanged.
+fn apply_capslock(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(upper), None) if c.is_alphabetic() => upper,
+                _ => c,
+            }
+        })
+        .collect()
 }
 
 /// The terminal key for a GPUI key name (`"enter"`, `"pageup"`, `"f5"`, `"a"`, `"!"`).
@@ -117,7 +143,7 @@ mod tests {
     }
 
     fn bytes(stroke: &Keystroke, modes: &TerminalModes) -> Option<Vec<u8>> {
-        key_event_for_keystroke(stroke, false).and_then(|event| encode_key(&event, modes))
+        key_event_for_keystroke(stroke, false, false).and_then(|event| encode_key(&event, modes))
     }
 
     #[test]
@@ -134,9 +160,31 @@ mod tests {
     }
 
     #[test]
+    fn capslock_uppercases_typed_letters_like_macos() {
+        let caps = |stroke: &Keystroke| {
+            key_event_for_keystroke(stroke, false, true)
+                .and_then(|event| encode_key(&event, &legacy()))
+        };
+        let a = keystroke("a", Some("a"), mods(false, false, false));
+        assert_eq!(caps(&a), Some(b"A".to_vec()));
+        // Shift does not undo Caps Lock on macOS.
+        let shift_a = keystroke("a", Some("A"), mods(true, false, false));
+        assert_eq!(caps(&shift_a), Some(b"A".to_vec()));
+        let o_umlaut = keystroke("ö", Some("ö"), mods(false, false, false));
+        assert_eq!(caps(&o_umlaut), Some("Ö".as_bytes().to_vec()));
+        let one = keystroke("1", Some("1"), mods(false, false, false));
+        assert_eq!(caps(&one), Some(b"1".to_vec()));
+        // Chords are unaffected.
+        let ctrl_c = keystroke("c", None, mods(false, true, false));
+        assert_eq!(caps(&ctrl_c), Some(vec![0x03]));
+        let alt_b = keystroke("b", Some("∫"), mods(false, false, true));
+        assert_eq!(caps(&alt_b), Some(b"\x1bb".to_vec()));
+    }
+
+    #[test]
     fn shift_enter_reaches_kitty_programs() {
         let shift_enter = keystroke("enter", Some("\n"), mods(true, false, false));
-        let event = key_event_for_keystroke(&shift_enter, false);
+        let event = key_event_for_keystroke(&shift_enter, false, false);
         assert_eq!(event, Some(KeyEvent::new(Key::Enter, Modifiers::SHIFT)));
         assert_eq!(
             bytes(&shift_enter, &pi_modes()),
@@ -161,7 +209,7 @@ mod tests {
     fn alt_chords_send_meta_not_composed_text() {
         // Option+b composes "∫" on a US layout; the terminal wants ESC b.
         let alt_b = keystroke("b", Some("∫"), mods(false, false, true));
-        let event = key_event_for_keystroke(&alt_b, false);
+        let event = key_event_for_keystroke(&alt_b, false, false);
         assert_eq!(event.as_ref().and_then(|e| e.text.clone()), None);
         assert_eq!(bytes(&alt_b, &legacy()), Some(b"\x1bb".to_vec()));
         assert_eq!(bytes(&alt_b, &pi_modes()), Some(b"\x1b[98;3u".to_vec()));
@@ -209,13 +257,13 @@ mod tests {
     fn held_keys_repeat_and_unknown_keys_are_dropped() {
         let held = keystroke("up", None, mods(false, false, false));
         assert_eq!(
-            key_event_for_keystroke(&held, true).map(|event| event.kind),
+            key_event_for_keystroke(&held, true, false).map(|event| event.kind),
             Some(KeyEventKind::Repeat)
         );
         let caps = keystroke("capslock", None, mods(false, false, false));
-        assert_eq!(key_event_for_keystroke(&caps, false), None);
+        assert_eq!(key_event_for_keystroke(&caps, false, false), None);
         let f0 = keystroke("f0", None, mods(false, false, false));
-        assert_eq!(key_event_for_keystroke(&f0, false), None);
+        assert_eq!(key_event_for_keystroke(&f0, false, false), None);
     }
 
     #[test]
@@ -228,7 +276,7 @@ mod tests {
                 ..gpui::Modifiers::default()
             },
         );
-        let event = key_event_for_keystroke(&cmd_k, false);
+        let event = key_event_for_keystroke(&cmd_k, false, false);
         assert_eq!(event, Some(KeyEvent::new(Key::Char('k'), Modifiers::SUPER)));
         assert_eq!(bytes(&cmd_k, &legacy()), None);
     }

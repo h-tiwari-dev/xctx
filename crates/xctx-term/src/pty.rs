@@ -1,8 +1,9 @@
 //! Opening a pseudo-terminal and starting a program on it.
 
+use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
@@ -15,6 +16,10 @@ pub(crate) struct SpawnedPty {
     pub master: File,
     /// The program. It leads its own session and process group.
     pub child: Child,
+    /// The parent's copy of the PTY slave. Holding it keeps the PTY from hanging up if the
+    /// program exits at once; drop it after registering `master` for readiness, so reading the
+    /// master reports end-of-file once the program and its children have exited.
+    pub slave: OwnedFd,
 }
 
 fn winsize(cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> libc::winsize {
@@ -26,50 +31,88 @@ fn winsize(cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> libc::win
     }
 }
 
-fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: fcntl on a descriptor we own; no memory is passed.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 {
+/// `TIOCPTYGNAME` from `<sys/ttycom.h>`: `_IOR('t', 83, char[128])`. Writes the slave's path
+/// into a caller-owned buffer, unlike `ptsname(3)`, which returns a shared static buffer.
+const TIOCPTYGNAME: libc::c_ulong = 0x4080_7453;
+
+/// Size of the buffer `TIOCPTYGNAME` fills.
+const PTY_NAME_SIZE: usize = 128;
+
+/// Attempts at opening `/dev/ptmx` before giving up on a transient failure.
+const PTMX_OPEN_ATTEMPTS: u32 = 16;
+
+fn open_cloexec(path: &CStr) -> io::Result<OwnedFd> {
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: as above.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(io::Error::last_os_error());
+    // SAFETY: open succeeded, so `fd` is open and owned by us alone.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens a new PTY master.
+///
+/// macOS fails `open("/dev/ptmx")` now and then with ENXIO (reported as -ENXIO) while other
+/// threads open and close PTYs; trying again gets a working master.
+fn open_ptmx() -> io::Result<OwnedFd> {
+    let mut attempt = 1;
+    loop {
+        match open_cloexec(c"/dev/ptmx") {
+            Err(err)
+                if attempt < PTMX_OPEN_ATTEMPTS
+                    && matches!(err.raw_os_error(), Some(code) if code.abs() == libc::ENXIO) =>
+            {
+                attempt += 1;
+                std::thread::yield_now();
+            }
+            result => return result,
+        }
     }
-    Ok(())
 }
 
 /// Opens a PTY pair sized to `cols` x `rows`, returning (master, slave).
+///
+/// Both ends are opened with `O_CLOEXEC`, so a program started concurrently on another thread
+/// never inherits them, and the slave is found with `TIOCPTYGNAME` rather than the
+/// thread-unsafe `ptsname(3)` that `openpty(3)` uses.
 fn open_pty(
     cols: u16,
     rows: u16,
     cell_width: u16,
     cell_height: u16,
 ) -> Result<(OwnedFd, OwnedFd), TermError> {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    let mut size = winsize(cols, rows, cell_width, cell_height);
-    // SAFETY: openpty writes two descriptors into the provided integers; the name and termios
-    // pointers may be null.
-    let result = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
-    if result != 0 {
+    let master = open_ptmx().map_err(TermError::OpenPty)?;
+    // SAFETY: grantpt and unlockpt take a descriptor we own.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } == -1 {
         return Err(TermError::OpenPty(io::Error::last_os_error()));
     }
-    // SAFETY: openpty succeeded, so both descriptors are open and owned by us alone.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // SAFETY: as above.
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } == -1 {
+        return Err(TermError::OpenPty(io::Error::last_os_error()));
+    }
+    let mut name = [0 as libc::c_char; PTY_NAME_SIZE];
+    // SAFETY: TIOCPTYGNAME writes at most PTY_NAME_SIZE bytes into `name`, which outlives the
+    // call.
+    if unsafe { libc::ioctl(master.as_raw_fd(), TIOCPTYGNAME, name.as_mut_ptr()) } == -1 {
+        return Err(TermError::OpenPty(io::Error::last_os_error()));
+    }
+    // Guarantee termination even if the kernel filled the whole buffer.
+    name[PTY_NAME_SIZE - 1] = 0;
+    // SAFETY: `name` is NUL-terminated (ensured above) and lives for this scope.
+    let slave_path = unsafe { CStr::from_ptr(name.as_ptr()) };
+    let slave = open_cloexec(slave_path).map_err(TermError::OpenPty)?;
 
-    // Neither end may leak into the child beyond its stdio, nor into other programs the app
-    // starts.
-    set_cloexec(master.as_raw_fd()).map_err(TermError::ConfigurePty)?;
-    set_cloexec(slave.as_raw_fd()).map_err(TermError::ConfigurePty)?;
+    let size = winsize(cols, rows, cell_width, cell_height);
+    // SAFETY: TIOCSWINSZ reads a winsize struct that lives for the duration of the call.
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
+        return Err(TermError::ConfigurePty(io::Error::last_os_error()));
+    }
 
     // Tell the line discipline input is UTF-8 so backspace in canonical mode erases whole
     // characters.
@@ -138,14 +181,13 @@ pub(crate) fn spawn(config: &TerminalConfig) -> Result<SpawnedPty, TermError> {
         program: config.program.clone(),
         source,
     })?;
-    // Close our copies of the slave (the parent's and the Command's) so reading the master
-    // reports end-of-file once the program and its children have exited.
+    // Close the Command's copies of the slave; the caller closes `slave` once it is ready.
     drop(command);
-    drop(slave);
 
     Ok(SpawnedPty {
         master: File::from(master),
         child,
+        slave,
     })
 }
 
@@ -178,6 +220,30 @@ pub(crate) fn signal_group(pid: u32, signal: libc::c_int) {
             libc::kill(pid, signal);
         }
     }
+}
+
+/// The PTY's foreground process group, if the program's session still owns the terminal.
+pub(crate) fn foreground_group(master: &File) -> Option<libc::pid_t> {
+    // SAFETY: tcgetpgrp takes a descriptor that `master` keeps open.
+    let group = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+    (group > 0).then_some(group)
+}
+
+/// Sends `signal` to every process in `group`. The caller must have seen `group` in use
+/// recently (for example from [`foreground_group`]).
+pub(crate) fn signal_process_group(group: libc::pid_t, signal: libc::c_int) {
+    if group > 0 {
+        // SAFETY: kill takes plain integers; a negative pid names a process group.
+        unsafe {
+            libc::kill(-group, signal);
+        }
+    }
+}
+
+/// Whether any process (including a zombie) is still in `group`.
+pub(crate) fn process_group_exists(group: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the group exists and may be signalled.
+    group > 0 && unsafe { libc::kill(-group, 0) } == 0
 }
 
 /// Blocks until `pid` has exited, without reaping it. Returns false if it cannot be waited on
