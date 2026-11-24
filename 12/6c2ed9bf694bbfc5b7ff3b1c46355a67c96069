@@ -1,0 +1,47 @@
+crates/xctx-core/src/space.rs
+  s_63556eb72dd10a::t_c0ff4c4fde78b1 3-5,191-194,203-204,209-219,225-226,234-236,441,464-559
+  s_63556eb72dd10a::t_56d5f89d1c26ee 229
+  s_63556eb72dd10a::t_4986089eacc668 560
+crates/xctx-core/src/error.rs
+  s_63556eb72dd10a::t_3cfe12b2864c03 72-85
+crates/xctx/src/control.rs
+  s_63556eb72dd10a::t_486104d2ea0d8a 738
+  s_63556eb72dd10a::t_d0019f2f1d0edc 425-441
+crates/xctx/src/persist.rs
+  s_63556eb72dd10a::t_486104d2ea0d8a 133
+crates/xctx-core/src/lib.rs
+  s_63556eb72dd10a::t_b6f8d2d80609e0 22
+crates/xctx/src/spawn.rs
+  s_63556eb72dd10a::t_486104d2ea0d8a 393
+crates/xctx-core/tests/space.rs
+  s_63556eb72dd10a::t_b66c4ff1110cf5 10,12,607-609,614-657,662-691,697-743,749-755,760-786,795,800-804,811-839,844-915
+  s_63556eb72dd10a::t_56d5f89d1c26ee 610-613,658-661,692-696,744-748,756-759,787-794,796-799,805-810,840-843
+crates/xctx-control/src/lib.rs
+  s_63556eb72dd10a::t_e2f3b3d5dfbeb9 11-12
+crates/xctx-control/src/cli.rs
+  s_63556eb72dd10a::t_89778edce6e797 7-8,23,25,176-177,186-187
+  s_63556eb72dd10a::t_28214944011c11 197-200,322-341,346-484
+  s_63556eb72dd10a::t_56d5f89d1c26ee 342-345
+  s_63556eb72dd10a::t_939fa14447d2e1 485
+crates/xctx-control/src/protocol.rs
+  s_63556eb72dd10a::t_77d099dabc9890 304,306-307,309-310,346-374,379,392-405,423-436,448-455,460-473,497-513,532-553,596,699-859,887-914,971-984,1003-1016,1033-1044,1060-1071,1216-1228
+  s_63556eb72dd10a::t_56d5f89d1c26ee 494-496,1397-1408,1410-1413,1415-1418,1420-1423,1470-1473
+  s_63556eb72dd10a::t_e2f3b3d5dfbeb9 1285-1396,1409,1414,1419,1424-1469,1474-1479
+  s_63556eb72dd10a::t_808e08422bd7e9 1229,1480
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "126c2ed9bf694bbfc5b7ff3b1c46355a67c96069",
+  "prompts": {},
+  "sessions": {
+    "s_63556eb72dd10a": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20d85-608b-776b-822f-bf51f4b51639",
+        "model": "claude-opus-5.5"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
