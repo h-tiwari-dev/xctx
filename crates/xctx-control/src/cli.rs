@@ -8,7 +8,8 @@
 //! `version` are numbers, `all`, `checks_passed` and `production` booleans, and `repos` a comma-separated list.
 //! `key:=<json>` passes any JSON value. Methods about a space take `space` from `$XCTX_SPACE` when it is not
 //! given, so an agent in a space's pane can say `xctx-ctl pane.split axis=vertical`. Likewise `channel.post`
-//! takes `from`, `contract.set` `author` and `contract.agree` `agent` from `$XCTX_AGENT_ID`.
+//! takes `from`, `contract.set` `author` and `contract.agree` `agent` from `$XCTX_AGENT_ID`, and `attempt.report`
+//! takes `attempt` from `$XCTX_ATTEMPT_ID` and `token` from `$XCTX_ATTEMPT_TOKEN`.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -28,6 +29,10 @@ pub const AGENT_ENV: &str = "XCTX_AGENT_ID";
 /// The environment variable an attempt's panes have, naming the attempt. `xctx-ctl` uses it as `attempt=` for
 /// `attempt.report`.
 pub const ATTEMPT_ENV: &str = "XCTX_ATTEMPT_ID";
+
+/// The environment variable an attempt's panes have, holding the attempt's report token. `xctx-ctl` sends it as
+/// `token=` with `attempt.report`; the window refuses reports without the right one.
+pub const ATTEMPT_TOKEN_ENV: &str = "XCTX_ATTEMPT_TOKEN";
 
 /// Parameters that are numbers when given as `key=value`.
 const INTEGER_KEYS: &[&str] = &[
@@ -106,6 +111,8 @@ pub struct Defaults {
     pub agent: Option<String>,
     /// `$XCTX_ATTEMPT_ID`: the `attempt=` of `attempt.report`.
     pub attempt: Option<String>,
+    /// `$XCTX_ATTEMPT_TOKEN`: the `token=` of `attempt.report`.
+    pub attempt_token: Option<String>,
 }
 
 /// Parse the arguments after the program name. `default_space` is `$XCTX_SPACE` and `default_agent`
@@ -121,6 +128,7 @@ pub fn parse_args(
             space: default_space.map(str::to_owned),
             agent: default_agent.map(str::to_owned),
             attempt: None,
+            attempt_token: None,
         },
     )
 }
@@ -190,6 +198,12 @@ pub fn parse_args_with(
             ))
         })?;
         params.insert("attempt".into(), Value::from(number));
+    }
+    if m == Method::AttemptReport
+        && !params.contains_key("token")
+        && let Some(token) = defaults.attempt_token.as_deref().filter(|s| !s.is_empty())
+    {
+        params.insert("token".into(), Value::String(token.to_owned()));
     }
     let call = Call::parse(m.name(), Some(Value::Object(params)))?;
     Ok(Command::Call {
@@ -264,7 +278,8 @@ pub fn help() -> String {
          {SPACE_ENV:<20} the default space=, set in every pane of a space\n  \
          {AGENT_ENV:<20} the default from= (channel.post), author= (contract.set) and agent= \
          (contract.agree), set in every agent's pane\n  \
-         {ATTEMPT_ENV:<20} the default attempt= of attempt.report, set in every attempt's panes\n\n\
+         {ATTEMPT_ENV:<20} the default attempt= of attempt.report, set in every attempt's panes\n  \
+         {ATTEMPT_TOKEN_ENV:<20} the default token= of attempt.report, set in every attempt's panes\n\n\
          The result is printed as JSON. Exit status: 0 ok, 1 the window refused or the call failed, \
          2 bad arguments, 3 no window.\n\
          Nothing here approves, launches, widens, forks or adopts: space.draft posts a Plan Gate, \
@@ -564,6 +579,7 @@ mod tests {
             space: Some("s".into()),
             agent: Some("writer-api".into()),
             attempt: Some("2".into()),
+            attempt_token: Some("feed".into()),
         };
         let parsed = parse_args_with(
             args(
@@ -579,6 +595,7 @@ mod tests {
             return Err(UsageError(format!("not a report: {parsed:?}")));
         };
         assert_eq!((p.space.as_str(), p.attempt), ("s", 2));
+        assert_eq!(p.token.as_deref(), Some("feed"));
         assert_eq!(
             (p.tests_passed, p.repro, p.gave_up),
             (Some(4), ReproStatus::Fixed, false)
@@ -587,6 +604,10 @@ mod tests {
         let given = parse_args_with(args("attempt.report attempt=3 summary=x"), &defaults)?;
         assert!(
             matches!(given, Command::Call { call: Call::AttemptReport(ref p), .. } if p.attempt == 3)
+        );
+        let own = parse_args_with(args("attempt.report summary=x token=mine"), &defaults)?;
+        assert!(
+            matches!(own, Command::Call { call: Call::AttemptReport(ref p), .. } if p.token.as_deref() == Some("mine"))
         );
         // Only attempt.report takes the default.
         assert!(parse_args_with(args("attempt.diff"), &defaults).is_err());

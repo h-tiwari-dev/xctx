@@ -204,6 +204,24 @@ pub fn dialog_instructions(texts: &[String], count: u32) -> Vec<Option<String>> 
         .collect()
 }
 
+/// The instructions the fork dialog draws as text instead of its inputs: while a fork runs (`running`), the
+/// first `count` of `submitted` (what it was started with), masked; none otherwise, since the inputs are drawn.
+pub fn busy_instructions(
+    running: bool,
+    submitted: &[String],
+    count: u32,
+    redactor: &Redactor,
+) -> Vec<SharedString> {
+    if !running {
+        return Vec::new();
+    }
+    submitted
+        .iter()
+        .take(count as usize)
+        .map(|text| SharedString::from(redactor.redact(text.trim()).into_owned()))
+        .collect()
+}
+
 // -------------------------------------------------------------------------------------------------------------
 // Dialog state
 
@@ -216,6 +234,8 @@ pub(crate) struct ForkState {
     count: u32,
     /// One instruction input per possible attempt; the first `count` are shown.
     inputs: Vec<Entity<PromptInput>>,
+    /// The instructions the running fork was started with, shown read-only in place of the inputs meanwhile.
+    submitted: Vec<String>,
     error: Option<String>,
     running: bool,
     _subscriptions: Vec<Subscription>,
@@ -322,6 +342,7 @@ impl Workspace {
             repo: repo.clone(),
             count: DEFAULT_FORK_COUNT,
             inputs,
+            submitted: Vec::new(),
             error: None,
             running: false,
             _subscriptions: subscriptions,
@@ -367,7 +388,11 @@ impl Workspace {
             .collect();
         let instructions = dialog_instructions(&texts, fork.count);
         fork.running = true;
+        fork.submitted = texts;
         fork.error = None;
+        // The inputs are not drawn while the fork runs (see `render_fork_dialog`); the dialog keeps the keys, so
+        // Esc still closes it.
+        self.dialog_focus.focus(window, cx);
         let (space, agent) = (fork.space.clone(), fork.agent.clone());
         let for_space = space.clone();
         let started = self.fork_attempts_then(
@@ -392,6 +417,10 @@ impl Workspace {
                     Err(e) => {
                         fork.running = false;
                         fork.error = Some(e);
+                        if let Some(input) = fork.inputs.first() {
+                            let focus = input.focus_handle(cx);
+                            focus.focus(window, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -404,6 +433,10 @@ impl Workspace {
         {
             fork.running = false;
             fork.error = Some(e);
+            if let Some(input) = fork.inputs.first() {
+                let focus = input.focus_handle(cx);
+                focus.focus(window, cx);
+            }
         }
         cx.notify();
     }
@@ -419,16 +452,25 @@ impl Workspace {
                     .get(&fork.space)
                     .map_or(0, |set| set.live().count() as u32),
             ),
-            instructions: Vec::new(),
+            instructions: busy_instructions(
+                fork.running,
+                &fork.submitted,
+                fork.count,
+                &self.redactor,
+            ),
             busy: fork.running,
             error: fork.error.clone().map(SharedString::from),
         };
-        let inputs: Vec<Entity<PromptInput>> = fork
-            .inputs
-            .iter()
-            .take(fork.count as usize)
-            .cloned()
-            .collect();
+        // While the fork runs, its instructions are drawn as text: what is typed then would not be used.
+        let inputs: Vec<Entity<PromptInput>> = if fork.running {
+            Vec::new()
+        } else {
+            fork.inputs
+                .iter()
+                .take(fork.count as usize)
+                .cloned()
+                .collect()
+        };
         let entity = cx.entity().downgrade();
         let (count, cancel, confirm) = (entity.clone(), entity.clone(), entity);
         div().w(px(600.0)).shadow_lg().child(
@@ -1166,6 +1208,21 @@ mod tests {
         );
         assert_eq!(attempt_lineage(&set, "writer-web"), None);
         Ok(())
+    }
+
+    #[test]
+    fn a_running_fork_shows_its_instructions_read_only() {
+        let redactor = Redactor::new([("T".to_owned(), "tok-4242".to_owned())]);
+        let texts = ["use tok-4242 ".to_owned(), String::new(), "c".to_owned()];
+        assert!(busy_instructions(false, &texts, 3, &redactor).is_empty());
+        let shown = busy_instructions(true, &texts, 2, &redactor);
+        assert_eq!(
+            shown,
+            [
+                SharedString::from("use [REDACTED:T]"),
+                SharedString::from("")
+            ]
+        );
     }
 
     #[test]

@@ -32,8 +32,9 @@ use xctx_layout::PaneKind;
 use xctx_ui::StatusBanner;
 
 use crate::attempts::{
-    self, attempt_diff, attempt_list, attempt_proposal, attempt_rpc_error, diff_target,
-    record_report, round_done_notice,
+    self, attempt_diff, attempt_list, attempt_proposal, attempt_rpc_error, check_report_token,
+    diff_target, plan_fork_skipping_leftovers, record_report, refuse_attempt_agent,
+    round_done_notice,
 };
 use crate::lifecycle::{home_dir, repo_for_draft};
 use crate::persist::restore_layout;
@@ -543,15 +544,18 @@ impl Workspace {
                 self.graph_call(&p.space, cx, |state, _, _| Ok(state.doc().clone()))
             }
             Call::GraphPause(p) => self.graph_call(&p.space, cx, |state, space, _| {
+                refuse_attempt_agent("graph.pause", &p.agent)?;
                 set_agent_paused(state, &space.id, &p.agent, true)
             }),
             Call::GraphResume(p) => self.graph_call(&p.space, cx, |state, space, _| {
+                refuse_attempt_agent("graph.resume", &p.agent)?;
                 set_agent_paused(state, &space.id, &p.agent, false)
             }),
             Call::GraphAddLane(p) => {
                 self.graph_call(&p.space, cx, |state, space, _| add_lane(state, space, &p))
             }
             Call::GraphRemoveLane(p) => self.graph_call(&p.space, cx, |state, space, _| {
+                refuse_attempt_agent("graph.remove_lane", &p.agent)?;
                 remove_lane(state, &space.id, &p.agent).map(|_| Ack {})
             }),
             Call::ChannelPost(p) => self.graph_call(&p.space, cx, |state, space, _| {
@@ -604,9 +608,11 @@ impl Workspace {
                 Ok(contract_get(state, redactor))
             }),
             Call::ContractSet(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
+                refuse_attempt_agent("contract.set", &p.author)?;
                 contract_set(state, &space.id, &p, redactor)
             }),
             Call::ContractAgree(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
+                refuse_attempt_agent("contract.agree", &p.agent)?;
                 contract_agree(state, &space.id, &p.agent, p.version, redactor)
             }),
             other => Err(RpcError::internal(format!(
@@ -730,6 +736,15 @@ impl Workspace {
         if params.summary.trim().is_empty() {
             return Err(RpcError::invalid_params("attempt.report: summary is empty"));
         }
+        let attempt = self
+            .attempts
+            .load(&id)
+            .map_err(RpcError::internal)?
+            .get(params.attempt)
+            .ok_or_else(|| {
+                RpcError::not_found(format!("{id} has no attempt {}", params.attempt))
+            })?;
+        check_report_token(&id, attempt, params.token.as_deref())?;
         let at = attempts::now();
         let reported = self
             .attempts
@@ -774,12 +789,24 @@ impl Workspace {
             .node(&AgentNodeId::new(proposal.agent.clone()))
             .and_then(|n| n.role.repo().map(str::to_owned))
             .unwrap_or_default();
-        // Refuse now what approving would refuse, such as more live attempts than a space may have.
-        self.attempts
-            .load(&id)
-            .map_err(RpcError::internal)?
-            .plan_fork(&proposal.agent, &repo, vec![None; proposal.count as usize])
-            .map_err(|e| attempt_rpc_error(&id, e))?;
+        let worktree = space
+            .repos
+            .iter()
+            .find(|r| r.name == repo)
+            .map(|r| r.worktree.clone())
+            .ok_or_else(|| RpcError::conflict(format!("space {id} has no repo {repo}")))?;
+        // Refuse now what approving would refuse, such as more live attempts than a space may have. Numbers a
+        // failed fork left behind are skipped, as the fork itself skips them.
+        let set = self.attempts.load(&id).map_err(RpcError::internal)?;
+        plan_fork_skipping_leftovers(
+            set,
+            id.as_str(),
+            &proposal.agent,
+            &repo,
+            &worktree,
+            vec![None; proposal.count as usize],
+        )
+        .map_err(|e| attempt_rpc_error(&id, e))?;
         let title = format!(
             "A request to fork {} of {} in {id} is waiting in the Inbox for your approval",
             if proposal.count == 1 {

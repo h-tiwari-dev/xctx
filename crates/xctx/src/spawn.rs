@@ -348,6 +348,16 @@ pub const SCRATCH_DIR_ENV: &str = "XCTX_SCRATCH_DIR";
 /// takes `attempt.report`'s `attempt=` from it. Empty in every other pane.
 pub const ATTEMPT_ID_ENV: &str = "XCTX_ATTEMPT_ID";
 
+/// The environment variable holding an attempt's report token (see `xctx_attempt::Attempt::token`), which
+/// `xctx-ctl` sends with `attempt.report`. Set only in that attempt's panes; empty in every other pane.
+pub const ATTEMPT_TOKEN_ENV: &str = xctx_control::cli::ATTEMPT_TOKEN_ENV;
+
+/// Whether an agent pane that was started from `launch` runs `pi` itself, so the session it was given may be
+/// recorded on its agent: the terminal `spawned`, and `pi` was found (no fallback shell, which has a notice).
+pub fn runs_pi(kind: PaneKind, launch: &PaneLaunch, spawned: bool) -> bool {
+    kind == PaneKind::Agent && spawned && launch.notice.is_none()
+}
+
 /// The agent of a space's graph a pane runs as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneAgent {
@@ -445,7 +455,8 @@ pub fn pane_launch_with(
     config = config
         .env(AGENT_ID_ENV, "")
         .env(AGENT_ROLE_ENV, "")
-        .env(ATTEMPT_ID_ENV, "");
+        .env(ATTEMPT_ID_ENV, "")
+        .env(ATTEMPT_TOKEN_ENV, "");
     if let Ok(scratch) = scratch_dir_for(space.id.as_str()) {
         config = config.env(SCRATCH_DIR_ENV, scratch.root().to_string_lossy());
     }
@@ -470,8 +481,11 @@ pub struct AttemptPane {
     pub worktree: PathBuf,
     /// Its own `PORT`.
     pub port: u16,
-    /// The writer it was forked from, exported as [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`].
+    /// The agent it runs as, exported as [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`]: its own id
+    /// (`<writer>#attempt-<n>`, see [`crate::attempts::attempt_agent_id`]) with its writer's role.
     pub agent: PaneAgent,
+    /// Its report token, exported as [`ATTEMPT_TOKEN_ENV`].
+    pub token: String,
     /// Its `pi` session: a fork of the writer's the first time, its own afterwards.
     pub session: AgentSession,
     /// What it was told to try, sent as the first message when its session is forked.
@@ -481,8 +495,8 @@ pub struct AttemptPane {
 }
 
 /// The config that starts an attempt's agent: as [`pane_launch_with`] for an agent in the attempt's repo, but run
-/// in the attempt's worktree with its own `PORT`, scratch directory and [`ATTEMPT_ID_ENV`], as the writer it was
-/// forked from. Its instruction is the first message only when the session is being forked.
+/// in the attempt's worktree with its own `PORT`, scratch directory, [`ATTEMPT_ID_ENV`] and [`ATTEMPT_TOKEN_ENV`],
+/// as its own agent. Its instruction is the first message only when the session is being forked.
 pub fn attempt_launch(space: &Space, attempt: &AttemptPane, search: &ProgramSearch) -> PaneLaunch {
     let role = PaneRole {
         kind: PaneKind::Agent,
@@ -498,7 +512,8 @@ pub fn attempt_launch(space: &Space, attempt: &AttemptPane, search: &ProgramSear
         .config
         .cwd(&attempt.worktree)
         .env("PORT", attempt.port.to_string())
-        .env(ATTEMPT_ID_ENV, attempt.number.to_string());
+        .env(ATTEMPT_ID_ENV, attempt.number.to_string())
+        .env(ATTEMPT_TOKEN_ENV, attempt.token.clone());
     if let Some(scratch) = &attempt.scratch {
         launch.config = launch
             .config
@@ -770,6 +785,7 @@ mod tests {
             // Set, not missing, so an outer xctx's XCTX_AGENT_ID never reaches the pane.
             assert_eq!(env(&launch, AGENT_ID_ENV), Some(""), "{kind:?}");
             assert_eq!(env(&launch, AGENT_ROLE_ENV), Some(""), "{kind:?}");
+            assert_eq!(env(&launch, ATTEMPT_TOKEN_ENV), Some(""), "{kind:?}");
         }
         Ok(())
     }
@@ -787,7 +803,19 @@ mod tests {
         assert_eq!(launch.config.program, "/bin/fish");
         assert_eq!(launch.config.args, ["-l"]);
         assert!(launch.notice.as_deref().unwrap_or_default().contains("pi"));
+        // The shell it fell back to runs no session, so none is recorded for the agent.
+        assert!(!runs_pi(PaneKind::Agent, &launch, true));
         assert_space_env(&launch, &space.repos[0].worktree);
+        executable(&root.path().join("bin/pi"))?;
+        let found = pane_launch(
+            &space,
+            &role(PaneKind::Agent, "api"),
+            &AgentStart::Task("x".into()),
+            &search(root.path()),
+        );
+        assert!(runs_pi(PaneKind::Agent, &found, true));
+        assert!(!runs_pi(PaneKind::Agent, &found, false));
+        assert!(!runs_pi(PaneKind::Shell, &found, true));
         Ok(())
     }
 
@@ -984,9 +1012,10 @@ mod tests {
             worktree: worktree.clone(),
             port: 4012,
             agent: PaneAgent {
-                id: "writer-api".into(),
+                id: "writer-api#attempt-2".into(),
                 role: "writer".into(),
             },
+            token: "0a0b".into(),
             session: AgentSession::Fork {
                 source: "xctx-fix-retry-writer-api".into(),
                 id: "xctx-fix-retry-writer-api-attempt-2".into(),
@@ -1009,7 +1038,8 @@ mod tests {
         assert_eq!(launch.config.cwd.as_deref(), Some(worktree.as_path()));
         assert_eq!(env(&launch, "PORT"), Some("4012"));
         assert_eq!(env(&launch, ATTEMPT_ID_ENV), Some("2"));
-        assert_eq!(env(&launch, AGENT_ID_ENV), Some("writer-api"));
+        assert_eq!(env(&launch, AGENT_ID_ENV), Some("writer-api#attempt-2"));
+        assert_eq!(env(&launch, ATTEMPT_TOKEN_ENV), Some("0a0b"));
         assert_eq!(env(&launch, "XCTX_SPACE"), Some("fix-retry"));
         assert_eq!(env(&launch, "MISE_ENV"), Some("fix-retry"));
         assert!(env(&launch, xctx_control::CONTROL_SOCKET_ENV).is_some());

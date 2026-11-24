@@ -1,5 +1,6 @@
 //! The Ship and Discard confirmations shown over a space, the ship summary, and the background jobs they run.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
@@ -10,6 +11,7 @@ use xctx_core::{ShipOptions, SpaceId, Store, git};
 use xctx_ui::{Button, ButtonVariant, PromptEvent, PromptInput, Theme};
 
 use crate::attempt_ui::{ForkState, ReviewState};
+use crate::attempts::delete_pre_adopt_refs;
 use crate::keymap::DIALOG_CONTEXT;
 use crate::lifecycle::{
     dirty_repos, discard_message, discard_space, ship_report_lines, ship_space,
@@ -340,6 +342,7 @@ impl Workspace {
             return;
         };
         self.in_flight_spaces.insert(id.clone());
+        let repos: Vec<PathBuf> = space.repos.iter().map(|r| r.repo.clone()).collect();
         let executor = cx.background_executor().clone();
         cx.spawn_in(window, async move |this, cx| {
             if check_dirty {
@@ -407,7 +410,7 @@ impl Workspace {
                 match result {
                     Ok(value) => {
                         if !this.spaces.iter().any(|s| s.id == id) {
-                            this.space_ended(&id, cx);
+                            this.space_ended(&id, repos, cx);
                         }
                         done(this, value, cx);
                         if this.dialog.is_none() {
@@ -433,17 +436,31 @@ impl Workspace {
         .detach();
     }
 
-    /// The space `id` was shipped or discarded: drop its agent graph from memory and remove its scratch
-    /// directory in the background, best effort (a leftover directory under `/tmp` harms nothing).
-    fn space_ended(&mut self, id: &SpaceId, cx: &mut Context<Self>) {
+    /// The space `id` was shipped or discarded: drop its agent graph and attempts from memory, and in the
+    /// background remove its scratch directory (best effort: a leftover directory under `/tmp` harms nothing) and
+    /// the backups adopting attempts kept in its `repos` (`refs/xctx/pre-adopt/<slug>/*`), saying which could not
+    /// be removed.
+    fn space_ended(&mut self, id: &SpaceId, repos: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.graphs.forget(id);
         self.attempts.forget(id);
+        self.unsaved_adoptions.remove(id);
         let slug = id.as_str().to_owned();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = clean_scratch(&slug);
-            })
-            .detach();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let failures: Vec<String> = executor
+                .spawn(async move {
+                    let _ = clean_scratch(&slug);
+                    repos
+                        .iter()
+                        .filter_map(|repo| delete_pre_adopt_refs(repo, &slug).err())
+                        .collect()
+                })
+                .await;
+            if !failures.is_empty() {
+                let _ = this.update(cx, |this, cx| this.error(failures.join("; "), cx));
+            }
+        })
+        .detach();
     }
 
     fn fail_job(&mut self, id: &SpaceId, error: JobError, action: &str, cx: &mut Context<Self>) {

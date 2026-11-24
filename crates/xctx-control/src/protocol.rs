@@ -589,7 +589,7 @@ impl Method {
             Method::AttemptList => "space=<slug> [round=<n>]",
             Method::AttemptReport => {
                 "space=<slug> attempt=<n> summary=<text> [tests_passed=<n>] [tests_failed=<n>] \
-                 [test_command=<cmd>] [repro=fixed|still_fails|not_checked] [gave_up=true]"
+                 [test_command=<cmd>] [repro=fixed|still_fails|not_checked] [gave_up=true] [token=<t>]"
             }
             Method::AttemptPropose => {
                 "space=<slug> agent=<writer id> count=<1-4> [instructions:='[\"...\",\"...\"]'] [rationale=<text>]"
@@ -946,6 +946,10 @@ pub struct AttemptReportParams {
     /// The agent could not finish; the attempt is marked failed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gave_up: bool,
+    /// The attempt's report token, which only its own panes know; `xctx-ctl` takes it from
+    /// `$XCTX_ATTEMPT_TOKEN`. A report without the right token is refused with [`ErrorCode::Forbidden`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// `attempt.propose`.
@@ -1501,6 +1505,7 @@ mod tests {
                 test_command: Some("cargo test".into()),
                 repro: ReproStatus::Fixed,
                 gave_up: false,
+                token: Some("0f0f".into()),
             }),
             Call::AttemptPropose(AttemptProposeParams {
                 space: "s".into(),
