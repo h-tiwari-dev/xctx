@@ -424,6 +424,10 @@ impl Element for SplitView {
                 SplitAxis::Vertical => CursorStyle::ResizeUpDown,
             };
             window.set_cursor_style(cursor, &divider.hitbox);
+            if dragging == Some(divider.divider.split_id) {
+                // A fast drag leaves the divider's hitbox behind; keep the resize cursor for the whole window.
+                window.set_window_cursor_style(cursor);
+            }
             if hovered || dragging == Some(divider.divider.split_id) {
                 window.paint_quad(fill(divider.bounds, theme.divider_hover));
             }

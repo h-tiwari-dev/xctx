@@ -12,11 +12,11 @@ pub const DIALOG_CONTEXT: &str = "Dialog";
 actions!(
     xctx,
     [
-        /// Quit the app.
+        /// Quit the app, unless a launch, ship or discard is running.
         Quit,
-        /// Close the focused pane, or the window on Home.
+        /// Close the focused pane; on Home, only say how to close the window or quit.
         ClosePane,
-        /// Close the window.
+        /// Close the window, unless a launch, ship or discard is running.
         CloseWindow,
         /// Split the focused pane side by side, with a new shell.
         SplitRight,

@@ -18,6 +18,46 @@ use crate::workspace::Workspace;
 /// How many indexed repos the draft offers to add with one click.
 const ADDABLE_REPOS_SHOWN: usize = 8;
 
+/// The draft shown on Home, with an id that changes whenever a new draft replaces it or it is thrown away, so a
+/// launch that finishes after the user started another draft leaves that one alone.
+#[derive(Debug, Default)]
+pub(crate) struct HomeDraft {
+    draft: Option<SpaceDraft>,
+    id: u64,
+}
+
+impl HomeDraft {
+    /// The draft, if there is one.
+    pub(crate) fn get(&self) -> Option<&SpaceDraft> {
+        self.draft.as_ref()
+    }
+
+    /// The draft, to add or drop repos; editing it keeps its id.
+    pub(crate) fn get_mut(&mut self) -> Option<&mut SpaceDraft> {
+        self.draft.as_mut()
+    }
+
+    /// The id of the draft shown now.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Show `draft` instead (or none), under a new id.
+    pub(crate) fn replace(&mut self, draft: Option<SpaceDraft>) {
+        self.id += 1;
+        self.draft = draft;
+    }
+
+    /// Throw the draft away if it is still the one that had `id`; returns whether it was.
+    pub(crate) fn clear_if_current(&mut self, id: u64) -> bool {
+        if self.id != id {
+            return false;
+        }
+        self.replace(None);
+        true
+    }
+}
+
 impl Workspace {
     /// Draft a space for `task` from the repo index. While the index is being built, the task waits for it.
     pub(crate) fn submit_task(&mut self, task: String, cx: &mut Context<Self>) {
@@ -39,13 +79,13 @@ impl Workspace {
             };
             self.info(hint, cx);
         }
-        self.draft = Some(draft);
+        self.draft.replace(Some(draft));
         cx.notify();
     }
 
     /// Throw the draft away and clear the prompt.
     pub(crate) fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.draft = None;
+        self.draft.replace(None);
         self.pending_task = None;
         self.task_prompt.update(cx, |prompt, cx| prompt.clear(cx));
         self.repo_input.update(cx, |input, cx| input.clear(cx));
@@ -94,7 +134,7 @@ impl Workspace {
 
     /// Add the repo at the path the user typed to the draft.
     pub(crate) fn add_repo_path(&mut self, input: String, cx: &mut Context<Self>) {
-        if self.draft.is_none() {
+        if self.draft.get().is_none() {
             self.info("type a task first; repos are added to its draft", cx);
             return;
         }
@@ -108,7 +148,7 @@ impl Workspace {
     }
 
     fn add_to_draft(&mut self, repo: DraftRepo, cx: &mut Context<Self>) {
-        let Some(draft) = self.draft.as_mut() else {
+        let Some(draft) = self.draft.get_mut() else {
             return;
         };
         let name = repo.name.clone();
@@ -119,18 +159,19 @@ impl Workspace {
     }
 
     fn drop_from_draft(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Some(draft) = self.draft.as_mut() {
+        if let Some(draft) = self.draft.get_mut() {
             draft.drop_repo(path);
             cx.notify();
         }
     }
 
     /// Launch the draft in the background: worktrees, mise files and the space; then open its tab with the
-    /// agents given the task.
+    /// agents given the task. The draft and prompt are cleared then, unless the user has started another draft.
     pub(crate) fn launch_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.draft.clone() else {
+        let Some(draft) = self.draft.get().cloned() else {
             return;
         };
+        let draft_id = self.draft.id();
         if draft.repos.is_empty() {
             self.error("add at least one repo to the draft before launching", cx);
             return;
@@ -152,8 +193,9 @@ impl Workspace {
                     Ok(launched) => {
                         let id = launched.space.id.clone();
                         let port = launched.space.port;
-                        this.draft = None;
-                        this.task_prompt.update(cx, |prompt, cx| prompt.clear(cx));
+                        if this.draft.clear_if_current(draft_id) {
+                            this.task_prompt.update(cx, |prompt, cx| prompt.clear(cx));
+                        }
                         this.refresh_spaces();
                         this.open_launched_space(
                             launched.space,
@@ -211,7 +253,7 @@ impl Workspace {
         if let Some(busy) = &self.busy {
             column = column.child(notice(format!("{busy}…"), theme.text_muted, &theme));
         }
-        if let Some(draft) = &self.draft {
+        if let Some(draft) = self.draft.get() {
             column = column.child(self.render_draft(draft, cx));
         } else if let Some(task) = &self.pending_task {
             column = column.child(notice(
@@ -407,11 +449,7 @@ impl Workspace {
 
     fn render_roots(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::of(cx);
-        let roots: Vec<PathBuf> = self
-            .store
-            .as_ref()
-            .map(|store| store.roots().to_vec())
-            .unwrap_or_default();
+        let roots = self.roots.clone();
         let status = if self.scanning {
             "indexing…".to_owned()
         } else {
@@ -582,4 +620,40 @@ fn section_label(label: &'static str, theme: &Theme) -> Div {
         .text_size(Theme::TEXT_SM)
         .text_color(theme.text_subtle)
         .child(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_clears_only_the_draft_it_launched() {
+        let mut slot = HomeDraft::default();
+        slot.replace(Some(SpaceDraft::new("add rate limiting")));
+        let launched = slot.id();
+        slot.replace(Some(SpaceDraft::new("fix the flaky test")));
+        assert!(!slot.clear_if_current(launched));
+        assert_eq!(
+            slot.get().map(|d| d.task.as_str()),
+            Some("fix the flaky test")
+        );
+        let current = slot.id();
+        assert!(slot.clear_if_current(current));
+        assert!(slot.get().is_none());
+    }
+
+    #[test]
+    fn editing_a_draft_keeps_its_id_and_cancelling_changes_it() {
+        let mut slot = HomeDraft::default();
+        slot.replace(Some(SpaceDraft::new("add rate limiting")));
+        let launched = slot.id();
+        if let Some(draft) = slot.get_mut() {
+            draft.add_repo(DraftRepo::new(PathBuf::from("/code/api"), ADDED_BY_HAND));
+        }
+        assert_eq!(slot.id(), launched);
+        slot.replace(None);
+        slot.replace(Some(SpaceDraft::new("add rate limiting")));
+        assert!(!slot.clear_if_current(launched));
+        assert!(slot.get().is_some());
+    }
 }
