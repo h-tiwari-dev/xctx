@@ -3,9 +3,14 @@
 //!
 //! Artifact paths come from agents, so every path is checked to be a plain relative path that stays inside the
 //! directory, and no artifact is read or written through a symbolic link.
+//!
+//! The base (`/tmp/xctx-scratch`) sits in a directory every local user can write to, so before anything is read,
+//! written, listed or removed, the base and the space's directory are checked to be real directories owned by
+//! this user, and they are created readable only by this user.
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
 use xctx_core::store::write_atomic;
@@ -15,9 +20,13 @@ use crate::error::{ChannelError, Result, validate_slug};
 /// Where scratch directories live unless a test or caller picks another base.
 pub const DEFAULT_SCRATCH_BASE: &str = "/tmp/xctx-scratch";
 
+/// The mode of every directory a scratch directory creates: only this user can list, read or add files.
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
 /// One space's scratch directory. Nothing is created until the first artifact is written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScratchDir {
+    base: PathBuf,
     root: PathBuf,
 }
 
@@ -32,6 +41,13 @@ fn io_error(path: &Path, source: io::Error) -> ChannelError {
 fn invalid(path: &str, reason: &'static str) -> ChannelError {
     ChannelError::InvalidArtifactPath {
         path: path.to_owned(),
+        reason,
+    }
+}
+
+fn unsafe_dir(path: &Path, reason: &'static str) -> ChannelError {
+    ChannelError::UnsafeScratchDir {
+        path: path.to_path_buf(),
         reason,
     }
 }
@@ -70,6 +86,59 @@ fn is_symlink(path: &Path) -> Result<bool> {
     }
 }
 
+fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Whether `path` exists, refusing it unless it is a directory (not a symbolic link to one) owned by this user.
+fn check_private_dir(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let kind = meta.file_type();
+            if kind.is_symlink() {
+                Err(unsafe_dir(path, "it is a symbolic link"))
+            } else if !kind.is_dir() {
+                Err(unsafe_dir(path, "it is not a directory"))
+            } else if meta.uid() != current_uid() {
+                Err(unsafe_dir(path, "it is owned by another user"))
+            } else {
+                Ok(true)
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_error(path, e)),
+    }
+}
+
+/// Create `path` (and, when `recursive`, its missing ancestors) readable only by this user, unless it already is
+/// a directory this user owns. Whatever ends up at `path` is checked again, so one planted meanwhile is refused.
+fn ensure_private_dir(path: &Path, recursive: bool) -> Result<()> {
+    if check_private_dir(path)? {
+        return Ok(());
+    }
+    match fs::DirBuilder::new()
+        .recursive(recursive)
+        .mode(PRIVATE_DIR_MODE)
+        .create(path)
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(io_error(path, e)),
+    }
+    if check_private_dir(path)? {
+        Ok(())
+    } else {
+        Err(io_error(
+            path,
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "the directory vanished after creation",
+            ),
+        ))
+    }
+}
+
 impl ScratchDir {
     /// The scratch directory of the space `slug` under [`DEFAULT_SCRATCH_BASE`].
     pub fn for_space(slug: &str) -> Result<ScratchDir> {
@@ -77,11 +146,14 @@ impl ScratchDir {
     }
 
     /// The scratch directory of the space `slug` under `base`, for tests and callers that keep scratch elsewhere.
-    /// A slug that could escape `base` is refused.
+    /// A slug that could escape `base` is refused. `base` itself must be (or will be created as) a directory owned
+    /// by this user and not a symbolic link; its ancestors are not checked.
     pub fn in_base(base: impl AsRef<Path>, slug: &str) -> Result<ScratchDir> {
         validate_slug(slug)?;
+        let base = base.as_ref().to_path_buf();
         Ok(ScratchDir {
-            root: base.as_ref().join(slug),
+            root: base.join(slug),
+            base,
         })
     }
 
@@ -90,13 +162,18 @@ impl ScratchDir {
         &self.root
     }
 
+    /// Whether the directory exists, refusing it when it or its base is not a directory owned by this user.
+    fn check_dirs(&self) -> Result<bool> {
+        let base_exists = check_private_dir(&self.base)?;
+        let root_exists = check_private_dir(&self.root)?;
+        Ok(base_exists && root_exists)
+    }
+
     /// `rel` resolved inside the directory, refusing paths that leave it and paths through symbolic links.
     fn resolve(&self, rel: &str) -> Result<PathBuf> {
         let clean = validate_artifact_path(rel)?;
+        self.check_dirs()?;
         let mut path = self.root.clone();
-        if is_symlink(&path)? {
-            return Err(invalid(rel, "the scratch directory is a symbolic link"));
-        }
         for component in clean.components() {
             path.push(component);
             if is_symlink(&path)? {
@@ -110,8 +187,14 @@ impl ScratchDir {
     /// replacing any artifact already there atomically. Returns the artifact's full path.
     pub fn write_artifact(&self, rel: &str, bytes: &[u8]) -> Result<PathBuf> {
         let path = self.resolve(rel)?;
+        ensure_private_dir(&self.base, true)?;
+        ensure_private_dir(&self.root, false)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(PRIVATE_DIR_MODE)
+                .create(parent)
+                .map_err(|e| io_error(parent, e))?;
         }
         write_atomic(&path, bytes)?;
         Ok(path)
@@ -126,11 +209,8 @@ impl ScratchDir {
     /// Every artifact (regular file) in the directory, as paths relative to it, sorted. Symbolic links are not
     /// followed or listed. Empty when the directory does not exist yet.
     pub fn list_artifacts(&self) -> Result<Vec<PathBuf>> {
-        if is_symlink(&self.root)? {
-            return Err(invalid(
-                &self.root.display().to_string(),
-                "the scratch directory is a symbolic link",
-            ));
+        if !self.check_dirs()? {
+            return Ok(Vec::new());
         }
         let mut found = Vec::new();
         let mut pending = vec![PathBuf::new()];
@@ -159,11 +239,18 @@ impl ScratchDir {
     }
 
     /// Remove the directory and everything in it, on Ship or Discard. Returns whether there was anything to
-    /// remove. A symbolic link in its place is removed without touching what it points to.
+    /// remove. A symbolic link in its place is removed without touching what it points to. An unsafe base (a
+    /// symbolic link, not a directory, or another user's) is refused and nothing is removed.
     pub fn clean(&self) -> Result<bool> {
+        if !check_private_dir(&self.base)? {
+            return Ok(false);
+        }
         if is_symlink(&self.root)? {
             fs::remove_file(&self.root).map_err(|e| io_error(&self.root, e))?;
             return Ok(true);
+        }
+        if !check_private_dir(&self.root)? {
+            return Ok(false);
         }
         match fs::remove_dir_all(&self.root) {
             Ok(()) => Ok(true),

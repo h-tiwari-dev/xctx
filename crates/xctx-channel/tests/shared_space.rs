@@ -287,6 +287,61 @@ fn damaged_and_newer_files_are_refused_and_left_alone() -> TestResult {
 }
 
 #[test]
+fn version_zero_files_are_refused_and_left_alone() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join(SPACES_DIR).join("rl").join(SHARED_FILE);
+    fs::create_dir_all(path.parent().ok_or("no parent")?)?;
+    let zero = br#"{"version": 0}"#;
+    fs::write(&path, zero)?;
+    assert!(matches!(
+        SharedSpaceStore::open(&path),
+        Err(ChannelError::UnsupportedVersion { found: 0, .. })
+    ));
+    assert_eq!(fs::read(&path)?, zero);
+    Ok(())
+}
+
+#[test]
+fn agreeing_to_a_contract_version_refuses_stale_versions() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut store = SharedSpaceStore::open_for_space(tmp.path(), "rl")?;
+    assert!(matches!(
+        store.agree_contract_version("writer-web", Some(1)),
+        Err(ChannelError::NoContract)
+    ));
+    store.set_contract("writer-api", draft("X-RateLimit: int"))?;
+    assert_eq!(store.agree_contract_version("writer-web", Some(1))?, 1);
+
+    assert_eq!(
+        store.set_contract("writer-api", draft("X-RateLimit: u32"))?,
+        2
+    );
+    let before = fs::read(store.path())?;
+    assert!(matches!(
+        store.agree_contract_version("writer-web", Some(1)),
+        Err(ChannelError::StaleContract {
+            current: 2,
+            given: 1
+        })
+    ));
+    assert_eq!(
+        fs::read(store.path())?,
+        before,
+        "a stale agreement writes nothing"
+    );
+    let none = Redactor::default();
+    let contract = store.contract(&none).ok_or("no contract")?;
+    assert!(!contract.is_agreed_by("writer-web"));
+
+    assert_eq!(store.agree_contract_version("writer-web", None)?, 2);
+    assert_eq!(store.agree_contract_version("tests", Some(2))?, 2);
+    let reopened = SharedSpaceStore::open_for_space(tmp.path(), "rl")?;
+    let contract = reopened.contract(&none).ok_or("no contract")?;
+    assert_eq!(contract.agreed_by, ["writer-api", "writer-web", "tests"]);
+    Ok(())
+}
+
+#[test]
 fn hand_edited_next_ids_cannot_repeat_ids() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut store = SharedSpaceStore::open_for_space(tmp.path(), "rl")?;

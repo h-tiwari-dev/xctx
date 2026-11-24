@@ -66,8 +66,8 @@ pub struct SharedSpaceStore {
 
 impl SharedSpaceStore {
     /// Open the shared space kept in the file `path`, creating its directory if needed. A missing file is an empty
-    /// shared space (written on the first change); one that cannot be parsed or comes from a newer xctx is an
-    /// error, and the file is left as it is.
+    /// shared space (written on the first change); one that cannot be parsed, comes from a newer xctx or has
+    /// version 0 is an error, and the file is left as it is.
     pub fn open(path: impl Into<PathBuf>) -> Result<SharedSpaceStore> {
         let path = path.into();
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -150,11 +150,24 @@ impl SharedSpaceStore {
     }
 
     /// Record that `agent` agrees to the current contract and return the version agreed to. Agreeing twice changes
-    /// nothing. Fails with [`ChannelError::NoContract`] when there is no contract.
+    /// nothing. Fails with [`ChannelError::NoContract`] when there is no contract. Same as
+    /// [`SharedSpaceStore::agree_contract_version`] without a version check.
     pub fn agree_contract(&mut self, agent: &str) -> Result<u32> {
+        self.agree_contract_version(agent, None)
+    }
+
+    /// Record that `agent` agrees to the current contract, but only if it is `expected_version` (when given), and
+    /// return the version agreed to. Fails with [`ChannelError::StaleContract`] when the contract was revised
+    /// after the agent read `expected_version`, and with [`ChannelError::NoContract`] when there is no contract.
+    /// Agreeing twice changes nothing.
+    pub fn agree_contract_version(
+        &mut self,
+        agent: &str,
+        expected_version: Option<u32>,
+    ) -> Result<u32> {
         self.commit(|data, now| {
             let contract = data.contract.as_mut().ok_or(ChannelError::NoContract)?;
-            contract.agree(agent, now)?;
+            contract.agree_version(agent, expected_version, now)?;
             Ok(contract.version)
         })
     }
@@ -219,7 +232,7 @@ impl SharedSpaceStore {
     }
 }
 
-/// Parse `shared.json`, refusing damaged files and files from a newer xctx.
+/// Parse `shared.json`, refusing damaged files, files from a newer xctx and files with version 0.
 fn parse(path: &Path, bytes: &[u8]) -> Result<SharedSpace> {
     // Check the version on its own first, so a newer file with a changed shape reports its version rather than a
     // parse error.
@@ -232,7 +245,7 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<SharedSpace> {
         source,
     };
     let Versioned { version } = serde_json::from_slice(bytes).map_err(corrupt)?;
-    if version > SHARED_VERSION {
+    if version == 0 || version > SHARED_VERSION {
         return Err(ChannelError::UnsupportedVersion {
             path: path.to_path_buf(),
             found: version,

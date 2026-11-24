@@ -329,18 +329,19 @@ impl AgentGraph {
         self.nodes.iter().find(|n| n.role.is_orchestrator())
     }
 
-    /// Check the graph's invariants: agent ids are unique, there is exactly one orchestrator, no repo has more
-    /// than one writer and no writer has an empty repo, and every edge joins two agents in the graph.
+    /// Check the graph's invariants: agent ids are unique, there is exactly one orchestrator and its id is
+    /// [`ORCHESTRATOR_ID`], no repo has more than one writer and no writer has an empty repo, and every edge joins
+    /// two different agents in the graph and appears once.
     pub fn validate(&self) -> Result<(), GraphError> {
         let mut ids = HashSet::new();
         let mut repos = HashSet::new();
-        let mut orchestrators = 0usize;
+        let mut orchestrators = Vec::new();
         for node in &self.nodes {
             if !ids.insert(&node.id) {
                 return Err(GraphError::DuplicateNodeId(node.id.clone()));
             }
             match &node.role {
-                AgentRole::Orchestrator => orchestrators += 1,
+                AgentRole::Orchestrator => orchestrators.push(&node.id),
                 AgentRole::Writer { repo } if repo.is_empty() => return Err(GraphError::EmptyRepo),
                 AgentRole::Writer { repo } => {
                     if !repos.insert(repo.as_str()) {
@@ -350,14 +351,27 @@ impl AgentGraph {
                 AgentRole::Helper { .. } => {}
             }
         }
-        match orchestrators {
-            0 => return Err(GraphError::MissingOrchestrator),
-            1 => {}
+        match orchestrators.as_slice() {
+            [] => return Err(GraphError::MissingOrchestrator),
+            [id] if id.as_str() != ORCHESTRATOR_ID => {
+                return Err(GraphError::WrongOrchestratorId((*id).clone()));
+            }
+            [_] => {}
             _ => return Err(GraphError::DuplicateOrchestrator),
         }
+        let mut edges = HashSet::new();
         for edge in &self.edges {
             if !ids.contains(&edge.from) || !ids.contains(&edge.to) {
                 return Err(GraphError::DanglingEdge {
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                });
+            }
+            if edge.from == edge.to {
+                return Err(GraphError::SelfLoopEdge(edge.from.clone()));
+            }
+            if !edges.insert(edge) {
+                return Err(GraphError::DuplicateEdge {
                     from: edge.from.clone(),
                     to: edge.to.clone(),
                 });

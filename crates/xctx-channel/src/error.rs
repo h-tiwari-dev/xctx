@@ -18,8 +18,8 @@ pub enum ChannelError {
         source: serde_json::Error,
     },
 
-    /// `shared.json` was written by a newer xctx. It is left untouched.
-    #[error("{path} is version {found}; this xctx reads up to version {supported}")]
+    /// `shared.json` was written by a newer xctx, or has the invalid version 0. It is left untouched.
+    #[error("{path} is version {found}; this xctx reads versions 1 to {supported}")]
     UnsupportedVersion {
         /// The file.
         path: PathBuf,
@@ -42,6 +42,16 @@ pub enum ChannelError {
     #[error("the space has no contract yet")]
     NoContract,
 
+    /// An agent agreed to a contract version that is no longer the current one: the contract was revised since
+    /// the agent read it, so it must read the new revision before agreeing.
+    #[error("contract version {given} is stale; the current version is {current}")]
+    StaleContract {
+        /// The current contract version.
+        current: u32,
+        /// The version the agent meant to agree to.
+        given: u32,
+    },
+
     /// No finding has this id.
     #[error("no finding {0}")]
     FindingNotFound(u64),
@@ -51,6 +61,16 @@ pub enum ChannelError {
     InvalidArtifactPath {
         /// The path as given.
         path: String,
+        /// Why it was refused.
+        reason: &'static str,
+    },
+
+    /// The scratch directory or its base is not safe to use: it is a symbolic link, not a directory, or owned by
+    /// another user. Nothing in or behind it is read, written or removed.
+    #[error("{path} is not a safe scratch directory: {reason}")]
+    UnsafeScratchDir {
+        /// The directory.
+        path: PathBuf,
         /// Why it was refused.
         reason: &'static str,
     },

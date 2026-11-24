@@ -1,10 +1,20 @@
 //! Findings and shared notes: what helpers (tests, reviewer, probe) report, and what any agent wants the space to
 //! remember.
+//!
+//! Both are bounded ([`MAX_FINDINGS`], [`MAX_NOTES`]) so an agent reporting in a loop cannot grow memory or
+//! `shared.json` without limit.
 
 use serde::{Deserialize, Serialize};
 use xctx_core::Redactor;
 
 use crate::error::{ChannelError, Result, require};
+
+/// How many findings a space keeps. Adding one more drops the oldest resolved finding, or the oldest finding when
+/// none is resolved.
+pub const MAX_FINDINGS: usize = 500;
+
+/// How many notes a space keeps. Adding one more drops the oldest.
+pub const MAX_NOTES: usize = 500;
 
 /// How serious a finding is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -105,7 +115,8 @@ fn non_blank(value: Option<&str>) -> Option<String> {
 }
 
 impl SharedNotes {
-    /// Record an unresolved finding and return its id. A blank `repo` or `file` counts as none.
+    /// Record an unresolved finding and return its id. A blank `repo` or `file` counts as none. Beyond
+    /// [`MAX_FINDINGS`], the oldest resolved finding is dropped first, then the oldest unresolved one.
     pub fn add_finding(
         &mut self,
         author: &str,
@@ -129,6 +140,10 @@ impl SharedNotes {
             resolved: false,
             created_at: now,
         });
+        while self.findings.len() > MAX_FINDINGS {
+            let oldest = self.findings.iter().position(|f| f.resolved).unwrap_or(0);
+            self.findings.remove(oldest);
+        }
         Ok(id)
     }
 
@@ -144,7 +159,7 @@ impl SharedNotes {
         Ok(changed)
     }
 
-    /// Record a note and return its id.
+    /// Record a note and return its id. The oldest notes beyond [`MAX_NOTES`] are dropped.
     pub fn add_note(&mut self, author: &str, body: &str, now: u64) -> Result<u64> {
         require("author", author)?;
         require("body", body)?;
@@ -156,6 +171,8 @@ impl SharedNotes {
             body: body.to_owned(),
             created_at: now,
         });
+        let excess = self.notes.len().saturating_sub(MAX_NOTES);
+        self.notes.drain(..excess);
         Ok(id)
     }
 
@@ -211,6 +228,52 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, b);
         assert_eq!(open[0].repo, None, "a blank repo counts as none");
+        Ok(())
+    }
+
+    #[test]
+    fn findings_and_notes_are_capped_dropping_resolved_findings_first() -> Result<()> {
+        let mut n = SharedNotes::default();
+        for i in 0..MAX_FINDINGS {
+            n.add_finding(
+                "tests",
+                FindingSeverity::Info,
+                None,
+                None,
+                &format!("f{i}"),
+                0,
+            )?;
+        }
+        n.resolve_finding(10)?;
+        n.resolve_finding(20)?;
+        n.add_finding("tests", FindingSeverity::Info, None, None, "one more", 0)?;
+        n.add_finding("tests", FindingSeverity::Info, None, None, "two more", 0)?;
+        let none = Redactor::default();
+        let ids: Vec<u64> = n.findings(false, &none).iter().map(|f| f.id).collect();
+        assert_eq!(ids.len(), MAX_FINDINGS);
+        assert!(
+            !ids.contains(&10) && !ids.contains(&20),
+            "resolved go first"
+        );
+        assert_eq!(
+            ids.first(),
+            Some(&1),
+            "unresolved stay while resolved remain"
+        );
+
+        let last = n.add_finding("tests", FindingSeverity::Info, None, None, "three", 0)?;
+        let ids: Vec<u64> = n.findings(false, &none).iter().map(|f| f.id).collect();
+        assert_eq!(ids.len(), MAX_FINDINGS);
+        assert_eq!(ids.first(), Some(&2), "then the oldest unresolved goes");
+        assert_eq!(ids.last(), Some(&last));
+
+        for i in 0..MAX_NOTES + 3 {
+            n.add_note("writer", &format!("n{i}"), 0)?;
+        }
+        let notes = n.notes(&none);
+        assert_eq!(notes.len(), MAX_NOTES);
+        assert_eq!(notes[0].id, 4);
+        assert_eq!(notes.last().map(|n| n.id), Some((MAX_NOTES + 3) as u64));
         Ok(())
     }
 

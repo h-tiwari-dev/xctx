@@ -45,6 +45,23 @@ pub enum GraphError {
         to: AgentNodeId,
     },
 
+    /// The orchestrator of a loaded graph does not have the id [`crate::ORCHESTRATOR_ID`].
+    #[error("the orchestrator has the id {0}; it must be \"orchestrator\"")]
+    WrongOrchestratorId(AgentNodeId),
+
+    /// An edge in a loaded graph starts and ends at the same agent.
+    #[error("the edge {0} -> {0} joins an agent to itself")]
+    SelfLoopEdge(AgentNodeId),
+
+    /// The same edge appears more than once in a loaded graph.
+    #[error("the edge {from} -> {to} appears more than once")]
+    DuplicateEdge {
+        /// Where the edge starts.
+        from: AgentNodeId,
+        /// Where the edge ends.
+        to: AgentNodeId,
+    },
+
     /// The agent's state does not allow the action, e.g. pausing an agent that is done.
     #[error("cannot {action} agent {id} while it is {from:?}")]
     InvalidTransition {
@@ -78,8 +95,8 @@ pub enum GraphError {
         source: serde_json::Error,
     },
 
-    /// The graph document was written by a newer xctx.
-    #[error("{path} is version {found}; this xctx reads up to version {supported}")]
+    /// The graph document was written by a newer xctx, or has the invalid version 0.
+    #[error("{path} is version {found}; this xctx reads versions 1 to {supported}")]
     UnsupportedVersion {
         /// The file.
         path: PathBuf,

@@ -217,6 +217,21 @@ fn a_newer_version_is_refused_even_if_its_shape_changed() -> TestResult {
 }
 
 #[test]
+fn version_zero_is_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = graph_path(dir.path(), "s")?;
+    let mut json = serde_json::to_value(sample_document()?)?;
+    json["version"] = serde_json::json!(0);
+    write_raw(&path, &json)?;
+    let result = load(&path);
+    assert!(
+        matches!(result, Err(GraphError::UnsupportedVersion { found: 0, .. })),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_missing_file_is_an_io_error() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = graph_path(dir.path(), "never-saved")?;

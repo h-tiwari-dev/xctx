@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use xctx_core::Redactor;
 
-use crate::error::{Result, require};
+use crate::error::{ChannelError, Result, require};
 
 /// One revision of a space's contract.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,9 +71,30 @@ impl Contract {
     }
 
     /// Record that `agent` agrees to this revision. Agreeing twice changes nothing; returns whether this call
-    /// added the agreement.
+    /// added the agreement. Same as [`Contract::agree_version`] without a version check.
     pub fn agree(&mut self, agent: &str, now: u64) -> Result<bool> {
+        self.agree_version(agent, None, now)
+    }
+
+    /// Record that `agent` agrees to this revision, but only if it is `expected_version` (when given): the
+    /// revision the agent actually read. Fails with [`ChannelError::StaleContract`] when the contract was revised
+    /// since, so an agent cannot agree to text it has not seen. Agreeing twice changes nothing; returns whether
+    /// this call added the agreement.
+    pub fn agree_version(
+        &mut self,
+        agent: &str,
+        expected_version: Option<u32>,
+        now: u64,
+    ) -> Result<bool> {
         require("agent", agent)?;
+        if let Some(given) = expected_version
+            && given != self.version
+        {
+            return Err(ChannelError::StaleContract {
+                current: self.version,
+                given,
+            });
+        }
         if self.agreed_by.iter().any(|a| a == agent) {
             return Ok(false);
         }
@@ -108,7 +129,6 @@ impl Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ChannelError;
 
     fn draft(spec: &str) -> ContractDraft {
         ContractDraft {
@@ -140,6 +160,33 @@ mod tests {
         assert_eq!(second.author, "writer-web");
         assert_eq!(second.agreed_by, ["writer-web"]);
         assert!(!second.is_agreed_by("writer-api"));
+        Ok(())
+    }
+
+    #[test]
+    fn agreeing_to_a_version_checks_it_is_current() -> Result<()> {
+        let first = Contract::revise(None, "writer-api", draft("X-RateLimit: int"), 1)?
+            .ok_or(ChannelError::NoContract)?;
+        let mut second =
+            Contract::revise(Some(&first), "writer-api", draft("X-RateLimit: u32"), 2)?
+                .ok_or(ChannelError::NoContract)?;
+
+        assert!(matches!(
+            second.agree_version("writer-web", Some(1), 3),
+            Err(ChannelError::StaleContract {
+                current: 2,
+                given: 1
+            })
+        ));
+        assert!(!second.is_agreed_by("writer-web"));
+        assert_eq!(second.updated_at, 2, "a stale agreement changes nothing");
+
+        assert!(second.agree_version("writer-web", Some(2), 4)?);
+        assert!(
+            second.agree_version("tests", None, 5)?,
+            "no version agrees to the current one"
+        );
+        assert_eq!(second.agreed_by, ["writer-api", "writer-web", "tests"]);
         Ok(())
     }
 

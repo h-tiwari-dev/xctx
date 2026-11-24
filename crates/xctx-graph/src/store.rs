@@ -78,7 +78,7 @@ pub fn save(path: &Path, doc: &SpaceGraphDocument) -> Result<(), GraphError> {
 }
 
 /// Read the document at `path`. Fails when the file cannot be read, is not a graph document, was written by a
-/// newer xctx, or holds a graph that fails [`AgentGraph::validate`] (with that error), so a damaged graph is never
+/// newer xctx or has version 0, or holds a graph that fails [`AgentGraph::validate`] (with that error), so a damaged graph is never
 /// used.
 pub fn load(path: &Path) -> Result<SpaceGraphDocument, GraphError> {
     let bytes = fs::read(path).map_err(io_error(path))?;
@@ -88,7 +88,7 @@ pub fn load(path: &Path) -> Result<SpaceGraphDocument, GraphError> {
     };
     // Read the version first: a newer document may not parse as this version's shape.
     let Version { version } = serde_json::from_slice(&bytes).map_err(json_error)?;
-    if version > GRAPH_DOCUMENT_VERSION {
+    if version == 0 || version > GRAPH_DOCUMENT_VERSION {
         return Err(GraphError::UnsupportedVersion {
             path: path.to_path_buf(),
             found: version,

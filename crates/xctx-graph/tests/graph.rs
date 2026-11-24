@@ -457,3 +457,48 @@ fn validate_rejects_broken_graphs() -> Result<(), serde_json::Error> {
     assert!(matches!(empty_repo.validate(), Err(GraphError::EmptyRepo)));
     Ok(())
 }
+
+#[test]
+fn validate_rejects_a_renamed_orchestrator_self_loops_and_duplicate_edges()
+-> Result<(), serde_json::Error> {
+    let orchestrator =
+        serde_json::json!({"id": "orchestrator", "role": {"role": "orchestrator"}, "label": "O"});
+    let api = serde_json::json!({"id": "writer-api", "role": {"role": "writer", "repo": "api"}, "label": "api"});
+
+    let renamed = graph_from_json(serde_json::json!({
+        "nodes": [{"id": "boss", "role": {"role": "orchestrator"}, "label": "O"}, api],
+        "edges": []
+    }))?;
+    assert!(matches!(
+        renamed.validate(),
+        Err(GraphError::WrongOrchestratorId(id)) if id.as_str() == "boss"
+    ));
+
+    let self_loop = graph_from_json(serde_json::json!({
+        "nodes": [orchestrator, api],
+        "edges": [{"from": "writer-api", "to": "writer-api", "kind": "contract"}]
+    }))?;
+    assert!(matches!(
+        self_loop.validate(),
+        Err(GraphError::SelfLoopEdge(id)) if id.as_str() == "writer-api"
+    ));
+
+    let coordinates =
+        serde_json::json!({"from": "orchestrator", "to": "writer-api", "kind": "coordinates"});
+    let duplicate = graph_from_json(serde_json::json!({
+        "nodes": [orchestrator, api],
+        "edges": [coordinates, coordinates]
+    }))?;
+    assert!(matches!(
+        duplicate.validate(),
+        Err(GraphError::DuplicateEdge { from, to })
+            if from.as_str() == "orchestrator" && to.as_str() == "writer-api"
+    ));
+
+    let once = graph_from_json(serde_json::json!({
+        "nodes": [orchestrator, api],
+        "edges": [coordinates]
+    }))?;
+    assert!(once.validate().is_ok());
+    Ok(())
+}

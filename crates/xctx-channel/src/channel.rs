@@ -96,7 +96,8 @@ impl Channel {
         &self.messages
     }
 
-    /// The messages that pass every filter given, oldest first, with bodies masked by `redactor`.
+    /// The messages that pass every filter given, oldest first, with sender, recipient and body masked by
+    /// `redactor`. Filters match the unmasked fields.
     ///
     /// - `to`: only messages addressed to this agent, plus broadcasts (which are addressed to everyone).
     /// - `kind`: only messages of this kind.
@@ -129,6 +130,8 @@ impl Channel {
             .skip(start)
             .take(limit)
             .map(|m| ChannelMessage {
+                from: redactor.redact(&m.from).into_owned(),
+                to: m.to.as_deref().map(|t| redactor.redact(t).into_owned()),
                 body: redactor.redact(&m.body).into_owned(),
                 ..m.clone()
             })
@@ -236,6 +239,25 @@ mod tests {
         let listed = c.list(None, None, None, None, &r);
         assert_eq!(listed[0].body, "token is [REDACTED:GH_TOKEN]");
         assert_eq!(c.messages()[0].body, "token is ghp_secret_value");
+        Ok(())
+    }
+
+    #[test]
+    fn listed_senders_and_recipients_are_masked() -> Result<()> {
+        let mut c = Channel::default();
+        c.post(
+            "agent-ghp_secret_value",
+            Some("to-ghp_secret_value"),
+            MessageKind::Status,
+            "hi",
+            0,
+        )?;
+        let r = Redactor::new([("GH_TOKEN".to_owned(), "ghp_secret_value".to_owned())]);
+        let listed = c.list(Some("to-ghp_secret_value"), None, None, None, &r);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].from, "agent-[REDACTED:GH_TOKEN]");
+        assert_eq!(listed[0].to.as_deref(), Some("to-[REDACTED:GH_TOKEN]"));
+        assert_eq!(c.messages()[0].from, "agent-ghp_secret_value");
         Ok(())
     }
 

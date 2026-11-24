@@ -5,6 +5,7 @@ edition.workspace = true
 description = "The shared space of an xctx space: the versioned Contract, the Channel between agents, Findings and Notes, their store on disk, and the scratch artifact directory"
 
 [dependencies]
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

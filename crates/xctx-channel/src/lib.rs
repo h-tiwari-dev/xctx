@@ -25,6 +25,6 @@ mod store;
 pub use channel::{Channel, ChannelMessage, MAX_MESSAGES, MessageKind};
 pub use contract::{Contract, ContractDraft};
 pub use error::{ChannelError, Result};
-pub use notes::{Finding, FindingSeverity, Note, SharedNotes};
+pub use notes::{Finding, FindingSeverity, MAX_FINDINGS, MAX_NOTES, Note, SharedNotes};
 pub use scratch::{DEFAULT_SCRATCH_BASE, ScratchDir};
 pub use store::{SHARED_FILE, SPACES_DIR, SharedSpaceStore};
