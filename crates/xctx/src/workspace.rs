@@ -16,10 +16,10 @@ use xctx_ui::{
     BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme,
 };
 
-use crate::control::{Control, PendingDraft};
+use crate::control::{Control, PendingDraft, PendingInboxList};
 use crate::dialogs::Dialog;
 use crate::home::HomeDraft;
-use crate::inbox_view::EnvPrompt;
+use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight, ResizeUp,
@@ -78,6 +78,8 @@ pub(crate) struct Workspace {
     /// The open dialog's subscription to its text input, if it has one.
     pub(crate) dialog_subscription: Option<Subscription>,
     banner: Option<StatusBanner>,
+    /// Whether the banner showing came from an agent (`status.set`) rather than xctx itself.
+    banner_from_agent: bool,
     banner_generation: u64,
     banner_task: Option<Task<()>>,
     /// The timer that saves [`Workspace::pending_drag_saves`] once divider drags pause.
@@ -89,6 +91,10 @@ pub(crate) struct Workspace {
     pub(crate) control: Option<Control>,
     /// `space.draft` requests waiting for the repo index to be built.
     pub(crate) pending_control_drafts: Vec<PendingDraft>,
+    /// Whether the startup mise check has finished, so the redactor knows the secrets it found.
+    pub(crate) mise_ready: bool,
+    /// `inbox.list` requests waiting for the startup mise check.
+    pub(crate) pending_inbox_lists: Vec<PendingInboxList>,
     /// The Inbox; `None` when it could not be opened.
     pub(crate) inbox: Option<Inbox>,
     /// Why the Inbox could not be opened.
@@ -99,8 +105,8 @@ pub(crate) struct Workspace {
     pub(crate) inbox_expanded: Option<SharedString>,
     /// The Plan Gate open for review on Home.
     pub(crate) plan_review: Option<ItemId>,
-    /// Whether the reviewed plan is launching.
-    pub(crate) plan_launching: bool,
+    /// The Plan Gates launching or launched from this window.
+    pub(crate) plan_launches: PlanLaunches,
     /// Where a repo is typed to add it to the reviewed plan.
     pub(crate) plan_repo_input: Entity<PromptInput>,
     /// The Set value input for a missing mise variable.
@@ -204,6 +210,7 @@ impl Workspace {
             dialog_focus: cx.focus_handle(),
             dialog_subscription: None,
             banner: None,
+            banner_from_agent: false,
             banner_generation: 0,
             banner_task: None,
             persist_task: None,
@@ -212,12 +219,14 @@ impl Workspace {
             terminal_theme: TerminalTheme::default(),
             control: None,
             pending_control_drafts: Vec::new(),
+            mise_ready: false,
+            pending_inbox_lists: Vec::new(),
             inbox,
             inbox_error,
             redactor: Redactor::default(),
             inbox_expanded: None,
             plan_review: None,
-            plan_launching: false,
+            plan_launches: PlanLaunches::default(),
             plan_repo_input,
             env_prompt: None,
             parent: ParentAgent::default(),
@@ -236,7 +245,7 @@ impl Workspace {
             workspace.error(e, cx);
         }
         workspace.refresh_spaces();
-        workspace.check_mise(workspace.spaces.clone(), cx);
+        workspace.check_mise_at_startup(cx);
         workspace.rescan(cx);
         let prompt_focus = workspace.task_prompt.focus_handle(cx);
         prompt_focus.focus(window, cx);
@@ -256,6 +265,20 @@ impl Workspace {
         if !banner_replaces(self.banner.as_ref(), &banner) {
             return;
         }
+        self.show_banner(banner, false, cx);
+    }
+
+    /// Show an agent's message (from `status.set`) in the status bar. It never replaces an error of xctx's own
+    /// (see [`agent_banner_replaces`]), so an agent cannot hide a real failure.
+    pub(crate) fn set_agent_banner(&mut self, banner: StatusBanner, cx: &mut Context<Self>) {
+        if !agent_banner_replaces(self.banner.as_ref(), self.banner_from_agent, &banner) {
+            return;
+        }
+        self.show_banner(banner, true, cx);
+    }
+
+    fn show_banner(&mut self, banner: StatusBanner, from_agent: bool, cx: &mut Context<Self>) {
+        self.banner_from_agent = from_agent;
         self.banner_generation += 1;
         let generation = self.banner_generation;
         self.banner_task = banner.auto_clear_after().map(|delay| {
@@ -643,6 +666,17 @@ pub(crate) fn banner_replaces(current: Option<&StatusBanner>, new: &StatusBanner
     !(new.kind == BannerKind::Info && current.is_some_and(|b| b.kind == BannerKind::Error))
 }
 
+/// Whether an agent's `new` banner may replace the banner showing, `current` (which came from an agent when
+/// `current_from_agent`): as [`banner_replaces`], except that it never replaces an error of xctx's own.
+pub(crate) fn agent_banner_replaces(
+    current: Option<&StatusBanner>,
+    current_from_agent: bool,
+    new: &StatusBanner,
+) -> bool {
+    let app_error = !current_from_agent && current.is_some_and(|b| b.kind == BannerKind::Error);
+    !app_error && banner_replaces(current, new)
+}
+
 /// Why the tab of space `id` cannot be opened or shown now, if it cannot. A space whose ship or discard is running
 /// (`in_flight`) cannot. Otherwise an open tab can always be shown; a closed one needs the store, which holds its
 /// saved layout (opening it without would replace that layout with a fresh one). `busy` is what the background job
@@ -680,6 +714,24 @@ mod tests {
         assert!(banner_replaces(Some(&info), &error));
         assert!(banner_replaces(Some(&error), &error));
         assert!(!banner_replaces(Some(&error), &info));
+    }
+
+    #[test]
+    fn an_agent_banner_never_replaces_an_app_error() {
+        let info = StatusBanner::info("agent: tests pass");
+        let error = StatusBanner::error("agent: tests failed");
+        let app_error = StatusBanner::error("push failed");
+        assert!(agent_banner_replaces(None, false, &info));
+        assert!(agent_banner_replaces(None, false, &error));
+        assert!(!agent_banner_replaces(Some(&app_error), false, &error));
+        assert!(!agent_banner_replaces(Some(&app_error), false, &info));
+        assert!(agent_banner_replaces(Some(&error), true, &error));
+        assert!(!agent_banner_replaces(Some(&error), true, &info));
+        assert!(agent_banner_replaces(
+            Some(&StatusBanner::info("launched")),
+            false,
+            &error
+        ));
     }
 
     #[test]

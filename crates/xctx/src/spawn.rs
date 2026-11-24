@@ -254,6 +254,28 @@ pub enum AgentStart {
     /// Resume the most recent session in the worktree: `pi --continue`. Used when a space is reopened, and for
     /// agent panes a reshape adds back.
     Continue,
+    /// A new session with no task: plain `pi`. Used for an agent pane split into a worktree another agent pane
+    /// already works in, so two `pi` processes never write to one session.
+    Fresh,
+}
+
+/// How an agent pane of `new` role added by a split starts in `space`: [`AgentStart::Fresh`] when one of
+/// `others` (the space's other panes) is an agent in the same worktree, whose session `pi --continue` would
+/// resume, else [`AgentStart::Continue`].
+pub fn split_agent_start<'a>(
+    space: &Space,
+    new: &PaneRole,
+    others: impl IntoIterator<Item = &'a PaneRole>,
+) -> AgentStart {
+    let worktree = pane_worktree(space, new);
+    let shared = others
+        .into_iter()
+        .any(|role| role.kind == PaneKind::Agent && pane_worktree(space, role) == worktree);
+    if shared {
+        AgentStart::Fresh
+    } else {
+        AgentStart::Continue
+    }
 }
 
 /// What to start in a pane, and a notice for the user when it is not what the pane's role asked for (for example
@@ -292,6 +314,7 @@ pub fn pane_launch(
                 let args = match agent {
                     AgentStart::Task(task) => vec!["--".to_owned(), task.clone()],
                     AgentStart::Continue => vec!["--continue".to_owned()],
+                    AgentStart::Fresh => Vec::new(),
                 };
                 (Some(pi), args, None)
             }
@@ -490,6 +513,39 @@ mod tests {
         assert_eq!(launch.config.args, ["--continue"]);
         assert_space_env(&launch, &space.repos[0].worktree);
         Ok(())
+    }
+
+    #[test]
+    fn a_fresh_agent_runs_plain_pi_without_a_session_flag() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let pi = root.path().join("bin/pi");
+        executable(&pi)?;
+        let space = space(root.path());
+        let launch = pane_launch(
+            &space,
+            &role(PaneKind::Agent, "web"),
+            &AgentStart::Fresh,
+            &search(root.path()),
+        );
+        assert_eq!(launch.notice, None);
+        assert_eq!(launch.config.program, pi.to_string_lossy());
+        assert!(launch.config.args.is_empty(), "{:?}", launch.config.args);
+        assert_space_env(&launch, &space.repos[1].worktree);
+        Ok(())
+    }
+
+    #[test]
+    fn a_split_agent_starts_fresh_beside_another_agent_in_its_worktree() {
+        let space = space(Path::new("/code"));
+        let new = role(PaneKind::Agent, "api");
+        let others = [role(PaneKind::Agent, "api"), role(PaneKind::Shell, "web")];
+        assert_eq!(split_agent_start(&space, &new, &others), AgentStart::Fresh);
+        let elsewhere = [role(PaneKind::Agent, "web"), role(PaneKind::Shell, "api")];
+        assert_eq!(
+            split_agent_start(&space, &new, &elsewhere),
+            AgentStart::Continue
+        );
+        assert_eq!(split_agent_start(&space, &new, &[]), AgentStart::Continue);
     }
 
     #[test]

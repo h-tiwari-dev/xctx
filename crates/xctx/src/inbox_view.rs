@@ -1,6 +1,7 @@
 //! The Inbox on Home: its entries, the Plan Gate card a Review opens (edit, approve and launch, or reject), and
 //! the input that sets a missing mise variable for one space.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{
@@ -30,8 +31,65 @@ pub(crate) struct EnvPrompt {
     _subscription: Subscription,
 }
 
+/// The Plan Gates launched from this window, so none launches twice or changes while it launches. A plan stays
+/// launched once its space exists, even if marking it approved in the Inbox failed.
+#[derive(Debug, Default)]
+pub(crate) struct PlanLaunches {
+    /// The plan launching now.
+    launching: Option<ItemId>,
+    /// The plans whose launch started and did not fail.
+    launched: HashSet<ItemId>,
+}
+
+impl PlanLaunches {
+    /// Whether a plan is launching, so the reviewed plan cannot be edited or approved.
+    pub(crate) fn is_launching(&self) -> bool {
+        self.launching.is_some()
+    }
+
+    /// Start launching plan `id`. Refused, with why, while another plan launches or when `id` was launched
+    /// already.
+    pub(crate) fn begin(&mut self, id: &ItemId) -> Result<(), String> {
+        if self.launching.is_some() {
+            return Err("a plan is launching; wait until it finishes".to_owned());
+        }
+        if !self.launched.insert(id.clone()) {
+            return Err(
+                "this plan was launched already; reject or dismiss it instead of approving it again"
+                    .to_owned(),
+            );
+        }
+        self.launching = Some(id.clone());
+        Ok(())
+    }
+
+    /// The launch of `id` created its space: it stays launched.
+    pub(crate) fn succeeded(&mut self, id: &ItemId) {
+        if self.launching.as_ref() == Some(id) {
+            self.launching = None;
+        }
+    }
+
+    /// The launch of `id` failed or never started: it may be approved again.
+    pub(crate) fn failed(&mut self, id: &ItemId) {
+        if self.launching.as_ref() == Some(id) {
+            self.launching = None;
+        }
+        self.launched.remove(id);
+    }
+}
+
 // -------------------------------------------------------------------------------------------------------------
 // Pure helpers
+
+/// Why `value` typed for the mise variable `name` cannot be saved, if it cannot: an empty (or blank) value would
+/// leave the variable effectively unset while marking it resolved.
+pub fn env_value_error(name: &str, value: &str) -> Option<String> {
+    value
+        .trim()
+        .is_empty()
+        .then(|| format!("{name} needs a value; type it, or press Esc to cancel"))
+}
 
 /// The panel's kind for an Inbox item kind.
 pub fn entry_kind(kind: ItemKind) -> InboxKind {
@@ -205,15 +263,22 @@ impl Workspace {
             .filter(|item| item.is_pending() && item.kind() == ItemKind::PlanGate)
     }
 
+    /// Edit the plan being reviewed. Does nothing while a plan launches, so what is stored is what ran.
     fn edit_reviewed_plan(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut SpaceDraft)) {
+        if self.plan_launches.is_launching() {
+            return;
+        }
         let Some(id) = self.plan_review.clone() else {
             return;
         };
         self.change_inbox(cx, |inbox| inbox.edit_plan(&id, edit));
     }
 
-    /// Add the repo typed under the plan being reviewed.
+    /// Add the repo typed under the plan being reviewed. Does nothing while a plan launches.
     pub(crate) fn add_plan_repo(&mut self, input: String, cx: &mut Context<Self>) {
+        if self.plan_launches.is_launching() {
+            return;
+        }
         match repo_from_input(&self.index, &input, home_dir().as_deref()) {
             Ok(repo) => {
                 self.plan_repo_input.update(cx, |input, cx| input.clear(cx));
@@ -228,8 +293,12 @@ impl Workspace {
         }
     }
 
-    /// Approve the plan being reviewed: launch it, and mark it approved once the space exists.
+    /// Approve the plan being reviewed: launch it, and mark it approved once the space exists. Does nothing while
+    /// a plan launches, and refuses a plan launched already (see [`PlanLaunches`]).
     fn approve_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plan_launches.is_launching() {
+            return;
+        }
         let Some(item) = self.reviewed_plan() else {
             return;
         };
@@ -241,20 +310,26 @@ impl Workspace {
             return;
         }
         let (id, draft) = (item.id.clone(), plan.draft.clone());
-        self.plan_launching = true;
+        if let Err(why) = self.plan_launches.begin(&id) {
+            self.error(why, cx);
+            return;
+        }
+        let (launched_id, failed_id) = (id.clone(), id.clone());
         let started = self.start_launch(
             draft,
             window,
             cx,
             move |this, _, cx| {
-                this.plan_launching = false;
-                this.plan_review = None;
-                this.change_inbox(cx, |inbox| inbox.approve(&id));
+                this.plan_launches.succeeded(&launched_id);
+                if this.plan_review.as_ref() == Some(&launched_id) {
+                    this.plan_review = None;
+                }
+                this.change_inbox(cx, |inbox| inbox.approve(&launched_id));
             },
-            |this, _| this.plan_launching = false,
+            move |this, _| this.plan_launches.failed(&failed_id),
         );
         if !started {
-            self.plan_launching = false;
+            self.plan_launches.failed(&id);
         }
         cx.notify();
     }
@@ -316,8 +391,15 @@ impl Workspace {
     }
 
     /// Write the value typed for a missing variable into its space's mise file, mask it from now on, mark the
-    /// item resolved and check the space with mise again.
+    /// item resolved and check the space with mise again. An empty value is refused and the input stays open.
     fn save_env_value(&mut self, value: String, cx: &mut Context<Self>) {
+        let Some(prompt) = self.env_prompt.as_ref() else {
+            return;
+        };
+        if let Some(why) = env_value_error(&prompt.name, &value) {
+            self.error(why, cx);
+            return;
+        }
         let Some(prompt) = self.env_prompt.take() else {
             return;
         };
@@ -363,7 +445,7 @@ impl Workspace {
             );
             section = section.child(
                 PlanGateCard::new(view)
-                    .busy(self.plan_launching || self.busy.is_some())
+                    .busy(self.plan_launches.is_launching() || self.busy.is_some())
                     .add_repo(div().pt(Theme::SPACE_1).child(self.plan_repo_input.clone()))
                     .on_shape(move |s: Shape, _, cx| {
                         let _ = shape.update(cx, |this, cx| {
@@ -413,7 +495,7 @@ impl Workspace {
                             .text_size(Theme::TEXT_SM)
                             .text_color(theme.text_muted)
                             .child(format!(
-                                "Written to {file} in the space's worktree, which git ignores and Ship or Discard removes. The value is masked from agents from now on. Enter saves, Esc cancels."
+                                "Written to {file} in the space's worktree (git ignores it; Ship or Discard removes it) and marked redact = true. xctx masks the value in control responses and Inbox previews, also after a restart; the file itself is plain text the space's agents can read. Enter saves, Esc cancels."
                             )),
                     )
                     .child(prompt.input.clone())
@@ -541,6 +623,45 @@ mod tests {
         assert_eq!(view.repos[0].path.as_ref(), "/code/api");
         assert_eq!(view.shape, Shape::Dev);
         Ok(())
+    }
+
+    #[test]
+    fn an_empty_env_value_is_refused() {
+        assert!(env_value_error("API_KEY", "").is_some_and(|e| e.contains("API_KEY")));
+        assert!(env_value_error("API_KEY", "  \t").is_some());
+        assert_eq!(env_value_error("API_KEY", "tok-1"), None);
+    }
+
+    #[test]
+    fn a_plan_launches_once_and_only_one_at_a_time() {
+        let (a, b) = (ItemId::new("inbox-1"), ItemId::new("inbox-2"));
+        let mut launches = PlanLaunches::default();
+        assert!(!launches.is_launching());
+        assert!(launches.begin(&a).is_ok());
+        assert!(launches.is_launching());
+        // A second click, or another plan, while it launches.
+        assert!(launches.begin(&a).is_err());
+        assert!(launches.begin(&b).is_err());
+        launches.succeeded(&a);
+        assert!(!launches.is_launching());
+        // Launched, even if marking it approved failed: never again.
+        assert!(
+            launches
+                .begin(&a)
+                .is_err_and(|e| e.contains("launched already"))
+        );
+        assert!(!launches.is_launching());
+        assert!(launches.begin(&b).is_ok());
+    }
+
+    #[test]
+    fn a_failed_plan_launch_may_be_approved_again() {
+        let id = ItemId::new("inbox-1");
+        let mut launches = PlanLaunches::default();
+        assert!(launches.begin(&id).is_ok());
+        launches.failed(&id);
+        assert!(!launches.is_launching());
+        assert!(launches.begin(&id).is_ok());
     }
 
     #[test]
