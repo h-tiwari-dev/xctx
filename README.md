@@ -4,18 +4,18 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
 
 **Status:** Milestone 1 is complete — Home, repo indexing & task drafting, per-space git worktrees & `mise.<slug>.toml`, truecolor PTY terminal (`pi`, `nvim`, `lazygit`), split/zoom/reshape panes (`Dev`/`Debug`/`Review`), layout persistence & agent resume (`pi --continue`), and Ship/Discard all work end-to-end. See [`docs/roadmap.md`](docs/roadmap.md) and [`docs/m2.md`](docs/m2.md) for what comes next.
 
-**Milestone 2:** waves 1 to 3 are in. xctx is now an agent-drivable harness:
+**Milestone 2 (complete):** xctx is now an agent-drivable harness (all 4 waves implemented, reviewed, and hardened):
 
-- **Control socket and `xctx-ctl`.** Agents and scripts can list spaces, read and change layouts, draft spaces and post to the Inbox. Every pane gets `XCTX_CONTROL_SOCKET` and has `xctx-ctl` on its `PATH`.
-- **Parent Agent on Home.** A `pi` session in a drawer, told its role and given only its read and bash tools. It drafts spaces through `xctx-ctl space.draft`, writes no code, and cannot launch anything.
+- **Control socket and `xctx-ctl`.** Agents and scripts can list spaces, read and change layouts on open spaces, draft spaces and post to the Inbox. Every pane gets `XCTX_CONTROL_SOCKET` and has `xctx-ctl` on its `PATH`.
+- **Parent Agent on Home.** A `pi` session in a drawer running outside the data directory, told its advisory no-code role and given only its read and bash tools. It drafts spaces through `xctx-ctl space.draft` and cannot launch anything.
 - **Inbox on Home.** The status bar shows how many items are pending. The Inbox holds four kinds of item:
   - **Plan Gates.** Review opens a card where you change the shape, drop or add repos, then Approve & launch or Reject.
-  - **Missing mise variables.** Each comes with mise's own help text. Set value writes the value into the space's git-ignored `mise.<slug>.toml`.
-  - **Notices** from agents.
+  - **Missing mise variables.** Each comes with mise's own help text. Set value writes `{ value = ..., redact = true }` into the space's git-ignored `mise.<slug>.toml`.
+  - **Notices** from agents (bounded cap).
   - **Space widenings** are shown, but approving them is not supported yet.
-- **Secret redaction.** Values mise marks as secret are masked as `[REDACTED:NAME]` in everything agents and the Inbox see.
+- **Secret redaction.** Values mise marks as secret are masked as `[REDACTED:NAME]` in control responses and Inbox previews (including after restarts).
 
-Wave 4, review and hardening, is in progress. The review findings still to fix, and where to pick up, are in [`docs/m2.md`](docs/m2.md#handoff-where-wave-4-stands).
+See [`docs/m2.md`](docs/m2.md) and [`docs/roadmap.md`](docs/roadmap.md) for Milestone 3 next steps.
 
 ## Prerequisites
 

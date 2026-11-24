@@ -353,6 +353,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (call, responder) = incoming.into_parts();
+        if responder.is_cancelled() {
+            return;
+        }
         let result = match call {
             Call::Ping => to_json(Ok(PingResult::current())),
             Call::SpaceList => to_json(Ok(space_list(&self.spaces))),
@@ -426,6 +429,9 @@ impl Workspace {
     /// Answer the drafts that waited for the repo index.
     pub(crate) fn flush_control_drafts(&mut self, cx: &mut Context<Self>) {
         for pending in std::mem::take(&mut self.pending_control_drafts) {
+            if pending.responder.is_cancelled() {
+                continue;
+            }
             let result = to_json(self.control_draft(&pending.params, cx));
             pending.responder.respond(result);
         }
@@ -434,6 +440,9 @@ impl Workspace {
     /// Answer the `inbox.list` requests that waited for the startup mise check.
     pub(crate) fn flush_inbox_lists(&mut self) {
         for pending in std::mem::take(&mut self.pending_inbox_lists) {
+            if pending.responder.is_cancelled() {
+                continue;
+            }
             let result = to_json(self.control_inbox_list(&pending.params));
             pending.responder.respond(result);
         }
