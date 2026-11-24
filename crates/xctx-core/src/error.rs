@@ -119,6 +119,16 @@ pub enum Error {
         branch: String,
     },
 
+    /// A fork failed with `error`, and removing the attempts it had made so far failed too, so these are left
+    /// behind (branches or worktree folders). Their numbers stay taken; a later fork skips them.
+    #[error("{error}; cleaning up also failed, leaving: {}", .leftovers.join("; "))]
+    ForkCleanupFailed {
+        /// Why the fork failed.
+        error: Box<Error>,
+        /// What could not be removed, each with why.
+        leftovers: Vec<String>,
+    },
+
     /// Adopting the attempt would conflict with the space's branch in these files; nothing was changed.
     #[error("adopting conflicts in {}; resolve it in the space first", .files.join(", "))]
     AdoptConflicts {

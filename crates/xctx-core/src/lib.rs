@@ -16,7 +16,8 @@ pub mod space;
 pub mod store;
 
 pub use attempt::{
-    AdoptReport, AttemptWorktree, MAX_ATTEMPTS, adopt_attempt, discard_attempt, fork_attempts,
+    AdoptReport, AttemptWorktree, MAX_ATTEMPTS, adopt_attempt, attempt_number_taken,
+    discard_attempt, fork_attempts,
 };
 pub use error::{Error, Result};
 pub use index::{IndexedRepo, RepoIndex, RepoMatch};

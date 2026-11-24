@@ -73,8 +73,11 @@ fn ensure_active(space: &Space) -> Result<()> {
 }
 
 /// Fork one attempt of the writer working in `repo` per `(number, port)` in `attempts`. Every attempt starts from
-/// the same snapshot of the writer's worktree, which is left exactly as it was. When any attempt cannot be made,
-/// the ones made so far are removed again and the error is returned.
+/// the same snapshot of the writer's worktree, which is left exactly as it was. Fails with
+/// [`Error::AttemptBranchTaken`], before making anything, when a number's branch or worktree folder already exists
+/// (see [`attempt_number_taken`] for choosing numbers that are free). When any attempt cannot be made, the ones made
+/// so far are removed again and the error is returned; when that removal fails too, the error is
+/// [`Error::ForkCleanupFailed`] and names what was left behind.
 pub fn fork_attempts(
     space: &Space,
     repo: &str,
@@ -124,22 +127,44 @@ pub fn fork_attempts(
             Ok(_) => made.push(attempt),
             Err(e) => {
                 made.push(attempt);
-                for attempt in made.iter().rev() {
-                    let _ = discard_attempt(slug, attempt);
+                let leftovers: Vec<String> = made
+                    .iter()
+                    .rev()
+                    .filter_map(|attempt| {
+                        discard_attempt(slug, attempt).err().map(|why| {
+                            format!("attempt {} ({}): {why}", attempt.number, attempt.branch)
+                        })
+                    })
+                    .collect();
+                if leftovers.is_empty() {
+                    return Err(e);
                 }
-                return Err(e);
+                return Err(Error::ForkCleanupFailed {
+                    error: Box::new(e),
+                    leftovers,
+                });
             }
         }
     }
     Ok(made)
 }
 
+/// Whether attempt `number` of space `slug` cannot be forked in the repository containing `repo`, because its
+/// branch or its worktree folder already exists (left, for example, by a fork whose cleanup failed). Callers
+/// choosing attempt numbers skip the taken ones.
+pub fn attempt_number_taken(repo: &Path, slug: &str, number: u32) -> Result<bool> {
+    let main = git::main_worktree(repo)?;
+    let path = git::worktree_path(&main, &attempt_dir_name(slug, number));
+    Ok(path.exists() || git::branch_exists(&main.path, &attempt_branch(slug, number))?)
+}
+
 /// Remove an attempt: its worktree (even with changes), its mise file, its branch, and the worktree folder's parent
-/// when that is now empty. What is already gone is skipped.
+/// when that is now empty. What is already gone is skipped. The repository's exclude line for the space's mise
+/// file stays, since the space and its other attempts still use it.
 pub fn discard_attempt(slug: &str, attempt: &AttemptWorktree) -> Result<()> {
     if attempt.repo_path.exists() {
         git::remove_worktree(&attempt.repo_path, &attempt.worktree, true)?;
-        mise::remove_space_mise_file(&attempt.worktree, &attempt.repo_path, slug)?;
+        mise::delete_space_mise_file(&attempt.worktree, slug)?;
         if git::branch_exists(&attempt.repo_path, &attempt.branch)? {
             git::delete_branch(&attempt.repo_path, &attempt.branch)?;
         }
@@ -175,46 +200,107 @@ pub struct AdoptReport {
     pub fast_forward: bool,
 }
 
+/// The ref that keeps the space's uncommitted work as it was before attempt `number` of `slug` was adopted.
+pub fn pre_adopt_ref(slug: &str, number: u32) -> String {
+    format!("refs/xctx/pre-adopt/{slug}/{number}")
+}
+
+/// Refuse with [`Error::ChangedSinceFork`] unless the worktree at `dir` holds exactly `fork_tree` on top of `head`.
+/// Returns the snapshot of the worktree.
+fn ensure_unchanged(dir: &Path, repo: &str, fork_tree: &str, head: &str) -> Result<String> {
+    let current = git::snapshot_commit(dir, "xctx: space before adopting")?;
+    if git::tree_of(dir, &current)? != fork_tree || git::head_commit(dir)? != head {
+        return Err(Error::ChangedSinceFork {
+            repo: repo.to_owned(),
+        });
+    }
+    Ok(current)
+}
+
+/// The commit `refs/stash` points at, or `None` when there is no stash.
+fn stash_top(dir: &Path) -> Result<Option<String>> {
+    match git::run_git(dir, ["rev-parse", "-q", "--verify", "refs/stash"]) {
+        Ok(out) => Ok(Some(out.trim().to_owned()).filter(|s| !s.is_empty())),
+        Err(Error::Command { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The `stash@{n}` entry whose commit is `sha`, so a stash is only ever touched by its identity.
+fn stash_entry(dir: &Path, sha: &str) -> Result<Option<String>> {
+    let list = git::run_git(dir, ["stash", "list", "--format=%H"])?;
+    Ok(list
+        .lines()
+        .position(|line| line.trim() == sha)
+        .map(|n| format!("stash@{{{n}}}")))
+}
+
+/// Stash the uncommitted work in `dir` and return the new stash's commit, or `None` when git stashed nothing.
+/// A stash the user already had is never mistaken for it.
+fn stash_push(dir: &Path, message: &str) -> Result<Option<String>> {
+    let before = stash_top(dir)?;
+    let pushed = git::run_git(dir, ["stash", "push", "--include-untracked", "-m", message]);
+    let after = stash_top(dir)?;
+    let made = after.filter(|after| Some(after) != before.as_ref());
+    if let Err(e) = pushed {
+        if let Some(sha) = &made {
+            let _ = restore_stash(dir, sha);
+        }
+        return Err(e);
+    }
+    Ok(made)
+}
+
+/// Put the stash with commit `sha` back into the worktree and remove it from the stash list.
+fn restore_stash(dir: &Path, sha: &str) -> Result<()> {
+    let Some(entry) = stash_entry(dir, sha)? else {
+        return Ok(());
+    };
+    if git::run_git(dir, ["stash", "pop", "-q", "--index", &entry]).is_err() {
+        git::run_git(dir, ["stash", "pop", "-q", &entry])?;
+    }
+    Ok(())
+}
+
 /// Merge an attempt's work, uncommitted changes included, into the space's branch in the space's worktree.
 ///
 /// Refuses, changing nothing, with [`Error::ChangedSinceFork`] when the space's worktree no longer holds what the
-/// attempts were forked from (its work would be lost), and with [`Error::AdoptConflicts`] when the merge would
-/// conflict. The space's uncommitted work, which the attempt already contains, is stashed for the merge and
-/// restored if the merge fails.
+/// attempts were forked from (its work would be lost; this is checked again right before anything changes), and
+/// with [`Error::AdoptConflicts`] when the merge would conflict. The space's uncommitted work, which the attempt
+/// already contains, is stashed for the merge and restored if the merge fails; after a merge it is kept under
+/// [`pre_adopt_ref`] instead of in the stash list. Stashes the user made are never touched.
+///
+/// The merge is a fast-forward whenever it can be, whatever the user's `merge.ff` setting.
 pub fn adopt_attempt(space: &Space, attempt: &AttemptWorktree) -> Result<AdoptReport> {
     ensure_active(space)?;
     let repo = space_repo(space, &attempt.repo)?;
     let dir = &repo.worktree;
     let tip = attempt_tip(attempt)?;
-    let current = git::snapshot_commit(dir, "xctx: space before adopting")?;
-    if git::tree_of(dir, &current)? != git::tree_of(dir, &attempt.fork_commit)? {
-        return Err(Error::ChangedSinceFork {
-            repo: repo.name.clone(),
-        });
-    }
+    let fork_tree = git::tree_of(dir, &attempt.fork_commit)?;
     let head = git::head_commit(dir)?;
+    ensure_unchanged(dir, &repo.name, &fork_tree, &head)?;
     let conflicts = git::merge_conflicts(dir, &head, &tip)?;
     if !conflicts.is_empty() {
         return Err(Error::AdoptConflicts { files: conflicts });
     }
-    let dirty = current != head;
-    if dirty {
-        git::run_git(
+    // Checked again just before stashing, so work written meanwhile is refused instead of stashed and lost.
+    let current = ensure_unchanged(dir, &repo.name, &fork_tree, &head)?;
+    let stash = if current != head {
+        stash_push(
             dir,
-            [
-                "stash",
-                "push",
-                "--include-untracked",
-                "-m",
-                &format!("xctx: before adopting attempt {}", attempt.number),
-            ],
-        )?;
-    }
-    let fast_forward = git::run_git(dir, ["merge-base", "--is-ancestor", &head, &tip]).is_ok();
+            &format!("xctx: before adopting attempt {}", attempt.number),
+        )?
+    } else {
+        None
+    };
     let merged = git::run_git(
         dir,
         [
+            "-c",
+            "merge.ff=true",
             "merge",
+            "--ff",
+            "--no-autostash",
             "--no-edit",
             "-m",
             &format!("xctx: adopt attempt {} of {}", attempt.number, space.id),
@@ -223,18 +309,31 @@ pub fn adopt_attempt(space: &Space, attempt: &AttemptWorktree) -> Result<AdoptRe
     );
     if let Err(e) = merged {
         let _ = git::run_git(dir, ["merge", "--abort"]);
-        if dirty {
-            let _ = git::run_git(dir, ["stash", "pop"]);
+        if let Some(sha) = &stash {
+            let _ = restore_stash(dir, sha);
         }
         return Err(e);
     }
-    if dirty {
-        // The attempt contained this work, so the merge has it; the stash is only a safety copy.
-        let _ = git::run_git(dir, ["stash", "drop"]);
+    if let Some(sha) = &stash {
+        // The attempt contained this work, so the merge has it. The stash is a safety copy: keep it as a ref, in
+        // case anything was written between the last check and the stash, and take it off the stash list.
+        // When the ref cannot be written, the stash stays on the list.
+        let kept = git::run_git(
+            dir,
+            [
+                "update-ref",
+                &pre_adopt_ref(space.id.as_str(), attempt.number),
+                sha,
+            ],
+        );
+        if let (Ok(_), Ok(Some(entry))) = (kept, stash_entry(dir, sha)) {
+            let _ = git::run_git(dir, ["stash", "drop", "-q", &entry]);
+        }
     }
+    let commit = git::head_commit(dir)?;
     Ok(AdoptReport {
-        commit: git::head_commit(dir)?,
-        fast_forward,
+        fast_forward: commit == tip,
+        commit,
     })
 }
 

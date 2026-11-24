@@ -111,18 +111,26 @@ pub fn set_space_var(worktree: &Path, slug: &str, name: &str, value: &str) -> Re
     Ok(path)
 }
 
-/// Delete the space's mise file from `worktree` (if it is there) and drop its line from the repository's exclude
-/// file. `repo` is any checkout of the repository; it is used for the exclude file when `worktree` is gone.
-pub fn remove_space_mise_file(worktree: &Path, repo: &Path, slug: &str) -> Result<()> {
-    let name = mise_file_name(slug);
-    let path = worktree.join(&name);
+/// Delete the space's mise file from `worktree`, if it is there, and nothing else. The exclude line stays: it is
+/// shared by every worktree of the repository (the space's own and its attempts'), so this is what removing one
+/// attempt uses.
+pub fn delete_space_mise_file(worktree: &Path, slug: &str) -> Result<()> {
+    let path = worktree.join(mise_file_name(slug));
     match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_error(path)(e)),
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_error(path)(e)),
     }
+}
+
+/// Delete the space's mise file from `worktree` (if it is there) and drop its line from the repository's exclude
+/// file. `repo` is any checkout of the repository; it is used for the exclude file when `worktree` is gone. Only
+/// for when the space itself leaves the repository: the exclude line also hides the file in the space's attempts,
+/// so removing one attempt uses [`delete_space_mise_file`].
+pub fn remove_space_mise_file(worktree: &Path, repo: &Path, slug: &str) -> Result<()> {
+    delete_space_mise_file(worktree, slug)?;
     let git_dir = if worktree.is_dir() { worktree } else { repo };
-    remove_git_exclude(git_dir, &name)
+    remove_git_exclude(git_dir, &mise_file_name(slug))
 }
 
 /// The repository's `info/exclude` file, shared by every worktree of the repository containing `dir`.

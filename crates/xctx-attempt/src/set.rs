@@ -204,13 +204,33 @@ impl AttemptSet {
 
     /// Reserve numbers for `instructions.len()` attempts of the writer `agent` in `repo`. Nothing changes until
     /// [`AttemptSet::record_fork`]. Fails when the count is 0 or above [`MAX_ATTEMPTS`], or when the space would
-    /// have more than [`MAX_ATTEMPTS`] live attempts.
+    /// have more than [`MAX_ATTEMPTS`] live attempts. Same as [`AttemptSet::plan_fork_avoiding`] with no number
+    /// taken.
     pub fn plan_fork(
         &self,
         agent: &str,
         repo: &str,
         instructions: Vec<Option<String>>,
     ) -> Result<ForkPlan> {
+        self.plan_fork_avoiding(agent, repo, instructions, |_| {
+            Ok::<bool, AttemptError>(false)
+        })
+    }
+
+    /// [`AttemptSet::plan_fork`], skipping every number for which `taken` says true. A fork whose cleanup failed
+    /// can leave an attempt's branch or folder behind without a record of it; the caller answers `taken` with
+    /// [`xctx_core::attempt_number_taken`] so the next fork does not collide with it. Numbers above the planned
+    /// ones are used up by [`AttemptSet::record_fork`]; `taken`'s errors are returned.
+    pub fn plan_fork_avoiding<E>(
+        &self,
+        agent: &str,
+        repo: &str,
+        instructions: Vec<Option<String>>,
+        mut taken: impl FnMut(u32) -> std::result::Result<bool, E>,
+    ) -> Result<ForkPlan>
+    where
+        AttemptError: From<E>,
+    {
         let count = u32::try_from(instructions.len()).unwrap_or(u32::MAX);
         if count == 0 || count > MAX_ATTEMPTS {
             return Err(AttemptError::BadCount {
@@ -225,9 +245,19 @@ impl AttemptSet {
                 max: MAX_ATTEMPTS,
             });
         }
+        let mut numbers = Vec::with_capacity(instructions.len());
+        let mut next = self.next_number;
+        while numbers.len() < instructions.len() {
+            if self.get(next).is_none() && !taken(next)? {
+                numbers.push(next);
+            }
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| AttemptError::PlanMismatch("no attempt numbers are left".into()))?;
+        }
         Ok(ForkPlan {
             round: self.next_round,
-            numbers: (self.next_number..self.next_number + count).collect(),
+            numbers,
             agent: agent.to_owned(),
             repo: repo.to_owned(),
             instructions: instructions
@@ -238,7 +268,8 @@ impl AttemptSet {
     }
 
     /// Record the worktrees made for `plan` as running attempts, forked from session `source_session`. Each gets
-    /// the session id `xctx-<slug>-<agent>-attempt-<n>`. Returns the new attempts.
+    /// the session id `xctx-<slug>-<agent>-attempt-<n>`. Every number up to the plan's last is used up, skipped
+    /// ones included. Returns the new attempts.
     pub fn record_fork(
         &mut self,
         plan: &ForkPlan,
@@ -246,7 +277,9 @@ impl AttemptSet {
         source_session: &str,
         now: u64,
     ) -> Result<Vec<Attempt>> {
-        if plan.round != self.next_round || plan.numbers.first() != Some(&self.next_number) {
+        let fresh = plan.numbers.windows(2).all(|w| w[0] < w[1])
+            && plan.numbers.first().is_some_and(|&n| n >= self.next_number);
+        if plan.round != self.next_round || !fresh {
             return Err(AttemptError::PlanMismatch(
                 "the set changed since the plan was made".into(),
             ));
@@ -275,7 +308,9 @@ impl AttemptSet {
                 updated_at: now,
             })
             .collect();
-        self.next_number += u32::try_from(made.len()).unwrap_or(0);
+        if let Some(&last) = plan.numbers.last() {
+            self.next_number = last.saturating_add(1);
+        }
         self.next_round += 1;
         self.attempts.extend(made.iter().cloned());
         Ok(made)
@@ -413,6 +448,27 @@ mod tests {
                 .map(Attempt::number),
             Some(3)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn numbers_left_behind_by_a_failed_fork_are_skipped_and_used_up() -> Result<()> {
+        let mut set = AttemptSet::new(SpaceId::new("s"));
+        // A fork of 1 and 2 failed, and its cleanup left attempt 2's branch behind.
+        let failed = set.plan_fork("w", "api", vec![None; 2])?;
+        assert_eq!(failed.numbers, [1, 2]);
+        let leftover = |n: u32| Ok::<bool, AttemptError>(n == 2);
+        let plan = set.plan_fork_avoiding("w", "api", vec![None; 2], leftover)?;
+        assert_eq!(plan.numbers, [1, 3], "the leftover number is skipped");
+        let trees = plan.numbers.iter().map(|&n| worktree(n)).collect();
+        set.record_fork(&plan, trees, "src", 1)?;
+        assert_eq!(set.next_number, 4);
+        let next = set.plan_fork_avoiding("w", "api", vec![None], leftover)?;
+        assert_eq!(next.numbers, [4]);
+        let refused = set.plan_fork_avoiding("w", "api", vec![None], |_| {
+            Err(AttemptError::PlanMismatch("git failed".into()))
+        });
+        assert!(matches!(refused, Err(AttemptError::PlanMismatch(_))));
         Ok(())
     }
 

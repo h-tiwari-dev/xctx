@@ -59,6 +59,17 @@ pub enum AttemptError {
     #[error(transparent)]
     Store(#[from] xctx_core::Error),
 
+    /// `attempts.json` in one space's folder says it belongs to another space.
+    #[error("{path} holds the attempts of space {found}, not {expected}")]
+    WrongSpace {
+        /// The file.
+        path: PathBuf,
+        /// The space it names.
+        found: String,
+        /// The space whose folder it is in.
+        expected: String,
+    },
+
     /// `attempts.json` was written by a newer xctx.
     #[error("{path} is version {found}; this xctx reads up to version {supported}")]
     UnsupportedVersion {

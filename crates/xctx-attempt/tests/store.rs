@@ -90,3 +90,28 @@ fn damaged_or_newer_files_are_errors_and_left_alone() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn a_file_of_another_space_is_refused_and_low_counters_are_raised() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let set = set_with_two()?;
+    save(dir.path(), &set)?;
+    let path = attempts_path(dir.path(), "rate-limit")?;
+    let other = attempts_path(dir.path(), "other")?;
+    fs::create_dir_all(other.parent().ok_or("parent")?)?;
+    fs::copy(&path, &other)?;
+    assert!(matches!(
+        load(dir.path(), &SpaceId::new("other")),
+        Err(AttemptError::WrongSpace { .. })
+    ));
+
+    let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    doc["next_number"] = 1.into();
+    doc["next_round"] = 1.into();
+    fs::write(&path, serde_json::to_vec(&doc)?)?;
+    let loaded = load(dir.path(), &SpaceId::new("rate-limit"))?;
+    assert_eq!((loaded.next_number, loaded.next_round), (3, 2));
+    let plan = loaded.plan_fork("writer-api", "api", vec![None])?;
+    assert_eq!(plan.numbers, [3], "stored numbers are not reused");
+    Ok(())
+}

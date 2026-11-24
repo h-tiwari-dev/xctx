@@ -41,7 +41,9 @@ pub fn attempts_path(data_dir: &Path, slug: &str) -> Result<PathBuf> {
     Ok(data_dir.join(SPACES_DIR).join(slug).join(ATTEMPTS_FILE))
 }
 
-/// The attempts of `space` in `data_dir`: an empty set when it has never had any.
+/// The attempts of `space` in `data_dir`: an empty set when it has never had any. Fails with
+/// [`AttemptError::WrongSpace`] when the file names another space. A `next_number` or `next_round` that is not
+/// above every stored attempt's (a file edited by hand, say) is raised, so numbers and rounds are never reused.
 pub fn load(data_dir: &Path, space: &SpaceId) -> Result<AttemptSet> {
     let path = attempts_path(data_dir, space.as_str())?;
     let bytes = match fs::read(&path) {
@@ -61,7 +63,21 @@ pub fn load(data_dir: &Path, space: &SpaceId) -> Result<AttemptSet> {
             supported: ATTEMPTS_VERSION,
         });
     }
-    Ok(doc.set)
+    let mut set = doc.set;
+    if set.space != *space {
+        return Err(AttemptError::WrongSpace {
+            path,
+            found: set.space.as_str().to_owned(),
+            expected: space.as_str().to_owned(),
+        });
+    }
+    if let Some(max) = set.attempts.iter().map(|a| a.number()).max() {
+        set.next_number = set.next_number.max(max.saturating_add(1));
+    }
+    if let Some(max) = set.latest_round() {
+        set.next_round = set.next_round.max(max.saturating_add(1));
+    }
+    Ok(set)
 }
 
 /// Save `set` to its space's file in `data_dir`, creating the space's directory if needed.
