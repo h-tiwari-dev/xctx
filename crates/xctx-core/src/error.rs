@@ -100,6 +100,42 @@ pub enum Error {
         last: u16,
     },
 
+    /// The space has no repository with this name.
+    #[error("space {space} has no repo {repo}")]
+    UnknownSpaceRepo {
+        /// The space.
+        space: SpaceId,
+        /// The name asked for.
+        repo: String,
+    },
+
+    /// An attempt's branch or worktree folder already exists, left by work xctx does not know about; the fork stops
+    /// rather than take it over.
+    #[error("{repo} already has {branch} or its worktree folder; refusing to take it over")]
+    AttemptBranchTaken {
+        /// The repository's main checkout.
+        repo: PathBuf,
+        /// The attempt's branch, `attempt/<slug>/<n>`.
+        branch: String,
+    },
+
+    /// Adopting the attempt would conflict with the space's branch in these files; nothing was changed.
+    #[error("adopting conflicts in {}; resolve it in the space first", .files.join(", "))]
+    AdoptConflicts {
+        /// The conflicting paths.
+        files: Vec<String>,
+    },
+
+    /// The space's worktree changed after the attempts were forked from it, so adopting would lose that work;
+    /// nothing was changed.
+    #[error(
+        "{repo} changed after the attempts were forked; commit or discard that work before adopting"
+    )]
+    ChangedSinceFork {
+        /// The repository's name in the space.
+        repo: String,
+    },
+
     /// Neither `XCTX_DATA_DIR` nor `HOME` is set, so there is nowhere to keep the store.
     #[error("neither XCTX_DATA_DIR nor HOME is set")]
     NoDataDir,

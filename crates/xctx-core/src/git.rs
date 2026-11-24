@@ -57,8 +57,26 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_program_env(program, args, dir, &[])
+}
+
+/// [`run_program`] with extra environment variables.
+fn run_program_env<I, S>(
+    program: &OsStr,
+    args: I,
+    dir: &Path,
+    env: &[(&str, &OsStr)],
+) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let args: Vec<S> = args.into_iter().collect();
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
         .args(&args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -100,6 +118,15 @@ where
     S: AsRef<OsStr>,
 {
     run_program(OsStr::new("git"), args, dir)
+}
+
+/// Run `git args` in `dir` with extra environment variables, such as `GIT_INDEX_FILE`.
+pub fn run_git_env<I, S>(dir: &Path, args: I, env: &[(&str, &OsStr)]) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_program_env(OsStr::new("git"), args, dir, env)
 }
 
 /// Run `git args` in `dir` and report whether it exited successfully, for commands whose exit status is the answer.
@@ -469,5 +496,175 @@ mod tests {
             bare: Some(PathBuf::from("/code/r/.bare")),
         };
         assert_eq!(worktree_path(&bare, "a/b"), PathBuf::from("/code/r/a-b"));
+    }
+}
+
+/// A commit holding everything in the worktree at `dir` right now: committed work, uncommitted changes and
+/// untracked files that git does not ignore, on top of `HEAD`. Neither the worktree nor its index changes: the
+/// files are staged into a temporary index. Returns `HEAD` itself when there is nothing uncommitted.
+pub fn snapshot_commit(dir: &Path, message: &str) -> Result<String> {
+    let head = head_commit(dir)?;
+    let index_dir = tempfile::tempdir().map_err(|source| Error::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let index = index_dir.path().join("index");
+    let env = [("GIT_INDEX_FILE", index.as_os_str())];
+    run_git_env(dir, ["read-tree", "HEAD"], &env)?;
+    run_git_env(dir, ["add", "-A", "--", "."], &env)?;
+    let tree = trimmed(run_git_env(dir, ["write-tree"], &env)?);
+    let head_tree = trimmed(run_git(dir, ["rev-parse", "HEAD^{tree}"])?);
+    if tree == head_tree {
+        return Ok(head);
+    }
+    let commit = run_git_env(
+        dir,
+        [
+            "-c",
+            "user.name=xctx",
+            "-c",
+            "user.email=xctx@localhost",
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-m",
+            message,
+        ],
+        &[],
+    )?;
+    Ok(trimmed(commit))
+}
+
+/// The tree a commit points at.
+pub fn tree_of(dir: &Path, commit: &str) -> Result<String> {
+    Ok(trimmed(run_git(
+        dir,
+        ["rev-parse", &format!("{commit}^{{tree}}")],
+    )?))
+}
+
+/// One file changed between two commits, from `git diff --numstat`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileChange {
+    /// The file's path in the repository (the new path of a rename).
+    pub path: String,
+    /// Lines added; `None` for a binary file.
+    pub added: Option<u32>,
+    /// Lines removed; `None` for a binary file.
+    pub removed: Option<u32>,
+}
+
+/// Parse `git diff --numstat -z` output.
+pub fn parse_numstat_z(text: &str) -> Vec<FileChange> {
+    let mut changes = Vec::new();
+    let mut fields = text.split('\0');
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut parts = record.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        // A rename has an empty path here, then the old and new paths as the next two fields.
+        let path = if path.is_empty() {
+            let _old = fields.next();
+            fields.next().unwrap_or_default().to_owned()
+        } else {
+            path.to_owned()
+        };
+        changes.push(FileChange {
+            path,
+            added: added.parse().ok(),
+            removed: removed.parse().ok(),
+        });
+    }
+    changes
+}
+
+/// The files changed from `base` to `head`, with line counts; renames are followed.
+pub fn diff_stat(dir: &Path, base: &str, head: &str) -> Result<Vec<FileChange>> {
+    let out = run_git(dir, ["diff", "--numstat", "-z", "-M", base, head])?;
+    Ok(parse_numstat_z(&out))
+}
+
+/// The unified diff of one file from `base` to `head`.
+pub fn diff_file(dir: &Path, base: &str, head: &str, path: &str) -> Result<String> {
+    run_git(dir, ["diff", "-M", base, head, "--", path])
+}
+
+/// The files that would conflict when merging `theirs` into `ours`, found with `git merge-tree --write-tree`
+/// without touching any worktree. Empty when the merge is clean.
+pub fn merge_conflicts(dir: &Path, ours: &str, theirs: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            ours,
+            theirs,
+        ])
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| Error::Spawn {
+            program: "git".into(),
+            source,
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(Vec::new()),
+        // Exit 1 is a conflicted merge: the tree id, then the conflicted paths.
+        Some(1) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut names: Vec<String> = text
+                .split('\0')
+                .skip(1)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            names.dedup();
+            Ok(names)
+        }
+        _ => Err(Error::Command {
+            program: "git".into(),
+            args: format!("merge-tree --write-tree {ours} {theirs}"),
+            dir: dir.to_path_buf(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod numstat_tests {
+    use super::*;
+
+    #[test]
+    fn numstat_reads_counts_binaries_and_renames() {
+        let text = "3\t1\tsrc/a.rs\x00-\t-\timg.png\x000\t0\t\x00old.rs\x00new.rs\x00";
+        assert_eq!(
+            parse_numstat_z(text),
+            [
+                FileChange {
+                    path: "src/a.rs".into(),
+                    added: Some(3),
+                    removed: Some(1)
+                },
+                FileChange {
+                    path: "img.png".into(),
+                    added: None,
+                    removed: None
+                },
+                FileChange {
+                    path: "new.rs".into(),
+                    added: Some(0),
+                    removed: Some(0)
+                },
+            ]
+        );
     }
 }

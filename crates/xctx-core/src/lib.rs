@@ -1,17 +1,23 @@
 //! The parts of xctx that need no window: git and worktrees, the repo index, the space model and its lifecycle, the
-//! per-space mise file, mise environment checks and secret redaction, and the store on disk.
+//! per-space mise file, mise environment checks and secret redaction, attempts (competing copies of a writer's
+//! work) and the `pi` session ids they fork, and the store on disk.
 
 #![warn(missing_docs)]
 
+pub mod attempt;
 pub mod error;
 pub mod git;
 pub mod index;
 pub mod mise;
 pub mod mise_env;
+pub mod pi_session;
 pub mod redact;
 pub mod space;
 pub mod store;
 
+pub use attempt::{
+    AdoptReport, AttemptWorktree, MAX_ATTEMPTS, adopt_attempt, discard_attempt, fork_attempts,
+};
 pub use error::{Error, Result};
 pub use index::{IndexedRepo, RepoIndex, RepoMatch};
 pub use mise_env::{EnvReport, MiseRunner, RequiredVar};
