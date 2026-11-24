@@ -381,11 +381,19 @@ pub enum Method {
     /// `space.widen_propose`: propose adding repos to a space or switching it to production; posts a space
     /// widening to the Inbox and never widens.
     SpaceWidenPropose,
+    /// `attempt.list`: a space's attempts.
+    AttemptList,
+    /// `attempt.report`: an attempt's agent reports its outcome.
+    AttemptReport,
+    /// `attempt.propose`: propose forking attempts of a writer; posts a gate to the Inbox and never forks.
+    AttemptPropose,
+    /// `attempt.diff`: the files an attempt changed since its fork, or one file's diff.
+    AttemptDiff,
 }
 
 impl Method {
     /// Every method, in the order `xctx-ctl help` lists them.
-    pub const ALL: [Method; 26] = [
+    pub const ALL: [Method; 30] = [
         Method::Ping,
         Method::SpaceList,
         Method::SpaceDraft,
@@ -412,6 +420,10 @@ impl Method {
         Method::LoopAdvance,
         Method::LoopSetAutonomy,
         Method::SpaceWidenPropose,
+        Method::AttemptList,
+        Method::AttemptReport,
+        Method::AttemptPropose,
+        Method::AttemptDiff,
     ];
 
     /// The name on the wire.
@@ -443,6 +455,10 @@ impl Method {
             Method::LoopAdvance => "loop.advance",
             Method::LoopSetAutonomy => "loop.set_autonomy",
             Method::SpaceWidenPropose => "space.widen_propose",
+            Method::AttemptList => "attempt.list",
+            Method::AttemptReport => "attempt.report",
+            Method::AttemptPropose => "attempt.propose",
+            Method::AttemptDiff => "attempt.diff",
         }
     }
 
@@ -478,7 +494,10 @@ impl Method {
             | Method::ChannelPost
             | Method::ContractSet
             | Method::ContractAgree
-            | Method::SpaceWidenPropose => Capability::Propose,
+            | Method::SpaceWidenPropose
+            | Method::AttemptReport
+            | Method::AttemptPropose => Capability::Propose,
+            Method::AttemptList | Method::AttemptDiff => Capability::Read,
         }
     }
 
@@ -518,6 +537,14 @@ impl Method {
             Method::LoopSetAutonomy => "set how far a space's loop runs without asking",
             Method::SpaceWidenPropose => {
                 "propose adding repos or production to a space; posts to the Inbox, never widens"
+            }
+            Method::AttemptList => "a space's competing attempts with their state and outcome",
+            Method::AttemptReport => "report this attempt's outcome: summary, tests, repro",
+            Method::AttemptPropose => {
+                "propose forking attempts of a writer; posts to the Inbox, never forks"
+            }
+            Method::AttemptDiff => {
+                "the files an attempt changed since its fork, or one file's diff"
             }
         }
     }
@@ -559,6 +586,15 @@ impl Method {
             Method::SpaceWidenPropose => {
                 "space=<slug> [repos=<name>,<name>...] [production=true] [rationale=<text>]"
             }
+            Method::AttemptList => "space=<slug> [round=<n>]",
+            Method::AttemptReport => {
+                "space=<slug> attempt=<n> summary=<text> [tests_passed=<n>] [tests_failed=<n>] \
+                 [test_command=<cmd>] [repro=fixed|still_fails|not_checked] [gave_up=true]"
+            }
+            Method::AttemptPropose => {
+                "space=<slug> agent=<writer id> count=<1-4> [instructions:='[\"...\",\"...\"]'] [rationale=<text>]"
+            }
+            Method::AttemptDiff => "space=<slug> attempt=<n> [path=<file>]",
         }
     }
 }
@@ -861,6 +897,88 @@ pub struct LoopSetAutonomyParams {
     pub max_turns: Option<u32>,
 }
 
+/// `attempt.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptListParams {
+    /// The space's slug.
+    pub space: String,
+    /// Only this round (one fork); every round when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+}
+
+/// Whether the problem an attempt works on still reproduces, as `attempt.report` says it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReproStatus {
+    /// Not checked.
+    #[default]
+    NotChecked,
+    /// The repro passes now.
+    Fixed,
+    /// It still fails.
+    StillFails,
+}
+
+/// `attempt.report`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptReportParams {
+    /// The space's slug.
+    pub space: String,
+    /// The attempt's number; `xctx-ctl` takes it from `$XCTX_ATTEMPT_ID`.
+    pub attempt: u32,
+    /// What the attempt did, in the agent's words.
+    pub summary: String,
+    /// Tests that passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<u32>,
+    /// Tests that failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_failed: Option<u32>,
+    /// The test command run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
+    /// Whether the problem still reproduces.
+    #[serde(default)]
+    pub repro: ReproStatus,
+    /// The agent could not finish; the attempt is marked failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gave_up: bool,
+}
+
+/// `attempt.propose`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptProposeParams {
+    /// The space's slug.
+    pub space: String,
+    /// The graph node of the writer to fork.
+    pub agent: String,
+    /// How many attempts, 1 to 4.
+    pub count: u32,
+    /// What each attempt should try differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<Vec<String>>,
+    /// Why, shown with the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
+/// `attempt.diff`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptDiffParams {
+    /// The space's slug.
+    pub space: String,
+    /// The attempt's number.
+    pub attempt: u32,
+    /// One file to show the diff of; the changed-file list when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// `space.widen_propose`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -933,6 +1051,14 @@ pub enum Call {
     LoopSetAutonomy(LoopSetAutonomyParams),
     /// See [`Method::SpaceWidenPropose`].
     SpaceWidenPropose(SpaceWidenProposeParams),
+    /// See [`Method::AttemptList`].
+    AttemptList(AttemptListParams),
+    /// See [`Method::AttemptReport`].
+    AttemptReport(AttemptReportParams),
+    /// See [`Method::AttemptPropose`].
+    AttemptPropose(AttemptProposeParams),
+    /// See [`Method::AttemptDiff`].
+    AttemptDiff(AttemptDiffParams),
 }
 
 fn params<P: DeserializeOwned>(method: Method, params: Option<Value>) -> Result<P, RpcError> {
@@ -1003,6 +1129,10 @@ impl Call {
             Method::LoopAdvance => Call::LoopAdvance(params(m, raw)?),
             Method::LoopSetAutonomy => Call::LoopSetAutonomy(params(m, raw)?),
             Method::SpaceWidenPropose => Call::SpaceWidenPropose(params(m, raw)?),
+            Method::AttemptList => Call::AttemptList(params(m, raw)?),
+            Method::AttemptReport => Call::AttemptReport(params(m, raw)?),
+            Method::AttemptPropose => Call::AttemptPropose(params(m, raw)?),
+            Method::AttemptDiff => Call::AttemptDiff(params(m, raw)?),
         })
     }
 
@@ -1035,6 +1165,10 @@ impl Call {
             Call::LoopAdvance(_) => Method::LoopAdvance,
             Call::LoopSetAutonomy(_) => Method::LoopSetAutonomy,
             Call::SpaceWidenPropose(_) => Method::SpaceWidenPropose,
+            Call::AttemptList(_) => Method::AttemptList,
+            Call::AttemptReport(_) => Method::AttemptReport,
+            Call::AttemptPropose(_) => Method::AttemptPropose,
+            Call::AttemptDiff(_) => Method::AttemptDiff,
         }
     }
 
@@ -1061,6 +1195,10 @@ impl Call {
             Call::LoopAdvance(p) => to_value(p),
             Call::LoopSetAutonomy(p) => to_value(p),
             Call::SpaceWidenPropose(p) => to_value(p),
+            Call::AttemptList(p) => to_value(p),
+            Call::AttemptReport(p) => to_value(p),
+            Call::AttemptPropose(p) => to_value(p),
+            Call::AttemptDiff(p) => to_value(p),
         }
     }
 
@@ -1086,6 +1224,10 @@ impl Call {
             Call::LoopAdvance(p) => Some(&p.space),
             Call::LoopSetAutonomy(p) => Some(&p.space),
             Call::SpaceWidenPropose(p) => Some(&p.space),
+            Call::AttemptList(p) => Some(&p.space),
+            Call::AttemptReport(p) => Some(&p.space),
+            Call::AttemptPropose(p) => Some(&p.space),
+            Call::AttemptDiff(p) => Some(&p.space),
         }
     }
 }
@@ -1237,6 +1379,76 @@ pub struct ChannelPostResult {
     pub id: u64,
 }
 
+/// One attempt in `attempt.list`. Text is already masked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptSummary {
+    /// Its number in the space.
+    pub number: u32,
+    /// Its round (fork).
+    pub round: u32,
+    /// The space repo it is a copy of.
+    pub repo: String,
+    /// The writer it was forked from.
+    pub agent: String,
+    /// `running`, `done`, `failed`, `discarded` or `adopted`.
+    pub state: String,
+    /// What it was told to try.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// Its branch, `attempt/<slug>/<n>`.
+    pub branch: String,
+    /// Its worktree.
+    pub worktree: String,
+    /// Its `PORT`.
+    pub port: u16,
+    /// What its agent last reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Tests that passed, as reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<u32>,
+    /// Tests that failed, as reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_failed: Option<u32>,
+    /// `fixed`, `still_fails` or `not_checked`.
+    pub repro: String,
+}
+
+/// The result of `attempt.list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptListResult {
+    /// The attempts, oldest first.
+    pub attempts: Vec<AttemptSummary>,
+}
+
+/// The result of `attempt.propose`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptProposeResult {
+    /// The gate posted to the Inbox; the attempts are forked only when the user approves it.
+    pub inbox_item: String,
+}
+
+/// One changed file in `attempt.diff`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptFileChange {
+    /// The path in the repository.
+    pub path: String,
+    /// Lines added; `None` for a binary file.
+    pub added: Option<u32>,
+    /// Lines removed; `None` for a binary file.
+    pub removed: Option<u32>,
+}
+
+/// The result of `attempt.diff`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptDiffResult {
+    /// The files changed since the fork, uncommitted work included.
+    pub files: Vec<AttemptFileChange>,
+    /// The unified diff of the file asked for, masked; absent without `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
 /// The result of `space.widen_propose`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceWidenProposeResult {
@@ -1261,8 +1473,47 @@ mod tests {
     }
 
     #[test]
+    fn nothing_on_the_socket_forks_adopts_or_discards_attempts() {
+        for m in Method::ALL {
+            for word in ["fork", "adopt", "discard"] {
+                assert!(!m.name().contains(word), "{m}");
+            }
+        }
+        assert_eq!(Method::AttemptList.capability(), Capability::Read);
+        assert_eq!(Method::AttemptDiff.capability(), Capability::Read);
+        assert_eq!(Method::AttemptReport.capability(), Capability::Propose);
+        assert_eq!(Method::AttemptPropose.capability(), Capability::Propose);
+    }
+
+    #[test]
     fn calls_round_trip_through_their_params() -> Result<(), RpcError> {
         let calls = [
+            Call::AttemptList(AttemptListParams {
+                space: "s".into(),
+                round: Some(2),
+            }),
+            Call::AttemptReport(AttemptReportParams {
+                space: "s".into(),
+                attempt: 3,
+                summary: "token bucket".into(),
+                tests_passed: Some(41),
+                tests_failed: Some(0),
+                test_command: Some("cargo test".into()),
+                repro: ReproStatus::Fixed,
+                gave_up: false,
+            }),
+            Call::AttemptPropose(AttemptProposeParams {
+                space: "s".into(),
+                agent: "writer-api".into(),
+                count: 3,
+                instructions: Some(vec!["a, with a comma".into()]),
+                rationale: None,
+            }),
+            Call::AttemptDiff(AttemptDiffParams {
+                space: "s".into(),
+                attempt: 1,
+                path: Some("src/limit.rs".into()),
+            }),
             Call::Ping,
             Call::SpaceList,
             Call::SpaceDraft(SpaceDraftParams {
@@ -1381,7 +1632,7 @@ mod tests {
         let calls = m3_calls();
         let mut methods: Vec<Method> = calls.iter().map(Call::method).collect();
         methods.dedup();
-        assert_eq!(methods, Method::ALL[12..], "every M3 method is covered");
+        assert_eq!(methods, Method::ALL[12..26], "every M3 method is covered");
         for call in calls {
             let parsed = Call::parse(call.method().name(), Some(call.params()))?;
             assert_eq!(parsed, call);

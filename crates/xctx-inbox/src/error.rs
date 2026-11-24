@@ -53,6 +53,15 @@ pub enum InboxError {
     /// A space widening cannot be approved when it adds no repos and does not switch to production.
     #[error("the widening in {0} changes nothing")]
     EmptyWiden(ItemId),
+
+    /// An attempt proposal asks for no attempts or more than one fork may make.
+    #[error("the attempt proposal in {id} asks for {count} attempts; a fork makes 1 to 4")]
+    BadAttemptCount {
+        /// The item.
+        id: ItemId,
+        /// How many it asked for.
+        count: u32,
+    },
 }
 
 /// The result type of the Inbox's fallible operations.
