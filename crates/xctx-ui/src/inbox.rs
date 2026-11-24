@@ -117,6 +117,8 @@ pub struct InboxEntry {
     pub space: Option<SharedString>,
     /// Mark it as touching production (a widening to `MISE_ENV=production`).
     pub production: bool,
+    /// Whether the app is acting on it now (a widening being approved): its action buttons are disabled.
+    pub busy: bool,
 }
 
 impl InboxEntry {
@@ -133,6 +135,7 @@ impl InboxEntry {
             detail: None,
             space: None,
             production: false,
+            busy: false,
         }
     }
 
@@ -152,6 +155,12 @@ impl InboxEntry {
     /// Mark it as touching production.
     pub fn production(mut self, production: bool) -> Self {
         self.production = production;
+        self
+    }
+
+    /// Mark it as being acted on, which disables its action buttons.
+    pub fn busy(mut self, busy: bool) -> Self {
+        self.busy = busy;
         self
     }
 }
@@ -227,6 +236,7 @@ impl InboxPanel {
             )
             .variant(action.variant())
             .size(ButtonSize::Regular)
+            .disabled(entry.busy)
             .selector(format!("inbox-{}-{}", action.name(), entry.id));
             if let Some(handler) = self.on_action.clone() {
                 let id = entry.id.clone();
@@ -397,8 +407,13 @@ mod tests {
     fn blank_detail_is_no_detail() {
         let entry = InboxEntry::new("inbox-1", InboxKind::Notice, "hi").detail("  \n");
         assert_eq!(entry.detail, None);
-        let entry = entry.detail("more").space("rate-limit").production(true);
+        assert!(!entry.busy);
+        let entry = entry
+            .detail("more")
+            .space("rate-limit")
+            .production(true)
+            .busy(true);
         assert_eq!(entry.detail.as_deref(), Some("more"));
-        assert!(entry.production);
+        assert!(entry.production && entry.busy);
     }
 }

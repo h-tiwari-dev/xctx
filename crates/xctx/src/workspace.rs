@@ -558,7 +558,7 @@ impl Workspace {
                 let space = &tab.space;
                 bar = bar
                     .space(space.id.as_str().to_owned())
-                    .mise_env(space.mise_env().to_owned())
+                    .mise_env(space.effective_mise_env().to_owned())
                     .port(space.port)
                     .branch(space.branch())
                     .shape(layout_shape(space.shape))

@@ -6,6 +6,7 @@
 //! `graph_panel.rs` and `control.rs`.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -16,13 +17,14 @@ use xctx_control::protocol::{
     Ack, ChannelListParams, ChannelPostParams, ChannelPostResult, ContractSetParams,
     GraphAddLaneParams, LaneRole, LoopAutonomy, LoopSetAutonomyParams,
 };
+use xctx_core::store::DATA_DIR_ENV;
 use xctx_core::{Redactor, Space, SpaceId, SpaceRepo};
 use xctx_graph::{
     AgentGraph, AgentNode, AgentNodeId, AgentRole, AutonomyLevel, GraphError, HelperKind,
     LoopDecision, LoopError, LoopRun, LoopStage, LoopStatus, SpaceGraphDocument,
 };
-use xctx_inbox::{Level, Notice};
-use xctx_layout::{PaneKind, RolePane};
+use xctx_inbox::{Filter, Inbox, ItemBody, ItemId, Level, Notice, Source};
+use xctx_layout::{PaneId, PaneKind, RolePane};
 use xctx_ui::{DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_TURNS, loop_stage_label};
 
 use crate::space_layout::repo_names;
@@ -173,10 +175,26 @@ impl SpaceGraphs {
     }
 }
 
-/// Remove the scratch directory of the space `slug` (`/tmp/xctx-scratch/<slug>`) once it is shipped or
-/// discarded. Returns whether there was anything to remove.
+/// The scratch directory of the space `slug`: `<XCTX_DATA_DIR>/scratch/<slug>` when `XCTX_DATA_DIR` is set (a
+/// development or test instance), so it never touches the real instance's artifacts, else
+/// `/tmp/xctx-scratch/<slug>`. A slug that could escape the base is refused.
+pub fn scratch_dir_for(slug: &str) -> Result<ScratchDir, ChannelError> {
+    scratch_dir_in(std::env::var_os(DATA_DIR_ENV), slug)
+}
+
+/// [`scratch_dir_for`] from an explicit value of `XCTX_DATA_DIR`, so it can be decided without reading the
+/// process environment. An empty value counts as unset.
+pub fn scratch_dir_in(data_dir: Option<OsString>, slug: &str) -> Result<ScratchDir, ChannelError> {
+    match data_dir.filter(|d| !d.is_empty()) {
+        Some(data_dir) => ScratchDir::in_base(PathBuf::from(data_dir).join("scratch"), slug),
+        None => ScratchDir::for_space(slug),
+    }
+}
+
+/// Remove the scratch directory of the space `slug` (see [`scratch_dir_for`]) once it is shipped or discarded.
+/// Returns whether there was anything to remove.
 pub fn clean_scratch(slug: &str) -> Result<bool, String> {
-    ScratchDir::for_space(slug)
+    scratch_dir_for(slug)
         .and_then(|scratch| scratch.clean())
         .map_err(|e| format!("could not remove the scratch directory of {slug}: {e}"))
 }
@@ -337,6 +355,35 @@ pub fn set_agent_paused(
         .map_err(|e| graph_error(id, e))
     })?;
     Ok(Ack {})
+}
+
+/// Who the channel says paused or resumed an agent from the graph panel.
+pub const PANEL_STATUS_AUTHOR: &str = "user";
+
+/// The graph panel's Pause or Resume: pause or resume `agent` as [`set_agent_paused`] does, then tell it on the
+/// space's channel with a [`MessageKind::Status`] message addressed to it from [`PANEL_STATUS_AUTHOR`], so an
+/// agent polling the channel knows. Returns the message's id.
+pub fn set_agent_paused_and_tell(
+    state: &mut SpaceGraphState,
+    id: &SpaceId,
+    agent: &str,
+    paused: bool,
+) -> Result<u64, RpcError> {
+    set_agent_paused(state, id, agent, paused)?;
+    let body = if paused {
+        "You were paused from the agent graph. Stop work and wait until you are resumed."
+    } else {
+        "You were resumed from the agent graph. Carry on where you left off."
+    };
+    state
+        .shared_mut()
+        .post_message(
+            PANEL_STATUS_AUTHOR,
+            Some(agent.trim()),
+            MessageKind::Status,
+            body,
+        )
+        .map_err(|e| channel_error(id, e))
 }
 
 /// `graph.add_lane`: add a writer (at most one per repo) or a helper to the graph of `space` and save it.
@@ -553,16 +600,40 @@ pub fn loop_set_autonomy(
     })
 }
 
+/// What the title of every loop approval notice (see [`loop_approval_notice`]) starts with.
+pub const LOOP_APPROVAL_TITLE_PREFIX: &str = "Loop ready for ";
+
 /// The Inbox notice posted when the loop of space `id` waits for the user to approve moving to `stage`.
 pub fn loop_approval_notice(id: &SpaceId, stage: LoopStage) -> Notice {
     Notice {
-        title: format!("Loop ready for {} in {id}", loop_stage_label(stage)),
+        title: format!(
+            "{LOOP_APPROVAL_TITLE_PREFIX}{} in {id}",
+            loop_stage_label(stage)
+        ),
         body: Some(
             "Open the space's agent graph (⌘G) and choose Approve next to run the stage."
                 .to_owned(),
         ),
         level: Level::Warning,
     }
+}
+
+/// The pending loop approval notices xctx posted for space `id` (see [`loop_approval_notice`]), to dismiss once
+/// the user approves the next stage.
+pub fn pending_loop_approvals(inbox: &Inbox, id: &SpaceId) -> Vec<ItemId> {
+    let filter = Filter {
+        space: Some(id.clone()),
+        include_settled: false,
+    };
+    inbox
+        .list(&filter)
+        .into_iter()
+        .filter(|item| item.source == Source::App)
+        .filter(|item| {
+            matches!(&item.body, ItemBody::Notice(n) if n.title.starts_with(LOOP_APPROVAL_TITLE_PREFIX))
+        })
+        .map(|item| item.id.clone())
+        .collect()
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -629,6 +700,21 @@ pub fn pane_agent(graph: &AgentGraph, pane: &RolePane) -> Option<PaneAgent> {
         id: node.id.as_str().to_owned(),
         role: agent_role_name(&node.role),
     })
+}
+
+/// The agent panes of `panes` bound to the writer of their own repo, which resume the worktree's session when the
+/// space is reopened (see [`crate::spawn::restore_agent_starts`]).
+pub fn writer_panes(graph: &AgentGraph, panes: &[RolePane]) -> Vec<PaneId> {
+    panes
+        .iter()
+        .filter(|pane| pane.role.kind == PaneKind::Agent)
+        .filter(|pane| {
+            graph.writers().any(|w| {
+                w.pane_id == Some(pane.id.0) && w.role.repo() == Some(pane.role.repo.as_str())
+            })
+        })
+        .map(|pane| pane.id)
+        .collect()
 }
 
 /// Bring the graph's pane bindings in step with the panes of the space: an agent bound to a pane that is gone
@@ -1053,6 +1139,107 @@ mod tests {
             graph.writers().map(|w| w.pane_id).collect::<Vec<_>>(),
             [Some(5), Some(3)]
         );
+    }
+
+    #[test]
+    fn writer_panes_are_the_agent_panes_bound_to_their_repos_writer() {
+        let mut graph = AgentGraph::for_space(&["api".to_owned(), "web".to_owned()]);
+        let helper = graph
+            .add_lane(
+                AgentRole::Helper {
+                    kind: HelperKind::Tests,
+                },
+                None,
+            )
+            .ok();
+        let panes = [
+            role_pane(1, PaneKind::Agent, "api"),
+            role_pane(2, PaneKind::Agent, "api"),
+            role_pane(3, PaneKind::Agent, "web"),
+        ];
+        if let Some(helper) = &helper {
+            assert!(graph.bind_pane(helper, Some(1)).is_ok());
+        }
+        assert!(sync_pane_bindings(&mut graph, &panes));
+        // The helper has the first api pane, so api's writer is bound to the second.
+        assert_eq!(writer_panes(&graph, &panes), [PaneId(2), PaneId(3)]);
+    }
+
+    #[test]
+    fn scratch_moves_under_the_data_dir_when_it_is_set() -> TestResult {
+        let data = tempfile::tempdir()?;
+        let isolated = scratch_dir_in(Some(data.path().into()), "rate-limit")?;
+        assert_eq!(isolated.root(), data.path().join("scratch/rate-limit"));
+        let real = scratch_dir_in(None, "rate-limit")?;
+        assert_eq!(real.root(), Path::new("/tmp/xctx-scratch/rate-limit"));
+        let empty = scratch_dir_in(Some(OsString::new()), "rate-limit")?;
+        assert_eq!(empty.root(), real.root());
+        assert!(scratch_dir_in(Some(data.path().into()), "../escape").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pausing_from_the_panel_tells_the_agent_on_the_channel() -> TestResult {
+        let data = tempfile::tempdir()?;
+        let space = space();
+        let mut state = SpaceGraphState::open(data.path(), &space)?;
+        set_agent_paused_and_tell(&mut state, &space.id, "writer-api", true)?;
+        set_agent_paused_and_tell(&mut state, &space.id, "writer-api", false)?;
+        let told = state.shared().list_messages(
+            Some("writer-api"),
+            Some(MessageKind::Status),
+            None,
+            None,
+            &Redactor::default(),
+        );
+        assert_eq!(told.len(), 2);
+        assert!(told.iter().all(|m| m.from == PANEL_STATUS_AUTHOR));
+        assert!(told[0].body.contains("paused") && told[1].body.contains("resumed"));
+        // An unknown agent is not paused, and nothing is posted.
+        assert_eq!(
+            code(set_agent_paused_and_tell(
+                &mut state, &space.id, "nobody", true
+            )),
+            Some(ErrorCode::NotFound)
+        );
+        assert_eq!(
+            state
+                .shared()
+                .list_messages(None, None, None, None, &Redactor::default())
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loop_approvals_of_a_space_are_found_to_dismiss() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let mut inbox = Inbox::open(dir.path())?;
+        let id = space().id;
+        let other = SpaceId::new("other");
+        let notice =
+            |space: &SpaceId| ItemBody::Notice(loop_approval_notice(space, LoopStage::Test));
+        let first = inbox.post(notice(&id), Some(id.clone()), Source::App)?;
+        let second = inbox.post(notice(&id), Some(id.clone()), Source::App)?;
+        inbox.post(notice(&other), Some(other.clone()), Source::App)?;
+        // An agent's notice with the same title is not xctx's to dismiss.
+        inbox.post(notice(&id), Some(id.clone()), Source::Agent)?;
+        inbox.post(
+            ItemBody::Notice(Notice {
+                title: "tests are flaky".into(),
+                body: None,
+                level: Level::Info,
+            }),
+            Some(id.clone()),
+            Source::App,
+        )?;
+        let mut found = pending_loop_approvals(&inbox, &id);
+        found.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(found, [first.clone(), second]);
+        inbox.dismiss(&first)?;
+        assert_eq!(pending_loop_approvals(&inbox, &id).len(), 1);
+        Ok(())
     }
 
     #[test]

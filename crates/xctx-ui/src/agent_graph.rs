@@ -86,7 +86,8 @@ struct CardHandlers {
 ///
 /// Test selectors: `graph-pause-<id>`, `graph-resume-<id>`, `graph-talk-<id>`, `graph-remove-<id>` on each
 /// card's buttons and `graph-add-<kind>` ([`helper_kind_name`]) on the add buttons. Talk appears only for an
-/// agent bound to a pane, and Remove only for writers and helpers.
+/// agent bound to a pane, and Remove only for helpers: a writer belongs to one of the space's repos and the panel
+/// cannot add it back.
 #[derive(IntoElement)]
 pub struct AgentGraphView {
     graph: AgentGraph,
@@ -131,7 +132,7 @@ impl AgentGraphView {
         self
     }
 
-    /// Call `handler` with a writer's or helper's id when its Remove button is clicked.
+    /// Call `handler` with a helper's id when its Remove button is clicked.
     pub fn on_remove(
         mut self,
         handler: impl Fn(&AgentNodeId, &mut Window, &mut App) + 'static,
@@ -236,7 +237,7 @@ fn agent_card(
             handlers.on_talk.as_ref(),
         )
     });
-    let remove = (!matches!(node.role, AgentRole::Orchestrator)).then(|| {
+    let remove = matches!(node.role, AgentRole::Helper { .. }).then(|| {
         card_button(
             "remove",
             "Remove",
