@@ -375,8 +375,9 @@ fn attempts_fork_report_diff_and_go_without_a_trace() -> TestResult {
     use xctx_core::Redactor;
 
     use crate::attempts::{
-        SpaceAttempts, allocate_attempt_ports, attempt_diff, attempt_list, diff_target,
-        live_attempts_refusal, record_report,
+        SpaceAttempts, allocate_attempt_ports, attempt_diff, attempt_list, check_report_token,
+        delete_pre_adopt_refs, diff_target, live_attempts_refusal, new_attempt_token,
+        plan_fork_skipping_leftovers, record_report,
     };
 
     let fixture = Fixture::new()?;
@@ -387,21 +388,48 @@ fn attempts_fork_report_diff_and_go_without_a_trace() -> TestResult {
     let worktree = space.repos[0].worktree.clone();
     fs::write(worktree.join("wip.txt"), "uncommitted work\n")?;
 
-    // Plan, allocate ports outside the space's, fork, record.
+    // A failed fork left attempt 1's branch behind: planning skips it.
+    let slug = space.id.as_str();
+    git(
+        &fixture.payments,
+        &["branch", &xctx_core::attempt::attempt_branch(slug, 1)],
+    )?;
     let mut attempts = SpaceAttempts::new(Some(fixture.data_dir()));
-    let plan = attempts.load(&space.id)?.plan_fork(
+    let plan = plan_fork_skipping_leftovers(
+        attempts.load(&space.id)?,
+        slug,
         "writer-payments",
         "payments",
+        &worktree,
         vec![Some("use a token bucket".into()), None],
     )?;
+    assert_eq!(plan.numbers, [2, 3]);
+    git(
+        &fixture.payments,
+        &["branch", "-D", &xctx_core::attempt::attempt_branch(slug, 1)],
+    )?;
+    // Planned again now that it is gone, for the numbers the rest of the test uses.
+    let plan = plan_fork_skipping_leftovers(
+        attempts.load(&space.id)?,
+        slug,
+        "writer-payments",
+        "payments",
+        &worktree,
+        vec![Some("use a token bucket".into()), None],
+    )?;
+    assert_eq!(plan.numbers, [1, 2]);
+
+    // Allocate ports outside the space's, fork, record with a report token each.
     let taken: Vec<u16> = store.port_allocations().into_keys().collect();
     let ports = allocate_attempt_ports(plan.numbers.len(), taken)?;
     assert!(!ports.contains(&space.port));
     let pairs: Vec<(u32, u16)> = plan.numbers.iter().copied().zip(ports).collect();
     let made = xctx_core::fork_attempts(&space, "payments", &pairs)?;
+    let tokens = [new_attempt_token()?, new_attempt_token()?];
     attempts.change(&space.id, |set| {
-        set.record_fork(&plan, made.clone(), "xctx-s-writer-payments", 1)
-            .map(|_| ())
+        set.record_fork(&plan, made.clone(), "xctx-s-writer-payments", 1)?;
+        set.set_token(1, tokens[0].clone())?;
+        set.set_token(2, tokens[1].clone())
     })?;
     assert!(made[0].worktree.join("wip.txt").is_file());
     assert!(live_attempts_refusal(&space.id, attempts.load(&space.id)?, "ship").is_some());
@@ -438,7 +466,16 @@ fn attempts_fork_report_diff_and_go_without_a_trace() -> TestResult {
         test_command: None,
         repro: ReproStatus::Fixed,
         gave_up: false,
+        token: Some(tokens[attempt as usize - 1].clone()),
     };
+    // Attempt 2's token does not report for attempt 1.
+    let first_attempt = attempts
+        .load(&space.id)?
+        .get(1)
+        .cloned()
+        .ok_or("no attempt 1")?;
+    assert!(check_report_token(&space.id, &first_attempt, Some(&tokens[1])).is_err());
+    check_report_token(&space.id, &first_attempt, report(1).token.as_deref())?;
     let first = attempts.change(&space.id, |set| record_report(set, &report(1), 2))?;
     assert!(!first.round_finished);
     let second = attempts.change(&space.id, |set| record_report(set, &report(2), 3))?;
@@ -465,5 +502,13 @@ fn attempts_fork_report_diff_and_go_without_a_trace() -> TestResult {
     );
     let mut reread = SpaceAttempts::new(Some(fixture.data_dir()));
     assert_eq!(reread.live_ports([&space.id]), Vec::<u16>::new());
+
+    // The space's uncommitted work before the adoption is kept as a ref until the space ends.
+    let backup = xctx_core::attempt::pre_adopt_ref(slug, 1);
+    git(&fixture.payments, &["rev-parse", "--verify", &backup])?;
+    assert_eq!(delete_pre_adopt_refs(&fixture.payments, slug)?, 1);
+    assert!(git(&fixture.payments, &["rev-parse", "--verify", &backup]).is_err());
+    assert_eq!(delete_pre_adopt_refs(&fixture.payments, slug)?, 0);
+    assert_eq!(delete_pre_adopt_refs(&fixture.root.join("gone"), slug)?, 0);
     Ok(())
 }

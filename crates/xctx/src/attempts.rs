@@ -5,16 +5,17 @@
 //! `attempt_jobs.rs` and `control.rs`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use xctx_attempt::{Attempt, AttemptError, AttemptSet, Outcome, Repro, TestSummary};
+use xctx_attempt::{Attempt, AttemptError, AttemptSet, ForkPlan, Outcome, Repro, TestSummary};
 use xctx_channel::{ChannelError, ScratchDir};
-use xctx_control::RpcError;
+use xctx_control::cli::ATTEMPT_TOKEN_ENV;
 use xctx_control::protocol::{
     AttemptDiffParams, AttemptDiffResult, AttemptFileChange, AttemptListResult,
     AttemptProposeParams, AttemptReportParams, AttemptSummary, ReproStatus,
 };
+use xctx_control::{ErrorCode, RpcError};
 use xctx_core::space::PORT_RANGE;
 use xctx_core::{AttemptWorktree, MAX_ATTEMPTS, Redactor, SpaceId};
 use xctx_graph::{AgentGraph, AgentNodeId};
@@ -353,6 +354,164 @@ pub fn live_attempts_refusal(id: &SpaceId, set: &AttemptSet, action: &str) -> Op
     ))
 }
 
+/// Where report tokens come from.
+const RANDOM_SOURCE: &str = "/dev/urandom";
+
+/// How many random bytes a report token holds (printed as twice as many hex digits).
+pub const TOKEN_BYTES: usize = 16;
+
+/// A new random report token for an attempt (see [`Attempt::token`]): [`TOKEN_BYTES`] bytes of `/dev/urandom`, in
+/// hex.
+pub fn new_attempt_token() -> Result<String, String> {
+    let file = std::fs::File::open(RANDOM_SOURCE)
+        .map_err(|e| format!("could not open {RANDOM_SOURCE} for an attempt token: {e}"))?;
+    token_from(file)
+        .map_err(|e| format!("could not read {RANDOM_SOURCE} for an attempt token: {e}"))
+}
+
+/// A token from the first [`TOKEN_BYTES`] bytes of `source`, in lowercase hex.
+pub fn token_from(mut source: impl std::io::Read) -> std::io::Result<String> {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    source.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Refuse, with [`ErrorCode::Forbidden`], an `attempt.report` whose `token` is not `attempt`'s: only the attempt's
+/// own panes have it (`XCTX_ATTEMPT_TOKEN`), so no other pane can write its outcome. An attempt without a token
+/// (forked before tokens, not yet given one) cannot report.
+pub fn check_report_token(
+    id: &SpaceId,
+    attempt: &Attempt,
+    token: Option<&str>,
+) -> Result<(), RpcError> {
+    let number = attempt.number();
+    if attempt.token.is_empty() {
+        return Err(RpcError::new(
+            ErrorCode::Forbidden,
+            format!(
+                "attempt {number} of {id} has no report token yet; reopen the space so xctx gives it one, then \
+                 report from its pane"
+            ),
+        ));
+    }
+    let given = token.map(str::trim).unwrap_or_default();
+    // Compared in full, whatever differs first.
+    let same = given.len() == attempt.token.len()
+        && given
+            .bytes()
+            .zip(attempt.token.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if !same {
+        return Err(RpcError::new(
+            ErrorCode::Forbidden,
+            format!(
+                "attempt.report: the token does not belong to attempt {number} of {id}; only its own panes \
+                 (with {ATTEMPT_TOKEN_ENV} set) may report for it"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The `XCTX_AGENT_ID` of attempt `number`'s agent, forked from writer `writer`: `<writer>#attempt-<n>`. It is no
+/// node of the graph, so an attempt never acts as its writer.
+pub fn attempt_agent_id(writer: &str, number: u32) -> String {
+    format!("{writer}{ATTEMPT_AGENT_MARK}{number}")
+}
+
+/// What an attempt agent's id has after its writer's (see [`attempt_agent_id`]).
+pub const ATTEMPT_AGENT_MARK: &str = "#attempt-";
+
+/// Refuse, with [`ErrorCode::Forbidden`], a call by which `agent` would change the space as one of its agents
+/// (`method`: pausing, removing or changing the contract) when `agent` is an attempt's (see
+/// [`attempt_agent_id`]). An attempt reports with `attempt.report`; its writer acts for the space.
+pub fn refuse_attempt_agent(method: &str, agent: &str) -> Result<(), RpcError> {
+    if agent.contains(ATTEMPT_AGENT_MARK) {
+        return Err(RpcError::new(
+            ErrorCode::Forbidden,
+            format!(
+                "{method}: {} is an attempt's agent and cannot act for the space; report with attempt.report",
+                agent.trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Plan a fork of writer `agent` in `repo` (the space's repo whose worktree is `worktree`), skipping attempt
+/// numbers whose branch or folder a failed fork left behind ([`xctx_core::attempt_number_taken`]), so leftovers
+/// never block a later fork. Runs git.
+pub fn plan_fork_skipping_leftovers(
+    set: &AttemptSet,
+    slug: &str,
+    agent: &str,
+    repo: &str,
+    worktree: &Path,
+    instructions: Vec<Option<String>>,
+) -> Result<ForkPlan, AttemptError> {
+    set.plan_fork_avoiding(agent, repo, instructions, |n| {
+        xctx_core::attempt_number_taken(worktree, slug, n)
+    })
+}
+
+/// Delete the refs that keep a space's work from before each adoption (`refs/xctx/pre-adopt/<slug>/*`, see
+/// [`xctx_core::attempt::pre_adopt_ref`]) in the repository of `repo`, once the space is shipped or discarded.
+/// Returns how many were deleted; a repository that is gone has none.
+pub fn delete_pre_adopt_refs(repo: &Path, slug: &str) -> Result<usize, String> {
+    if !repo.exists() {
+        return Ok(0);
+    }
+    let prefix = format!("refs/xctx/pre-adopt/{slug}/");
+    let failed = |e: xctx_core::Error| {
+        format!(
+            "could not remove the pre-adopt backups of {slug} in {}: {e}",
+            repo.display()
+        )
+    };
+    let listed = xctx_core::git::run_git(repo, ["for-each-ref", "--format=%(refname)", &prefix])
+        .map_err(failed)?;
+    let mut deleted = 0;
+    for name in listed
+        .lines()
+        .map(str::trim)
+        .filter(|n| n.starts_with(&prefix))
+    {
+        xctx_core::git::run_git(repo, ["update-ref", "-d", name]).map_err(failed)?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+/// What the user is told when the worktrees a fork of `id` made but could not record were not all removed:
+/// each leftover with why, or `None` when every one was.
+pub fn unrecorded_cleanup_message(id: &SpaceId, failures: &[String]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "could not remove what a failed fork of {id} made: {}; remove it by hand (later forks skip these numbers)",
+        failures.join("; ")
+    ))
+}
+
+/// What the user is told when attempt `number` was merged into `id` but marking it adopted could not be saved
+/// (`error`): nothing was cleaned up, and adopting it again retries.
+pub fn unsaved_adoption_message(id: &SpaceId, number: u32, error: &str) -> String {
+    format!(
+        "merged attempt {number} into {id}, but could not record it as adopted: {error}. Its worktree and agent \
+         are kept; adopt it again to retry saving (it is not merged twice)"
+    )
+}
+
+/// Why nothing but adopting attempt `number` again is allowed while its adoption into `id` is unsaved.
+pub fn unsaved_adoption_refusal(id: &SpaceId, number: u32) -> String {
+    format!(
+        "attempt {number} of {id} was merged, but its adoption is not saved yet; adopt attempt {number} again to \
+         retry saving it first"
+    )
+}
+
 /// The scratch directory of attempt `number` inside the space's scratch directory `space`:
 /// `<space scratch>/attempts/<number>`.
 pub fn attempt_scratch(space: &ScratchDir, number: u32) -> Result<ScratchDir, ChannelError> {
@@ -479,7 +638,73 @@ mod tests {
             test_command: None,
             repro: ReproStatus::NotChecked,
             gave_up: false,
+            token: None,
         }
+    }
+
+    #[test]
+    fn reports_need_the_attempts_own_token() -> TestResult {
+        let id = SpaceId::new("s");
+        let mut set = AttemptSet::new(id.clone());
+        forked(&mut set, vec![None, None])?;
+        let token = token_from(&[7u8; TOKEN_BYTES][..])?;
+        assert_eq!(token, "07".repeat(TOKEN_BYTES));
+        assert!(token_from(&[1u8; 3][..]).is_err());
+        let fresh = new_attempt_token()?;
+        assert_eq!(fresh.len(), TOKEN_BYTES * 2);
+        assert_ne!(fresh, new_attempt_token()?);
+        set.set_token(1, token.clone())?;
+        let first = set.get(1).cloned().ok_or("no attempt 1")?;
+        let second = set.get(2).cloned().ok_or("no attempt 2")?;
+        assert!(check_report_token(&id, &first, Some(&token)).is_ok());
+        let forbidden =
+            |r: Result<(), RpcError>| r.err().and_then(|e| e.kind()) == Some(ErrorCode::Forbidden);
+        assert!(forbidden(check_report_token(&id, &first, None)));
+        assert!(forbidden(check_report_token(&id, &first, Some("07"))));
+        assert!(forbidden(check_report_token(
+            &id,
+            &first,
+            Some(&"08".repeat(TOKEN_BYTES))
+        )));
+        // An attempt without a token takes no report, not even one with an empty token.
+        assert!(forbidden(check_report_token(&id, &second, Some(""))));
+        assert!(forbidden(check_report_token(&id, &second, None)));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_cleanups_and_unsaved_adoptions_are_explained() {
+        let id = SpaceId::new("s");
+        assert_eq!(unrecorded_cleanup_message(&id, &[]), None);
+        let message = unrecorded_cleanup_message(
+            &id,
+            &[
+                "attempt 3 (/w/s--attempt-3): locked".into(),
+                "attempt 4 (/w): gone".into(),
+            ],
+        )
+        .unwrap_or_default();
+        assert!(
+            message.contains("attempt 3 (/w/s--attempt-3): locked; attempt 4"),
+            "{message}"
+        );
+        assert!(message.contains("later forks skip"), "{message}");
+        let unsaved = unsaved_adoption_message(&id, 2, "disk full");
+        assert!(unsaved.contains("disk full") && unsaved.contains("adopt it again"));
+        assert!(unsaved_adoption_refusal(&id, 2).contains("adopt attempt 2 again"));
+    }
+
+    #[test]
+    fn attempt_agents_have_their_own_id_and_cannot_act_for_the_space() {
+        let id = attempt_agent_id("writer-api", 2);
+        assert_eq!(id, "writer-api#attempt-2");
+        assert_eq!(
+            refuse_attempt_agent("contract.set", &id)
+                .err()
+                .and_then(|e| e.kind()),
+            Some(ErrorCode::Forbidden)
+        );
+        assert!(refuse_attempt_agent("contract.set", "writer-api").is_ok());
     }
 
     #[test]

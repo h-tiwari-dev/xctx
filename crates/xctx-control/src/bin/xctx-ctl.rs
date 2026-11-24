@@ -2,7 +2,9 @@
 
 use std::process::ExitCode;
 
-use xctx_control::cli::{self, AGENT_ENV, ATTEMPT_ENV, Command, Defaults, SPACE_ENV};
+use xctx_control::cli::{
+    self, AGENT_ENV, ATTEMPT_ENV, ATTEMPT_TOKEN_ENV, Command, Defaults, SPACE_ENV,
+};
 use xctx_control::{Client, ControlError};
 
 fn main() -> ExitCode {
@@ -10,6 +12,7 @@ fn main() -> ExitCode {
         space: std::env::var(SPACE_ENV).ok(),
         agent: std::env::var(AGENT_ENV).ok(),
         attempt: std::env::var(ATTEMPT_ENV).ok(),
+        attempt_token: std::env::var(ATTEMPT_TOKEN_ENV).ok(),
     };
     let command = match cli::parse_args_with(std::env::args().skip(1), &defaults) {
         Ok(command) => command,

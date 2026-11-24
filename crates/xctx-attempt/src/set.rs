@@ -117,6 +117,11 @@ pub struct Attempt {
     pub created_at: u64,
     /// When it last changed.
     pub updated_at: u64,
+    /// The secret its agent sends with `attempt.report` (exported to its panes only, as `XCTX_ATTEMPT_TOKEN`),
+    /// so no other pane can report for it. Empty in files written before tokens, and until the app gives it one;
+    /// an attempt with no token cannot report.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token: String,
 }
 
 impl Attempt {
@@ -304,6 +309,7 @@ impl AttemptSet {
                 instruction,
                 state: AttemptState::Running,
                 outcome: None,
+                token: String::new(),
                 created_at: now,
                 updated_at: now,
             })
@@ -314,6 +320,12 @@ impl AttemptSet {
         self.next_round += 1;
         self.attempts.extend(made.iter().cloned());
         Ok(made)
+    }
+
+    /// Give attempt `number` the token its agent must send with `attempt.report` (see [`Attempt::token`]).
+    pub fn set_token(&mut self, number: u32, token: String) -> Result<()> {
+        self.get_mut(number)?.token = token;
+        Ok(())
     }
 
     /// Record what attempt `number`'s agent reported: `Failed` when `failed`, else `Done`. A live attempt may

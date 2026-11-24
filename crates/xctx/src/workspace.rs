@@ -109,6 +109,10 @@ pub(crate) struct Workspace {
     /// Spaces whose fork, adopt or discard of attempts is running: one at a time per space, and no Ship or
     /// Discard of the space meanwhile.
     pub(crate) attempt_jobs: HashSet<SpaceId>,
+    /// Per space, the attempt that was merged into it but could not be recorded as adopted, with what the merge
+    /// did: adopting it again only retries the record (and the cleanup after it), and no other attempt of the
+    /// space can be adopted meanwhile.
+    pub(crate) unsaved_adoptions: HashMap<SpaceId, (u32, xctx_core::AdoptReport)>,
     /// Where pi keeps its sessions, for finding an agent's session from before named sessions and whether a forked
     /// session has started; `None` when neither `PI_CODING_AGENT_SESSION_DIR` nor `HOME` is set.
     pub(crate) sessions: Option<SessionStorage>,
@@ -246,6 +250,7 @@ impl Workspace {
             widen_approvals: HashSet::new(),
             attempts: SpaceAttempts::new(data_dir),
             attempt_jobs: HashSet::new(),
+            unsaved_adoptions: HashMap::new(),
             sessions: SessionStorage::from_env(),
             inbox,
             inbox_error,

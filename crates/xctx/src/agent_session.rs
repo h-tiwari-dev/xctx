@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use xctx_attempt::{Attempt, AttemptSet, AttemptState};
 use xctx_core::pi_session::{self, read_header, session_id};
 
 use crate::spawn::AgentStart;
@@ -86,20 +87,93 @@ impl SessionStorage {
         })
     }
 
-    /// The newest session file whose header says it works in `cwd`, among the newest [`MAX_HEADERS_READ`] files
-    /// of its folder: what `pi --continue` would resume there.
+    /// The newest unnamed session file whose header says it works in `cwd`, among the newest
+    /// [`MAX_HEADERS_READ`] files of its folder: the session an agent from before Milestone 4 left there. Sessions
+    /// xctx named (`xctx-*`) are skipped: they belong to other agents of the space (helpers share the writer's
+    /// worktree), never to an agent that has no id yet.
     pub fn newest_session_in(&self, cwd: &Path) -> Option<PathBuf> {
         let cwd = resolved(cwd);
         self.files_for(&cwd)
             .into_iter()
+            .filter(|file| {
+                !file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.split_once('_'))
+                    .is_some_and(|(_, id)| id.starts_with(XCTX_SESSION_PREFIX))
+            })
             .take(MAX_HEADERS_READ)
             .find(|file| {
-                read_header(file)
-                    .ok()
-                    .and_then(|h| h.cwd)
-                    .is_some_and(|c| c == cwd || resolved(&c) == cwd)
+                read_header(file).ok().is_some_and(|h| {
+                    !h.id.starts_with(XCTX_SESSION_PREFIX)
+                        && h.cwd.is_some_and(|c| c == cwd || resolved(&c) == cwd)
+                })
             })
     }
+
+    /// The newest file of session `id`, in any working directory's folder; `None` when pi has not written it.
+    pub fn find(&self, id: &str) -> Option<PathBuf> {
+        pi_session::find_session(&self.root, id)
+    }
+}
+
+/// What every session id xctx chooses starts with (see [`pi_session::session_id`]).
+pub const XCTX_SESSION_PREFIX: &str = "xctx-";
+
+/// What to give `pi --fork` for session `id`: its file when it is known and UTF-8 (exact, as
+/// [`pi_session::fork_args_path`] passes it, where an id could match another session by prefix), else the id.
+pub fn fork_source_arg(id: &str, file: Option<&Path>) -> String {
+    file.and_then(Path::to_str)
+        .map_or_else(|| id.to_owned(), str::to_owned)
+}
+
+/// The adopted attempt of writer `agent` in space `slug` whose adoption gave the writer the session `recorded`
+/// (see [`adopted_session_id`]), if `recorded` is such a session.
+pub fn adopted_winner<'a>(
+    set: &'a AttemptSet,
+    slug: &str,
+    agent: &str,
+    recorded: &str,
+) -> Option<&'a Attempt> {
+    set.attempts.iter().find(|a| {
+        a.state == AttemptState::Adopted
+            && a.agent == agent
+            && adopted_session_id(slug, &a.agent, a.number()) == recorded
+    })
+}
+
+/// Whether `recorded` is a session a writer `agent` of space `slug` gets after an adoption (see
+/// [`adopted_session_id`]), whichever attempt it was.
+pub fn is_adopted_session(slug: &str, agent: &str, recorded: &str) -> bool {
+    let prefix = format!("{}-", session_id(&[slug, agent, "adopted"]));
+    recorded.starts_with(&prefix)
+}
+
+/// The session a fork of writer `agent` copies. `recorded` is the session on its graph node, `winner` the session
+/// of the attempt it adopted when `recorded` is that adoption's id, and `on_disk` says whether pi has written a
+/// session. Refused when the writer has no recorded session (its pane has not started under one: start it first),
+/// or when neither its session nor the winner's is on disk yet.
+pub fn fork_source(
+    agent: &str,
+    recorded: Option<&str>,
+    winner: Option<&str>,
+    on_disk: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let Some(recorded) = recorded else {
+        return Err(format!(
+            "{agent} has no recorded pi session to fork; start the writer's agent pane first"
+        ));
+    };
+    if on_disk(recorded) {
+        return Ok(recorded.to_owned());
+    }
+    if let Some(winner) = winner.filter(|w| on_disk(w)) {
+        return Ok(winner.to_owned());
+    }
+    Err(format!(
+        "{agent}'s pi session {recorded} has not been written yet; start the writer's agent pane and give it a \
+         message first, then fork"
+    ))
 }
 
 /// `path` with symbolic links resolved (pi resolves `/tmp` to `/private/tmp`), or as given when it cannot be.
@@ -322,6 +396,42 @@ mod tests {
     }
 
     #[test]
+    fn forks_need_a_recorded_session_on_disk() {
+        let on_disk = |id: &str| id == "xctx-s-w" || id == "xctx-s-w-attempt-2";
+        let refused = fork_source("w", None, None, on_disk);
+        assert!(refused.is_err_and(|e| e.contains("start the writer's agent pane first")));
+        assert_eq!(
+            fork_source("w", Some("xctx-s-w"), None, on_disk).as_deref(),
+            Ok("xctx-s-w")
+        );
+        // An adopted id not started yet forks from the winner.
+        assert_eq!(
+            fork_source(
+                "w",
+                Some("xctx-s-w-adopted-2"),
+                Some("xctx-s-w-attempt-2"),
+                on_disk
+            )
+            .as_deref(),
+            Ok("xctx-s-w-attempt-2")
+        );
+        let unwritten = fork_source("w", Some("xctx-s-w-new"), None, on_disk);
+        assert!(unwritten.is_err_and(|e| e.contains("has not been written yet")));
+        assert!(fork_source("w", Some("xctx-s-x"), Some("xctx-s-y"), on_disk).is_err());
+        assert_eq!(
+            fork_source_arg("xctx-s-w", Some(Path::new("/p/1_xctx-s-w.jsonl"))),
+            "/p/1_xctx-s-w.jsonl"
+        );
+        assert_eq!(fork_source_arg("xctx-s-w", None), "xctx-s-w");
+        assert!(is_adopted_session(
+            "s",
+            "writer-api",
+            "xctx-s-writer-api-adopted-3"
+        ));
+        assert!(!is_adopted_session("s", "writer-api", "xctx-s-writer-api"));
+    }
+
+    #[test]
     fn forked_sessions_fork_once_then_open() {
         assert_eq!(
             forked_session("a", "src", false),
@@ -361,8 +471,15 @@ mod tests {
         fs::write(&old, header("old", &worktree))?;
         fs::write(&new, header("xctx-s-writer-api", &worktree))?;
         fs::write(&elsewhere, header("other", &root))?;
-        assert_eq!(storage.newest_session_in(&worktree), Some(new));
+        // Named sessions belong to an agent with an id (a helper in the same worktree, say); only the unnamed
+        // one from before Milestone 4 is carried over.
+        assert_eq!(storage.newest_session_in(&worktree), Some(old.clone()));
+        let renamed = folder.join("2026-02-02T00-00-00-000Z_plain.jsonl");
+        fs::write(&renamed, header("xctx-s-helper-1", &worktree))?;
+        assert_eq!(storage.newest_session_in(&worktree), Some(old));
         assert!(storage.has_session(&worktree, "xctx-s-writer-api"));
+        assert_eq!(storage.find("xctx-s-writer-api"), Some(new));
+        assert_eq!(storage.find("xctx-s-nobody"), None);
         assert!(!storage.has_session(&worktree, "xctx-s-writer"));
 
         let flat = SessionStorage {

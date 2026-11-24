@@ -115,3 +115,28 @@ fn a_file_of_another_space_is_refused_and_low_counters_are_raised() -> TestResul
     assert_eq!(plan.numbers, [3], "stored numbers are not reused");
     Ok(())
 }
+
+#[test]
+fn tokens_are_kept_and_old_files_have_none() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let space = SpaceId::new("rate-limit");
+    let mut set = set_with_two()?;
+    assert!(set.attempts.iter().all(|a| a.token.is_empty()));
+    save(dir.path(), &set)?;
+    let path = attempts_path(dir.path(), "rate-limit")?;
+    // A file written before tokens has no token field.
+    assert!(!fs::read_to_string(&path)?.contains("\"token\""));
+    assert!(
+        load(dir.path(), &space)?
+            .attempts
+            .iter()
+            .all(|a| a.token.is_empty())
+    );
+    set.set_token(2, "0123abcd".into())?;
+    assert!(set.set_token(9, "x".into()).is_err());
+    save(dir.path(), &set)?;
+    let reread = load(dir.path(), &space)?;
+    assert_eq!(reread.get(2).map(|a| a.token.as_str()), Some("0123abcd"));
+    assert_eq!(reread.get(1).map(|a| a.token.as_str()), Some(""));
+    Ok(())
+}

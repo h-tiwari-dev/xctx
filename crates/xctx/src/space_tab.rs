@@ -22,7 +22,9 @@ use crate::lifecycle::reshape_space;
 use crate::persist::{restore_layout, save_layout};
 use crate::space_graph::{scratch_dir_for, writer_panes};
 use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
-use crate::spawn::{AgentStart, pane_launch_with, restore_agent_starts, split_agent_start};
+use crate::spawn::{
+    AgentStart, pane_launch_with, restore_agent_starts, runs_pi, split_agent_start,
+};
 use crate::workspace::{View, Workspace, open_space_refusal, wait_message};
 
 /// A layout error of space `id` as a control error: unknown panes are not found, the rest conflicts.
@@ -237,7 +239,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let agent = self.pane_agent_of(id, pane);
-        let session = self.pane_session_of(id, pane, start);
+        let session = match self.pane_session_of(id, pane, start) {
+            Ok(session) => session,
+            Err(message) => {
+                self.error(message.clone(), cx);
+                if let Some(tab) = self.tabs.get_mut(id) {
+                    tab.terminals.insert(pane.id, PaneTerminal::Failed(message));
+                }
+                return;
+            }
+        };
         let Some(tab) = self.tabs.get(id) else {
             return;
         };
@@ -248,13 +259,21 @@ impl Workspace {
         let launch = pane_launch_with(&tab.space, &pane.role, start, &session, &self.search)
             .with_agent(agent.as_ref());
         let program = launch.config.program.clone();
-        let terminal = match TerminalView::spawn(
+        let runs_agent = runs_pi(pane.role.kind, &launch, true);
+        let notice = launch.notice;
+        let spawned = TerminalView::spawn(
             launch.config,
             self.terminal_font.clone(),
             self.terminal_theme,
             window,
             cx,
-        ) {
+        );
+        if runs_agent && spawned.is_ok() {
+            // Only now that pi itself runs it: a shell fallback or a failed start must not take the old session's
+            // place on the agent.
+            self.record_pane_session(id, pane, &session);
+        }
+        let terminal = match spawned {
             Ok(view) => {
                 let space_id = id.clone();
                 let pane_id = pane.id;
@@ -281,7 +300,7 @@ impl Workspace {
         if let Some(tab) = self.tabs.get_mut(id) {
             tab.terminals.insert(pane.id, terminal);
         }
-        if let Some(notice) = launch.notice {
+        if let Some(notice) = notice {
             self.info(notice, cx);
         }
     }
