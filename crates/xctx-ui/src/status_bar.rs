@@ -114,6 +114,8 @@ pub struct StatusBar {
     banner: Option<StatusBanner>,
     hints: Vec<KeyHint>,
     on_dismiss_banner: Option<DismissHandler>,
+    inbox: Option<usize>,
+    on_inbox: Option<DismissHandler>,
 }
 
 impl Default for StatusBar {
@@ -135,6 +137,8 @@ impl StatusBar {
             banner: None,
             hints: default_key_hints(),
             on_dismiss_banner: None,
+            inbox: None,
+            on_inbox: None,
         }
     }
 
@@ -186,6 +190,18 @@ impl StatusBar {
         self
     }
 
+    /// Show how many Inbox items are pending; highlighted when there are any.
+    pub fn inbox(mut self, pending: usize) -> Self {
+        self.inbox = Some(pending);
+        self
+    }
+
+    /// Make the Inbox count a button that calls `handler`, to show the Inbox.
+    pub fn on_inbox(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_inbox = Some(Rc::new(handler));
+        self
+    }
+
     /// Show a dismiss button on the banner that calls `handler`.
     pub fn on_dismiss_banner(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_dismiss_banner = Some(Rc::new(handler));
@@ -230,6 +246,23 @@ impl RenderOnce for StatusBar {
         let zoomed = self
             .zoomed
             .then(|| Badge::new("ZOOMED").tone(Tone::Warning));
+
+        let inbox = self.inbox.map(|pending| {
+            let label = format!("Inbox {pending}");
+            let mut button = Button::new("status-inbox", label)
+                .variant(if pending > 0 {
+                    ButtonVariant::Secondary
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .size(ButtonSize::Compact)
+                .selected(pending > 0)
+                .selector("status-inbox");
+            if let Some(handler) = self.on_inbox.clone() {
+                button = button.on_click(move |_, window, cx| handler(window, cx));
+            }
+            div().flex_none().child(button)
+        });
 
         let banner = self.banner.map(|banner| {
             let (tone, color) = match banner.kind {
@@ -289,6 +322,7 @@ impl RenderOnce for StatusBar {
             .children(branch)
             .children(shape)
             .children(zoomed)
+            .children(inbox)
             .child(
                 div()
                     .flex()
