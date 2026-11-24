@@ -2,18 +2,20 @@
 
 use std::process::ExitCode;
 
-use xctx_control::cli::{self, Command, SPACE_ENV};
+use xctx_control::cli::{self, AGENT_ENV, Command, SPACE_ENV};
 use xctx_control::{Client, ControlError};
 
 fn main() -> ExitCode {
     let space = std::env::var(SPACE_ENV).ok();
-    let command = match cli::parse_args(std::env::args().skip(1), space.as_deref()) {
-        Ok(command) => command,
-        Err(e) => {
-            eprintln!("xctx-ctl: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    let agent = std::env::var(AGENT_ENV).ok();
+    let command =
+        match cli::parse_args(std::env::args().skip(1), space.as_deref(), agent.as_deref()) {
+            Ok(command) => command,
+            Err(e) => {
+                eprintln!("xctx-ctl: {e}");
+                return ExitCode::from(2);
+            }
+        };
     let (socket, compact, call) = match command {
         Command::Help => {
             print!("{}", cli::help());

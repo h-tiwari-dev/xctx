@@ -42,10 +42,14 @@ pub struct ServerConfig {
 }
 
 impl Default for ServerConfig {
-    /// Every capability and a 30 second reply timeout: what the app gives the agents in its panes.
+    /// [`Capability::Read`], [`Capability::Layout`] and [`Capability::Propose`] with a 30 second reply timeout: what
+    /// the app gives the agents in its panes. [`Capability::Steer`] is left out, so a pane agent cannot resume an
+    /// agent the user paused or raise a loop's autonomy past the user's gates.
     fn default() -> Self {
         ServerConfig {
-            capabilities: Capability::ALL.into_iter().collect(),
+            capabilities: [Capability::Read, Capability::Layout, Capability::Propose]
+                .into_iter()
+                .collect(),
             reply_timeout: Duration::from_secs(30),
         }
     }
