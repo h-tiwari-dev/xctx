@@ -1,0 +1,39 @@
+crates/xctx-core/tests/mise_env.rs
+  s_78e04af8c645b8::t_a914d388c412c3 119-122
+  s_78e04af8c645b8::t_ef001f2cd90bf0 141,149-152
+  s_78e04af8c645b8::t_526cbc9e1603ee 9,116-118,123-140,142-148,153-154
+  s_78e04af8c645b8::t_b3640bb7f57261 155
+crates/xctx-inbox/src/error.rs
+  s_78e04af8c645b8::t_68a93f6e6c28f1 52-55
+crates/xctx-core/src/mise.rs
+  s_78e04af8c645b8::t_cb128911e84426 80-84,106-109,220-223
+crates/xctx-inbox/src/store.rs
+  s_78e04af8c645b8::t_a914d388c412c3 382-383
+  s_78e04af8c645b8::t_68a93f6e6c28f1 22-26,97-98,134,137-141,184-185,264-265,277-279,352-354,378-381,387-394,419-450
+  s_78e04af8c645b8::t_526ed8316985fb 451
+crates/xctx-inbox/tests/inbox.rs
+  s_78e04af8c645b8::t_d4231807dcf467 9-10,260-282,288-413
+  s_78e04af8c645b8::t_a914d388c412c3 283-287
+  s_78e04af8c645b8::t_7bb691a90dbd2e 414
+crates/xctx-core/src/mise_env.rs
+  s_78e04af8c645b8::t_b4448471ca2abd 17,104-106,193-194,200,265-272
+  s_78e04af8c645b8::t_b237319bee3a76 273-274
+crates/xctx-inbox/src/lib.rs
+  s_78e04af8c645b8::t_73ffaa20af143a 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "756e7be5f5505fba98579aa9fd385262e355d918",
+  "prompts": {},
+  "sessions": {
+    "s_78e04af8c645b8": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20d6a-1b1d-73b1-b7a2-96ce6af641fb",
+        "model": "claude-opus-5.5"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
