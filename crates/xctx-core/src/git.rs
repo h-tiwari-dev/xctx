@@ -501,7 +501,9 @@ mod tests {
 
 /// A commit holding everything in the worktree at `dir` right now: committed work, uncommitted changes and
 /// untracked files that git does not ignore, on top of `HEAD`. Neither the worktree nor its index changes: the
-/// files are staged into a temporary index. Returns `HEAD` itself when there is nothing uncommitted.
+/// files are staged into a temporary copy of the index, so the index's sparse-checkout, skip-worktree and
+/// assume-unchanged bits still apply (files outside a sparse checkout are kept as committed, not taken as
+/// deleted). Returns `HEAD` itself when there is nothing uncommitted.
 pub fn snapshot_commit(dir: &Path, message: &str) -> Result<String> {
     let head = head_commit(dir)?;
     let index_dir = tempfile::tempdir().map_err(|source| Error::Io {
@@ -510,8 +512,23 @@ pub fn snapshot_commit(dir: &Path, message: &str) -> Result<String> {
     })?;
     let index = index_dir.path().join("index");
     let env = [("GIT_INDEX_FILE", index.as_os_str())];
-    run_git_env(dir, ["read-tree", "HEAD"], &env)?;
-    run_git_env(dir, ["add", "-A", "--", "."], &env)?;
+    let real = PathBuf::from(trimmed(run_git(dir, ["rev-parse", "--git-path", "index"])?));
+    let real = if real.is_absolute() {
+        real
+    } else {
+        dir.join(real)
+    };
+    let seeded = match std::fs::copy(&real, &index) {
+        Ok(_) => run_git_env(dir, ["add", "-A", "--", "."], &env).is_ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(source) => return Err(Error::Io { path: real, source }),
+    };
+    if !seeded {
+        // No index yet (or one git cannot use from a copy): start from HEAD.
+        let _ = std::fs::remove_file(&index);
+        run_git_env(dir, ["read-tree", "HEAD"], &env)?;
+        run_git_env(dir, ["add", "-A", "--", "."], &env)?;
+    }
     let tree = trimmed(run_git_env(dir, ["write-tree"], &env)?);
     let head_tree = trimmed(run_git(dir, ["rev-parse", "HEAD^{tree}"])?);
     if tree == head_tree {
@@ -584,15 +601,53 @@ pub fn parse_numstat_z(text: &str) -> Vec<FileChange> {
     changes
 }
 
+/// Options every diff xctx shows passes, so the user's config (`diff.external`, `color.diff`, `diff.noprefix`)
+/// does not change what is parsed.
+const DIFF_OPTIONS: [&str; 4] = [
+    "--no-ext-diff",
+    "--no-color",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
+
+/// Paths given to git are file names, never patterns.
+const LITERAL_PATHS: (&str, &str) = ("GIT_LITERAL_PATHSPECS", "1");
+
+fn run_diff(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut all = vec!["diff"];
+    all.extend(DIFF_OPTIONS);
+    all.extend(args);
+    run_git_env(dir, all, &[(LITERAL_PATHS.0, OsStr::new(LITERAL_PATHS.1))])
+}
+
 /// The files changed from `base` to `head`, with line counts; renames are followed.
 pub fn diff_stat(dir: &Path, base: &str, head: &str) -> Result<Vec<FileChange>> {
-    let out = run_git(dir, ["diff", "--numstat", "-z", "-M", base, head])?;
+    let out = run_diff(dir, &["--numstat", "-z", "-M", base, head])?;
     Ok(parse_numstat_z(&out))
 }
 
-/// The unified diff of one file from `base` to `head`.
+/// The unified diff of one file from `base` to `head`. `path` is a file name (never a pattern), the new name of a
+/// renamed file as [`diff_stat`] reports it; a rename is shown as one, against its old name.
 pub fn diff_file(dir: &Path, base: &str, head: &str, path: &str) -> Result<String> {
-    run_git(dir, ["diff", "-M", base, head, "--", path])
+    let names = run_diff(dir, &["--name-status", "-z", "-M", base, head])?;
+    let mut fields = names.split('\0');
+    let mut old = None;
+    while let Some(status) = fields.next() {
+        if status.starts_with('R') || status.starts_with('C') {
+            let (Some(from), Some(to)) = (fields.next(), fields.next()) else {
+                break;
+            };
+            if to == path && status.starts_with('R') {
+                old = Some(from.to_owned());
+            }
+        } else if fields.next().is_none() {
+            break;
+        }
+    }
+    match old {
+        Some(old) => run_diff(dir, &["-M", base, head, "--", &old, path]),
+        None => run_diff(dir, &["-M", base, head, "--", path]),
+    }
 }
 
 /// The files that would conflict when merging `theirs` into `ours`, found with `git merge-tree --write-tree`

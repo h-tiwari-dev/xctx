@@ -5,8 +5,8 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{TestResult, git, make_repos, temp_root};
-use xctx_core::attempt::{attempt_changes, attempt_tip};
+use common::{TestResult, git, make_repo, make_repos, temp_root};
+use xctx_core::attempt::{attempt_changes, attempt_number_taken, attempt_tip};
 use xctx_core::git as xgit;
 use xctx_core::{
     DraftRepo, Error, Space, SpaceDraft, Store, adopt_attempt, discard_attempt, fork_attempts,
@@ -233,5 +233,259 @@ fn merge_conflicts_are_found_without_touching_a_worktree() -> TestResult {
     );
     assert_eq!(status(&writer)?, "");
     assert!(xgit::merge_conflicts(&writer, &head, &head)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn discarding_one_attempt_keeps_the_mise_file_ignored_for_the_space_and_the_others() -> TestResult {
+    let root = temp_root()?;
+    let (space, writer) = space(&root.path)?;
+    let attempts = fork_attempts(&space, "payments", &[(1, 4101), (2, 4102)])?;
+    fs::write(attempts[1].worktree.join("src/limit.ts"), "token bucket\n")?;
+    discard_attempt(space.id.as_str(), &attempts[0])?;
+    assert_eq!(
+        status(&writer)?,
+        "",
+        "the space's mise file is still ignored"
+    );
+    assert_eq!(status(&attempts[1].worktree)?, "M src/limit.ts");
+    let changes = attempt_changes(&attempts[1])?;
+    let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["src/limit.ts"]);
+    adopt_attempt(&space, &attempts[1])?;
+    assert_eq!(
+        fs::read_to_string(writer.join("src/limit.ts"))?,
+        "token bucket\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_of_a_sparse_checkout_keeps_the_files_outside_it() -> TestResult {
+    let root = temp_root()?;
+    let repo = root.path.join("sparse");
+    make_repo(&repo, &[("src/a.ts", "a\n"), ("docs/guide.md", "guide\n")])?;
+    git(&repo, &["sparse-checkout", "set", "src"])?;
+    assert!(!repo.join("docs/guide.md").exists());
+    let head = xgit::head_commit(&repo)?;
+    assert_eq!(xgit::snapshot_commit(&repo, "s")?, head, "nothing changed");
+    fs::write(repo.join("src/a.ts"), "changed\n")?;
+    let snapshot = xgit::snapshot_commit(&repo, "s")?;
+    let files = git(&repo, &["ls-tree", "-r", "--name-only", &snapshot])?;
+    assert_eq!(files, "docs/guide.md\nsrc/a.ts");
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_leaves_out_skip_worktree_and_assume_unchanged_contents() -> TestResult {
+    let root = temp_root()?;
+    let repo = root.path.join("flags");
+    make_repo(
+        &repo,
+        &[
+            ("a.ts", "a\n"),
+            ("local.env", "committed\n"),
+            ("same.txt", "committed\n"),
+        ],
+    )?;
+    git(&repo, &["update-index", "--skip-worktree", "local.env"])?;
+    git(&repo, &["update-index", "--assume-unchanged", "same.txt"])?;
+    fs::write(repo.join("local.env"), "my own settings\n")?;
+    fs::write(repo.join("same.txt"), "assumed unchanged\n")?;
+    let head = xgit::head_commit(&repo)?;
+    assert_eq!(xgit::snapshot_commit(&repo, "s")?, head, "nothing to take");
+    fs::write(repo.join("a.ts"), "changed\n")?;
+    let snapshot = xgit::snapshot_commit(&repo, "s")?;
+    for (file, text) in [
+        ("a.ts", "changed"),
+        ("local.env", "committed"),
+        ("same.txt", "committed"),
+    ] {
+        assert_eq!(git(&repo, &["show", &format!("{snapshot}:{file}")])?, text);
+    }
+    Ok(())
+}
+
+/// Give the writer a stash of the user's own, and return `git stash list`.
+fn user_stash(writer: &Path) -> TestResult<String> {
+    fs::write(writer.join("README.md"), "mine, for later\n")?;
+    git(writer, &["stash", "push", "-q", "-m", "the user's own"])?;
+    let list = git(writer, &["stash", "list", "--format=%H %s"])?;
+    assert!(list.contains("the user's own"), "{list}");
+    Ok(list)
+}
+
+#[test]
+fn adopting_into_a_sparse_checkout_keeps_the_files_outside_it() -> TestResult {
+    let root = temp_root()?;
+    let (space, writer) = space(&root.path)?;
+    fs::create_dir_all(writer.join("docs"))?;
+    common::commit_file(&writer, "docs/guide.md", "guide\n", "docs")?;
+    git(&writer, &["sparse-checkout", "set", "src"])?;
+    let attempts = fork_attempts(&space, "payments", &[(1, 4101)])?;
+    assert_eq!(
+        fs::read_to_string(attempts[0].worktree.join("docs/guide.md"))?,
+        "guide\n",
+        "the attempt has the file the writer's checkout leaves out"
+    );
+    fs::write(attempts[0].worktree.join("src/limit.ts"), "attempt\n")?;
+    adopt_attempt(&space, &attempts[0])?;
+    assert_eq!(
+        git(&writer, &["ls-tree", "--name-only", "HEAD", "docs/"])?,
+        "docs/guide.md"
+    );
+    assert_eq!(
+        fs::read_to_string(writer.join("src/limit.ts"))?,
+        "attempt\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_skip_worktree_change_is_neither_adopted_over_nor_a_reason_to_touch_the_user_s_stash()
+-> TestResult {
+    let root = temp_root()?;
+    let (space, writer) = space(&root.path)?;
+    let stashes = user_stash(&writer)?;
+    // A local-only change git is told to leave alone: neither a snapshot nor a stash sees it.
+    git(
+        &writer,
+        &["update-index", "--skip-worktree", "src/charge.ts"],
+    )?;
+    fs::write(writer.join("src/charge.ts"), "local only\n")?;
+    let attempts = fork_attempts(&space, "payments", &[(1, 4101)])?;
+    let forked = fs::read_to_string(attempts[0].worktree.join("src/charge.ts"))?;
+    fs::write(attempts[0].worktree.join("src/limit.ts"), "attempt\n")?;
+    adopt_attempt(&space, &attempts[0])?;
+    assert_eq!(git(&writer, &["stash", "list", "--format=%H %s"])?, stashes);
+    assert_eq!(forked, "", "the attempt starts from the committed file");
+    assert_eq!(git(&writer, &["show", "HEAD:src/charge.ts"])?, "");
+    assert_eq!(
+        fs::read_to_string(writer.join("src/charge.ts"))?,
+        "local only\n"
+    );
+    assert_eq!(
+        fs::read_to_string(writer.join("src/limit.ts"))?,
+        "attempt\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn adopting_leaves_the_user_s_stash_alone_when_it_stashes_and_when_it_refuses() -> TestResult {
+    let root = temp_root()?;
+    let (space, writer) = space(&root.path)?;
+    let stashes = user_stash(&writer)?;
+    fs::write(writer.join("src/limit.ts"), "work in progress\n")?;
+    let attempts = fork_attempts(&space, "payments", &[(1, 4101), (2, 4102)])?;
+    fs::write(attempts[0].worktree.join("src/charge.ts"), "charge\n")?;
+
+    fs::write(writer.join("NEW.md"), "written after the fork\n")?;
+    let refused = adopt_attempt(&space, &attempts[0]);
+    assert!(
+        matches!(refused, Err(Error::ChangedSinceFork { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(git(&writer, &["stash", "list", "--format=%H %s"])?, stashes);
+    fs::remove_file(writer.join("NEW.md"))?;
+
+    adopt_attempt(&space, &attempts[0])?;
+    assert_eq!(git(&writer, &["stash", "list", "--format=%H %s"])?, stashes);
+    assert_eq!(
+        fs::read_to_string(writer.join("src/limit.ts"))?,
+        "work in progress\n"
+    );
+    assert_eq!(status(&writer)?, "");
+    let backup = xctx_core::attempt::pre_adopt_ref(space.id.as_str(), 1);
+    assert!(!git(&writer, &["rev-parse", "--verify", &backup])?.is_empty());
+    Ok(())
+}
+
+fn parents(dir: &Path) -> TestResult<usize> {
+    Ok(git(dir, &["rev-list", "--parents", "-n", "1", "HEAD"])?
+        .split_whitespace()
+        .count()
+        - 1)
+}
+
+#[test]
+fn adopting_fast_forwards_whatever_merge_ff_says() -> TestResult {
+    let root = temp_root()?;
+    let (space, writer) = space(&root.path)?;
+    git(&writer, &["config", "merge.ff", "false"])?;
+    let attempts = fork_attempts(&space, "payments", &[(1, 4101)])?;
+    fs::write(attempts[0].worktree.join("src/limit.ts"), "attempt\n")?;
+    let report = adopt_attempt(&space, &attempts[0])?;
+    assert!(report.fast_forward);
+    assert_eq!(parents(&writer)?, 1, "no merge commit");
+    Ok(())
+}
+
+#[test]
+fn adopting_merges_when_it_cannot_fast_forward_even_with_merge_ff_only() -> TestResult {
+    let root = temp_root()?;
+    let (space, writer) = space(&root.path)?;
+    git(&writer, &["config", "merge.ff", "only"])?;
+    fs::write(writer.join("src/limit.ts"), "writer\n")?;
+    let attempts = fork_attempts(&space, "payments", &[(1, 4101)])?;
+    fs::write(attempts[0].worktree.join("src/charge.ts"), "attempt\n")?;
+    // The writer commits exactly what was forked, so nothing is lost but the branch moved on.
+    git(&writer, &["commit", "-q", "-am", "writer"])?;
+    let report = adopt_attempt(&space, &attempts[0])?;
+    assert!(!report.fast_forward);
+    assert_eq!(parents(&writer)?, 2, "a merge commit");
+    assert_eq!(
+        fs::read_to_string(writer.join("src/charge.ts"))?,
+        "attempt\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn one_file_diffs_read_names_literally_and_follow_renames() -> TestResult {
+    let root = temp_root()?;
+    let repo = root.path.join("names");
+    make_repo(
+        &repo,
+        &[
+            ("a*.txt", "star\n"),
+            ("ab.txt", "plain\n"),
+            ("old.txt", "one\ntwo\nthree\nfour\n"),
+        ],
+    )?;
+    let base = xgit::head_commit(&repo)?;
+    git(&repo, &["config", "diff.external", "false"])?;
+    git(&repo, &["config", "color.diff", "always"])?;
+    fs::write(repo.join("a*.txt"), "star changed\n")?;
+    fs::write(repo.join("ab.txt"), "plain changed\n")?;
+    git(&repo, &["mv", "old.txt", "new.txt"])?;
+    fs::write(repo.join("new.txt"), "one\ntwo\nthree\nfour\nfive\n")?;
+    let head = xgit::snapshot_commit(&repo, "s")?;
+
+    let diff = xgit::diff_file(&repo, &base, &head, "a*.txt")?;
+    assert!(diff.contains("+star changed"), "{diff}");
+    assert!(!diff.contains("plain"), "the name is not a pattern: {diff}");
+    assert!(!diff.contains('\x1b'), "no colour: {diff}");
+    let renamed = xgit::diff_file(&repo, &base, &head, "new.txt")?;
+    assert!(renamed.contains("rename from old.txt"), "{renamed}");
+    assert!(renamed.contains("+five"), "{renamed}");
+    let stat = xgit::diff_stat(&repo, &base, &head)?;
+    let paths: Vec<&str> = stat.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["a*.txt", "ab.txt", "new.txt"]);
+    Ok(())
+}
+
+#[test]
+fn numbers_left_behind_by_another_fork_are_reported_taken() -> TestResult {
+    let root = temp_root()?;
+    let (space, _) = space(&root.path)?;
+    let repo = &space.repos[0].repo;
+    git(repo, &["branch", &format!("attempt/{}/1", space.id)])?;
+    let slug = space.id.as_str();
+    assert!(attempt_number_taken(repo, slug, 1)?);
+    assert!(!attempt_number_taken(repo, slug, 2)?);
+    let made = fork_attempts(&space, "payments", &[(2, 4102)])?;
+    fs::write(made[0].worktree.join("x"), "")?;
+    assert!(attempt_number_taken(repo, slug, 2)?);
     Ok(())
 }

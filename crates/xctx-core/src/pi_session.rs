@@ -54,7 +54,9 @@ pub fn open_args(id: &str) -> Vec<String> {
     vec!["--session-id".to_owned(), id.to_owned()]
 }
 
-/// `pi` arguments that fork session `source` into the current directory as session `new`.
+/// `pi` arguments that fork session `source` into the current directory as session `new`. pi resolves an id that
+/// matches no session exactly as a prefix of another, so when the source's session file is known (see
+/// [`find_session`]), prefer [`fork_args_path`].
 pub fn fork_args(source: &str, new: &str) -> Vec<String> {
     vec![
         "--fork".to_owned(),
@@ -62,6 +64,12 @@ pub fn fork_args(source: &str, new: &str) -> Vec<String> {
         "--session-id".to_owned(),
         new.to_owned(),
     ]
+}
+
+/// `pi` arguments that fork the session in file `source` into the current directory as session `new`: exact, unlike
+/// an id. `None` when the path is not UTF-8; fork by id with [`fork_args`] then.
+pub fn fork_args_path(source: &Path, new: &str) -> Option<Vec<String>> {
+    source.to_str().map(|source| fork_args(source, new))
 }
 
 /// pi's session folder: `$PI_CODING_AGENT_SESSION_DIR` when set and non-empty, else `~/.pi/agent/sessions`.
@@ -139,6 +147,15 @@ mod tests {
         assert_eq!(session_id(&["a/b", "c!"]), "xctx-a-b-c");
         assert_eq!(fork_args("x", "y"), ["--fork", "x", "--session-id", "y"]);
         assert_eq!(open_args("x"), ["--session-id", "x"]);
+        assert_eq!(
+            fork_args_path(Path::new("/s/1_x.jsonl"), "y"),
+            Some(vec![
+                "--fork".to_owned(),
+                "/s/1_x.jsonl".to_owned(),
+                "--session-id".to_owned(),
+                "y".to_owned()
+            ])
+        );
     }
 
     #[test]
