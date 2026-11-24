@@ -4,6 +4,8 @@
 //! The tree only knows pane ids. The app keeps what runs in each pane (a terminal, an agent) keyed by [`PaneId`],
 //! and allocates those ids itself; the tree allocates [`SplitId`]s for its dividers.
 
+#![warn(missing_docs)]
+
 mod error;
 mod geometry;
 mod shape;

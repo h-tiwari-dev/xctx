@@ -148,15 +148,17 @@ impl SpaceDraft {
 /// One repository of a launched space.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceRepo {
-    /// The repository's folder name.
+    /// The repository's folder name, with `-2`, `-3`, ... appended when another repository of the space has the
+    /// same one. Unique within the space, so panes can name their repository by it.
     pub name: String,
-    /// The repository's main checkout.
+    /// The repository's main checkout, or its bare directory for a bare layout.
     pub repo: PathBuf,
     /// This space's worktree of it, where the agent and shell run.
     pub worktree: PathBuf,
     /// The branch checked out in the worktree: `space/<slug>`.
     pub branch: String,
-    /// The branch the main checkout was on at launch; pull requests target it.
+    /// The branch the main checkout was on at launch (the default branch for a bare layout); pull requests target
+    /// it.
     pub base_branch: String,
     /// The commit the space's branch started from; commits after it are the space's work.
     pub base_commit: String,
@@ -243,7 +245,7 @@ pub fn slugify(task: &str) -> String {
 }
 
 /// [`slugify`], with `-2`, `-3`, ... appended until `taken` says the slug is free.
-pub fn unique_slug(task: &str, taken: impl Fn(&str) -> bool) -> String {
+pub fn unique_slug(task: &str, mut taken: impl FnMut(&str) -> bool) -> String {
     let root = slugify(task);
     let mut slug = root.clone();
     let mut n = 2;
@@ -278,11 +280,34 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// `name`, with `-2`, `-3`, ... appended until no name in `taken` is the same.
+fn unique_repo_name(name: &str, taken: &[String]) -> String {
+    let mut unique = name.to_owned();
+    let mut n = 2;
+    while taken.contains(&unique) {
+        unique = format!("{name}-{n}");
+        n += 1;
+    }
+    unique
+}
+
+/// Whether `slug` is in use in any of `targets`: its `space/<slug>` branch or its worktree directory already exists,
+/// e.g. left by a space whose record was lost.
+fn slug_in_use(targets: &[(DraftRepo, git::MainWorktree)], slug: &str) -> Result<bool> {
+    let branch = space_branch(slug);
+    for (_, main) in targets {
+        if git::branch_exists(&main.path, &branch)? || git::worktree_path(main, slug).exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Undo what a failed launch made, newest first. Errors here are dropped: the launch error is what the user sees.
 fn roll_back(slug: &str, made: &[SpaceRepo]) {
     for repo in made.iter().rev() {
-        let _ = mise::remove_space_mise_file(&repo.worktree, &repo.repo, slug);
         let _ = git::remove_worktree(&repo.repo, &repo.worktree, true);
+        let _ = mise::remove_space_mise_file(&repo.worktree, &repo.repo, slug);
         if repo.branch_created {
             let _ = git::delete_branch(&repo.repo, &repo.branch);
         }
@@ -297,10 +322,16 @@ fn launch_repo(
     port: u16,
 ) -> Result<SpaceRepo> {
     let branch = space_branch(slug);
-    let head = git::head_commit(&main.path)?;
-    let base_branch = match git::current_branch(&main.path)? {
-        Some(branch) => branch,
-        None => git::default_branch(&main.path)?,
+    let (base_branch, head) = if main.bare.is_some() {
+        let base_branch = git::default_branch(&main.path)?;
+        let head = git::resolve_commit(&main.path, &base_branch)?;
+        (base_branch, head)
+    } else {
+        let base_branch = match git::current_branch(&main.path)? {
+            Some(branch) => branch,
+            None => git::default_branch(&main.path)?,
+        };
+        (base_branch, git::head_commit(&main.path)?)
     };
     let path = git::worktree_path(main, slug);
     let created = git::create_worktree(&main.path, &path, &branch, &head)?;
@@ -328,22 +359,44 @@ fn launch_repo(
     Ok(repo)
 }
 
-/// Make the draft real: for each repository, a worktree on `space/<slug>` started from the main checkout's HEAD
-/// (or the existing `space/<slug>` branch, checked out as it is), and a git-ignored `mise.<slug>.toml` with the
-/// space's `PORT`. The space is saved to `store` as active. All or nothing: if any step fails, what was made is
-/// removed again and the store is unchanged.
+/// Make the draft real: for each repository, a worktree on a new branch `space/<slug>` started from the main
+/// checkout's HEAD (from the default branch for a bare layout), and a git-ignored `mise.<slug>.toml` with the
+/// space's `PORT`. The slug is one no saved space has and no repository of the draft has a `space/<slug>` branch or
+/// worktree directory for, so a launch never takes over work it does not know about. Repositories that share a
+/// folder name get unique [`SpaceRepo::name`]s. The space is saved to `store` as active. All or nothing: if any step
+/// fails, what was made is removed again and the store is unchanged.
 pub fn launch(store: &mut Store, draft: SpaceDraft) -> Result<Space> {
     if draft.repos.is_empty() {
         return Err(Error::EmptyDraft);
     }
-    let mut targets: Vec<(&DraftRepo, git::MainWorktree)> = Vec::new();
+    let mut targets: Vec<(DraftRepo, git::MainWorktree)> = Vec::new();
     for draft_repo in &draft.repos {
         let main = git::main_worktree(&draft_repo.path)?;
         if targets.iter().all(|(_, m)| m.path != main.path) {
-            targets.push((draft_repo, main));
+            targets.push((draft_repo.clone(), main));
         }
     }
-    let slug = store.unique_slug(&draft.task);
+    let mut names: Vec<String> = Vec::new();
+    for (draft_repo, _) in &mut targets {
+        draft_repo.name = unique_repo_name(&draft_repo.name, &names);
+        names.push(draft_repo.name.clone());
+    }
+    let mut lookup_error = None;
+    let slug = unique_slug(&draft.task, |slug| {
+        if store.spaces().iter().any(|s| s.id.as_str() == slug) {
+            return true;
+        }
+        match slug_in_use(&targets, slug) {
+            Ok(in_use) => in_use,
+            Err(e) => {
+                lookup_error = Some(e);
+                false
+            }
+        }
+    });
+    if let Some(e) = lookup_error {
+        return Err(e);
+    }
     let port = store.allocate_port()?;
     let mut made: Vec<SpaceRepo> = Vec::new();
     for (draft_repo, main) in &targets {
@@ -401,13 +454,16 @@ fn ensure_clean(space: &Space) -> Result<()> {
     }
 }
 
-/// Remove each worktree of the space and its mise file; branches stay.
+/// Remove each worktree of the space, then its mise file, so a worktree git refuses to remove keeps its mise file;
+/// branches stay. A repository whose worktree and repository folders are both gone has nothing left to clean up.
 fn remove_worktrees(space: &Space, force: bool) -> Result<Vec<RemovedWorktree>> {
     let mut removed = Vec::new();
     for repo in &space.repos {
         let existed = repo.worktree.is_dir();
-        mise::remove_space_mise_file(&repo.worktree, &repo.repo, space.id.as_str())?;
-        git::remove_worktree(&repo.repo, &repo.worktree, force)?;
+        if existed || repo.repo.exists() {
+            git::remove_worktree(&repo.repo, &repo.worktree, force)?;
+            mise::remove_space_mise_file(&repo.worktree, &repo.repo, space.id.as_str())?;
+        }
         removed.push(RemovedWorktree {
             name: repo.name.clone(),
             worktree: repo.worktree.clone(),
@@ -416,6 +472,19 @@ fn remove_worktrees(space: &Space, force: bool) -> Result<Vec<RemovedWorktree>> 
         });
     }
     Ok(removed)
+}
+
+/// The commit after which the space's branch has its own work: where it meets its base branch, so upstream commits
+/// merged into the space are not counted, or the launch's base commit when the base branch is gone or unrelated.
+fn ship_base(repo: &SpaceRepo) -> Result<String> {
+    if !git::branch_exists(&repo.repo, &repo.base_branch)? {
+        return Ok(repo.base_commit.clone());
+    }
+    match git::merge_base(&repo.repo, &repo.base_branch, &repo.branch) {
+        Ok(base) => Ok(base),
+        Err(Error::Command { .. }) => Ok(repo.base_commit.clone()),
+        Err(e) => Err(e),
+    }
 }
 
 fn set_status(store: &mut Store, mut space: Space, status: SpaceStatus) -> Result<()> {
@@ -484,7 +553,7 @@ pub struct RepoShipReport {
     pub name: String,
     /// The space's branch.
     pub branch: String,
-    /// Commits on the branch after its base.
+    /// Commits on the branch that its base branch does not have.
     pub commits_ahead: u32,
     /// What happened.
     pub outcome: ShipOutcome,
@@ -538,7 +607,8 @@ pub struct RemovedWorktree {
     pub worktree: PathBuf,
     /// The branch it had checked out, which is kept.
     pub branch: String,
-    /// True when the directory was already gone and only git's record of it was pruned.
+    /// True when the directory was already gone: git's record of it was pruned, or, when the repository is gone
+    /// too, nothing was left to clean up.
     pub already_gone: bool,
 }
 
@@ -572,7 +642,8 @@ pub fn ship(store: &mut Store, id: &SpaceId, options: &ShipOptions) -> Result<Sh
     ensure_clean(&space)?;
     let mut repos = Vec::new();
     for repo in &space.repos {
-        let commits_ahead = git::commits_ahead(&repo.repo, &repo.base_commit, &repo.branch)?;
+        let base = ship_base(repo)?;
+        let commits_ahead = git::commits_ahead(&repo.repo, &base, &repo.branch)?;
         let outcome = if commits_ahead == 0 {
             ShipOutcome::Skipped(ShipSkipReason::NoNewCommits)
         } else if let Some(remote) = git::remote_name(&repo.repo)? {

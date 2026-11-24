@@ -130,8 +130,50 @@ fn a_worktree_that_cannot_be_made_leaves_no_new_branch_behind() -> TestResult {
     let taken = root.path.join("taken");
     fs::create_dir_all(&taken)?;
     fs::write(taken.join("file"), "x")?;
-    assert!(git::create_worktree(&repo, &taken, "space/taken", "HEAD").is_err());
+    let result = git::create_worktree(&repo, &taken, "space/taken", "HEAD");
+    assert!(
+        matches!(&result, Err(Error::Command { args, .. }) if args.starts_with("worktree add")),
+        "git's own error comes back: {result:?}"
+    );
     assert!(!git::branch_exists(&repo, "space/taken")?);
+    Ok(())
+}
+
+#[test]
+fn a_bare_layout_main_worktree_is_the_bare_directory() -> TestResult {
+    let root = temp_root()?;
+    let source = root.path.join("source");
+    make_repo(&source, &[("README.md", "app\n")])?;
+    let bare = root.path.join("app").join(".bare");
+    git(
+        &root.path,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &source.to_string_lossy(),
+            &bare.to_string_lossy(),
+        ],
+    )?;
+    let linked = root.path.join("app").join("aaa");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "space/aaa",
+            &linked.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(
+        git::main_worktree(&linked)?,
+        MainWorktree {
+            path: bare.clone(),
+            bare: Some(bare)
+        }
+    );
     Ok(())
 }
 

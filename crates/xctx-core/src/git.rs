@@ -19,7 +19,8 @@ pub struct Worktree {
 /// Where a repository's main checkout is, which decides where new worktrees go.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MainWorktree {
-    /// The main checkout, or the bare directory for a bare repository with no checkout.
+    /// The main checkout, or the bare directory for a bare layout. Git commands for the repository run here; a
+    /// bare layout never names one of its linked worktrees, which may belong to a space and vanish with it.
     pub path: PathBuf,
     /// The bare git directory, for a bare repository layout.
     pub bare: Option<PathBuf>,
@@ -167,7 +168,8 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
     Ok(parse_worktrees(&run_git(dir, ["worktree", "list", "--porcelain"])?).0)
 }
 
-/// The main checkout of the repository containing `dir`, even when `dir` is one of its linked worktrees.
+/// The main checkout of the repository containing `dir`, even when `dir` is one of its linked worktrees. For a bare
+/// layout it is the bare directory: git lists linked worktrees by path, so the first one may be another space's.
 pub fn main_worktree(dir: &Path) -> Result<MainWorktree> {
     if !dir.is_dir() {
         return Err(Error::NotARepository(dir.to_path_buf()));
@@ -178,11 +180,9 @@ pub fn main_worktree(dir: &Path) -> Result<MainWorktree> {
         Err(e) => return Err(e),
     };
     let (worktrees, bare) = parse_worktrees(&text);
-    let path = worktrees
-        .into_iter()
-        .next()
-        .map(|w| w.path)
-        .or_else(|| bare.clone())
+    let path = bare
+        .clone()
+        .or_else(|| worktrees.into_iter().next().map(|w| w.path))
         .ok_or_else(|| Error::NotARepository(dir.to_path_buf()))?;
     Ok(MainWorktree { path, bare })
 }
@@ -196,6 +196,19 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>> {
 /// The commit HEAD points at in `dir`.
 pub fn head_commit(dir: &Path) -> Result<String> {
     Ok(trimmed(run_git(dir, ["rev-parse", "HEAD"])?))
+}
+
+/// The commit `rev` names, which may be any revision git understands.
+pub fn resolve_commit(dir: &Path, rev: &str) -> Result<String> {
+    Ok(trimmed(run_git(
+        dir,
+        [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )?))
 }
 
 /// Whether `refs/heads/<branch>` exists in the repository containing `dir`.
@@ -295,7 +308,8 @@ pub fn worktree_path(main: &MainWorktree, slug: &str) -> PathBuf {
 }
 
 /// Make a worktree at `path` with `branch` checked out. An existing branch is checked out as it is; otherwise the
-/// branch is created from `start_point` (and deleted again if the worktree cannot be made). Git refuses when the
+/// branch is created from `start_point`. When the worktree cannot be made, a branch git made for it on the way is
+/// deleted again (only while it still points at `start_point`) and git's error is returned. Git refuses when the
 /// branch is already checked out somewhere else or `path` is a non-empty directory.
 pub fn create_worktree(
     repo: &Path,
@@ -316,6 +330,7 @@ pub fn create_worktree(
             ],
         )?;
     } else {
+        let start_commit = resolve_commit(repo, start_point).ok();
         let added = run_git(
             repo,
             [
@@ -328,9 +343,11 @@ pub fn create_worktree(
             ],
         );
         if let Err(e) = added {
-            // git makes the branch before the worktree, and keeps it when the worktree cannot be made.
-            if branch_exists(repo, branch)? {
-                delete_branch(repo, branch)?;
+            // git makes the branch before the worktree, and keeps it when the worktree cannot be made. Cleanup
+            // errors are dropped so the caller sees why the worktree failed.
+            let tip = resolve_commit(repo, &format!("refs/heads/{branch}")).ok();
+            if tip.is_some() && tip == start_commit {
+                let _ = delete_branch(repo, branch);
             }
             return Err(e);
         }

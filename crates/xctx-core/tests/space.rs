@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{TestResult, add_bare_remote, commit_file, git, make_repos, temp_root};
+use common::{TestResult, add_bare_remote, commit_file, git, make_repo, make_repos, temp_root};
 use xctx_core::git as xgit;
 use xctx_core::space::{
     DraftRepo, PullRequestOutcome, ShipOptions, ShipOutcome, ShipSkipReason, SpaceDraft,
@@ -121,14 +121,8 @@ fn a_failed_launch_removes_what_it_made_and_saves_nothing() -> TestResult {
     assert!(store.spaces().is_empty());
     assert!(!xgit::branch_exists(&repos.payments, "space/broken")?);
 
-    // The second repository fails after the first worktree is made: its path is already taken.
-    let blocker = repos
-        .code
-        .join("web")
-        .join("checkout-web-worktrees")
-        .join("blocked");
-    fs::create_dir_all(&blocker)?;
-    fs::write(blocker.join("file"), "x")?;
+    // The second repository fails after the first worktree is made: the folder its worktree goes in is a file.
+    fs::write(repos.code.join("web").join("checkout-web-worktrees"), "x")?;
     let result = launch(
         &mut store,
         draft("blocked", &[&repos.payments, &repos.checkout_web]),
@@ -151,30 +145,128 @@ fn a_failed_launch_removes_what_it_made_and_saves_nothing() -> TestResult {
 }
 
 #[test]
-fn launch_checks_out_an_existing_space_branch_as_it_is() -> TestResult {
+fn launch_never_reuses_an_existing_space_branch() -> TestResult {
     let root = temp_root()?;
     let repos = make_repos(&root.path)?;
-    let base = xgit::head_commit(&repos.payments)?;
     git(&repos.payments, &["checkout", "-q", "-b", "space/retry"])?;
     commit_file(&repos.payments, "retry.ts", "", "earlier work")?;
     git(&repos.payments, &["checkout", "-q", "main"])?;
     commit_file(&repos.payments, "main.ts", "", "main moved on")?;
+    let earlier_tip = xgit::resolve_commit(&repos.payments, "space/retry")?;
+    let head = xgit::head_commit(&repos.payments)?;
 
     let mut store = Store::open(root.path.join("data"))?;
     let space = launch(&mut store, draft("retry", &[&repos.payments]))?;
-    let repo = &space.repos[0];
-    assert!(!repo.branch_created);
     assert_eq!(
-        repo.base_commit, base,
-        "the base is where the branch left main"
+        space.id.as_str(),
+        "retry-2",
+        "a space/<slug> branch the store does not know is taken"
     );
-    assert!(repo.worktree.join("retry.ts").exists());
+    let repo = &space.repos[0];
+    assert!(repo.branch_created);
+    assert_eq!(repo.branch, "space/retry-2");
+    assert_eq!(repo.base_commit, head);
+    assert!(!repo.worktree.join("retry.ts").exists());
 
     discard(&mut store, &space.id, false)?;
-    assert!(
-        xgit::branch_exists(&repos.payments, "space/retry")?,
-        "an existing branch survives"
+    assert_eq!(
+        xgit::resolve_commit(&repos.payments, "space/retry")?,
+        earlier_tip,
+        "the existing branch is untouched"
     );
+
+    // A leftover worktree folder takes its slug too, even with no branch behind it.
+    fs::create_dir_all(repos.code.join("payments-worktrees").join("leftover"))?;
+    let next = launch(&mut store, draft("leftover", &[&repos.payments]))?;
+    assert_eq!(next.id.as_str(), "leftover-2");
+    Ok(())
+}
+
+#[test]
+fn launch_gives_repositories_with_the_same_folder_name_unique_names() -> TestResult {
+    let root = temp_root()?;
+    let work_api = root.path.join("work").join("api");
+    let oss_api = root.path.join("oss").join("api");
+    make_repo(&work_api, &[("README.md", "work api\n")])?;
+    make_repo(&oss_api, &[("README.md", "oss api\n")])?;
+    let mut store = Store::open(root.path.join("data"))?;
+
+    let space = launch(&mut store, draft("api change", &[&work_api, &oss_api]))?;
+    let names: Vec<&str> = space.repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["api", "api-2"]);
+    assert_eq!(space.repos[0].repo, work_api);
+    assert_eq!(space.repos[1].repo, oss_api);
+    assert_ne!(space.repos[0].worktree, space.repos[1].worktree);
+    for repo in &space.repos {
+        assert!(repo.worktree.is_dir());
+        assert_eq!(
+            xgit::current_branch(&repo.worktree)?.as_deref(),
+            Some("space/api-change")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn launch_in_a_bare_layout_branches_from_the_default_branch_not_another_space() -> TestResult {
+    let root = temp_root()?;
+    let source = root.path.join("source");
+    make_repo(&source, &[("README.md", "app\n")])?;
+    let layout = root.path.join("app");
+    fs::create_dir_all(&layout)?;
+    let bare = layout.join(".bare");
+    git(
+        &layout,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &source.to_string_lossy(),
+            &bare.to_string_lossy(),
+        ],
+    )?;
+    let main = layout.join("main");
+    let aaa = layout.join("aaa");
+    git(
+        &bare,
+        &["worktree", "add", "-q", &main.to_string_lossy(), "main"],
+    )?;
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "space/aaa",
+            &aaa.to_string_lossy(),
+        ],
+    )?;
+    commit_file(&aaa, "aaa.ts", "", "another space's work")?;
+    let listed = xgit::list_worktrees(&main)?;
+    assert_eq!(
+        listed[0].path, aaa,
+        "git lists the other space's worktree before main"
+    );
+    let main_head = xgit::head_commit(&main)?;
+
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("bare work", &[&main]))?;
+    let repo = &space.repos[0];
+    assert_eq!(
+        repo.repo, bare,
+        "the bare directory, which outlives any worktree"
+    );
+    assert_eq!(repo.worktree, layout.join("bare-work"));
+    assert_eq!(repo.base_branch, "main");
+    assert_eq!(repo.base_commit, main_head);
+    assert!(!repo.worktree.join("aaa.ts").exists());
+    assert_eq!(xgit::head_commit(&repo.worktree)?, main_head);
+
+    fs::remove_dir_all(&aaa)?;
+    discard(&mut store, &space.id, false)?;
+    assert!(!repo.worktree.exists());
+    assert!(xgit::branch_exists(&bare, "space/bare-work")?);
     Ok(())
 }
 
@@ -432,6 +524,68 @@ fn ship_and_discard_survive_a_worktree_deleted_by_hand() -> TestResult {
     let report = discard(&mut store, &space.id, false)?;
     assert!(report.removed[0].already_gone);
     assert_eq!(xgit::list_worktrees(&repos.payments)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_worktree_git_will_not_remove_keeps_its_mise_file() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("payments locked", &[&repos.payments]))?;
+    let worktree = space.repos[0].worktree.clone();
+    git(
+        &repos.payments,
+        &["worktree", "lock", &worktree.to_string_lossy()],
+    )?;
+
+    let result = discard(&mut store, &space.id, true);
+    assert!(matches!(result, Err(Error::Command { .. })), "{result:?}");
+    assert!(worktree.join(space.mise_file_name()).exists());
+    let exclude = fs::read_to_string(repos.payments.join(".git/info/exclude"))?;
+    assert!(exclude.contains(&space.mise_file_name()), "{exclude}");
+    assert_eq!(
+        store.space(&space.id).map(|s| s.status),
+        Some(SpaceStatus::Active)
+    );
+    Ok(())
+}
+
+#[test]
+fn discard_survives_a_repository_and_worktree_both_deleted_by_hand() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("payments vanished", &[&repos.payments]))?;
+    fs::remove_dir_all(&space.repos[0].worktree)?;
+    fs::remove_dir_all(&repos.payments)?;
+
+    let report = discard(&mut store, &space.id, false)?;
+    assert!(report.removed[0].already_gone);
+    assert_eq!(
+        store.space(&space.id).map(|s| s.status),
+        Some(SpaceStatus::Discarded)
+    );
+    Ok(())
+}
+
+#[test]
+fn ship_does_not_count_upstream_commits_merged_into_the_space() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("payments merge", &[&repos.payments]))?;
+    let worktree = space.repos[0].worktree.clone();
+    commit_file(&worktree, "work.ts", "", "space work")?;
+    commit_file(&repos.payments, "upstream1.ts", "", "upstream one")?;
+    commit_file(&repos.payments, "upstream2.ts", "", "upstream two")?;
+    git(&worktree, &["merge", "-q", "--no-edit", "main"])?;
+
+    let report = ship(&mut store, &space.id, &ShipOptions::default())?;
+    assert_eq!(
+        report.repos[0].commits_ahead, 2,
+        "the space's commit and its merge commit"
+    );
     Ok(())
 }
 
