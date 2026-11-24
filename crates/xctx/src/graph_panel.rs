@@ -316,7 +316,8 @@ impl Workspace {
                 });
             });
 
-        let (pause, resume, talk, remove, add) = (
+        let (pause, resume, talk, remove, add, fork) = (
+            entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
@@ -324,6 +325,11 @@ impl Workspace {
             entity.clone(),
         );
         let graph = AgentGraphView::new(state.graph().clone())
+            .notes(self.attempt_notes(&tab.space.id))
+            .on_fork(move |agent, window, cx| {
+                let agent = agent.clone();
+                let _ = fork.update(cx, |this, cx| this.open_fork_dialog(agent, window, cx));
+            })
             .on_pause(move |agent, _, cx| {
                 let agent = agent.clone();
                 let _ = pause.update(cx, |this, cx| {

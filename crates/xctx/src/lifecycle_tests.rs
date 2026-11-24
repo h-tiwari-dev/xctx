@@ -124,7 +124,7 @@ fn a_space_lives_from_draft_to_discard() -> TestResult {
     assert!(store.spaces().is_empty());
 
     // Launch: worktrees, the space, and its first layout saved.
-    let launched = launch_space(&mut store, draft)?;
+    let launched = launch_space(&mut store, draft, Vec::new())?;
     assert_eq!(launched.warning, None);
     let mut space = launched.space;
     let mut layout = launched.layout;
@@ -243,7 +243,7 @@ fn shipping_without_a_remote_keeps_the_work_on_the_branch() -> TestResult {
     let mut store = fixture.store()?;
     let mut draft = xctx_core::SpaceDraft::new("tidy payments readme");
     draft.add_repo(repo_for_draft(&fixture.payments.to_string_lossy(), None)?);
-    let launched = launch_space(&mut store, draft)?;
+    let launched = launch_space(&mut store, draft, Vec::new())?;
     let space = launched.space;
     let worktree = space.repos[0].worktree.clone();
     fs::write(worktree.join("NOTES.md"), "notes\n")?;
@@ -283,7 +283,7 @@ fn an_approved_widen_request_adds_a_worktree_and_a_writer() -> TestResult {
     let mut draft = index.draft("make payments checkout retry safe");
     draft.repos.retain(|r| r.path == fixture.payments);
     assert_eq!(draft.repos.len(), 1);
-    let space = launch_space(&mut store, draft)?.space;
+    let space = launch_space(&mut store, draft, Vec::new())?.space;
     let mut graph = SpaceGraphState::open(&fixture.data_dir(), &space)?;
     assert_eq!(graph.graph().writers().count(), 1);
 
@@ -383,7 +383,7 @@ fn attempts_fork_report_diff_and_go_without_a_trace() -> TestResult {
     let mut store = fixture.store()?;
     let mut draft = xctx_core::SpaceDraft::new("make payments checkout retry safe");
     draft.add_repo(repo_for_draft(&fixture.payments.to_string_lossy(), None)?);
-    let space = launch_space(&mut store, draft)?.space;
+    let space = launch_space(&mut store, draft, Vec::new())?.space;
     let worktree = space.repos[0].worktree.clone();
     fs::write(worktree.join("wip.txt"), "uncommitted work\n")?;
 

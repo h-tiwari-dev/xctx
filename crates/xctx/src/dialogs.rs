@@ -9,6 +9,7 @@ use gpui::{
 use xctx_core::{ShipOptions, SpaceId, Store, git};
 use xctx_ui::{Button, ButtonVariant, PromptEvent, PromptInput, Theme};
 
+use crate::attempt_ui::{ForkState, ReviewState};
 use crate::keymap::DIALOG_CONTEXT;
 use crate::lifecycle::{
     dirty_repos, discard_message, discard_space, ship_report_lines, ship_space,
@@ -35,6 +36,11 @@ pub(crate) enum Dialog {
     },
     /// What a ship did.
     Shipped { space: SpaceId, lines: Vec<String> },
+    /// Fork a writer into competing attempts (see `attempt_ui.rs`). Its fork job does not keep it open.
+    Fork(ForkState),
+    /// Compare a round of attempts, and adopt or discard them (see `attempt_ui.rs`). Its jobs do not keep it
+    /// open.
+    Review(ReviewState),
 }
 
 impl Dialog {
@@ -43,6 +49,8 @@ impl Dialog {
             Dialog::Ship { space, .. }
             | Dialog::Discard { space, .. }
             | Dialog::Shipped { space, .. } => space,
+            Dialog::Fork(fork) => &fork.space,
+            Dialog::Review(review) => &review.space,
         }
     }
 
@@ -89,7 +97,7 @@ impl Dialog {
                     *dirty = dirty_repos;
                 }
             }
-            Dialog::Shipped { .. } => {}
+            Dialog::Shipped { .. } | Dialog::Fork(_) | Dialog::Review(_) => {}
         }
     }
 }
@@ -456,7 +464,49 @@ impl Workspace {
     pub(crate) fn render_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.dialog.as_ref()?;
         let theme = Theme::of(cx);
-        let body = match dialog {
+        let body: AnyElement = match dialog {
+            Dialog::Fork(fork) => self
+                .render_fork_dialog(fork, cx)
+                .key_context(DIALOG_CONTEXT)
+                .track_focus(&self.dialog_focus)
+                .into_any_element(),
+            Dialog::Review(review) => self
+                .render_review_sheet(review, cx)
+                .key_context(DIALOG_CONTEXT)
+                .track_focus(&self.dialog_focus)
+                .into_any_element(),
+            _ => self
+                .render_confirmation(dialog, &theme, cx)
+                .key_context(DIALOG_CONTEXT)
+                .track_focus(&self.dialog_focus)
+                .into_any_element(),
+        };
+        Some(
+            div()
+                .id("dialog-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(hsla(0.0, 0.0, 0.0, 0.55))
+                .occlude()
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// The panel of a Ship, Discard or Shipped dialog.
+    fn render_confirmation(
+        &self,
+        dialog: &Dialog,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = *theme;
+        match dialog {
             Dialog::Ship {
                 space,
                 title,
@@ -591,25 +641,9 @@ impl Workspace {
                     ),
                 )
             }
-        };
-        Some(
-            div()
-                .id("dialog-backdrop")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(hsla(0.0, 0.0, 0.0, 0.55))
-                .occlude()
-                .child(
-                    body.key_context(DIALOG_CONTEXT)
-                        .track_focus(&self.dialog_focus),
-                )
-                .into_any_element(),
-        )
+            // Drawn by `render_dialog` itself.
+            Dialog::Fork(_) | Dialog::Review(_) => panel(&theme),
+        }
     }
 }
 

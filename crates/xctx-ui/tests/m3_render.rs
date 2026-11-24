@@ -168,6 +168,54 @@ fn agent_graph_tiers_stack_orchestrator_writers_then_helpers(cx: &mut TestAppCon
     assert!(api < tests, "helpers sit under the writers");
 }
 
+struct ForkGraphHost {
+    log: Log,
+}
+
+impl Render for ForkGraphHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let fork = self.log.clone();
+        let notes = [(
+            AgentNodeId::new("writer-api"),
+            "attempts: #1 adopted, #2 discarded".into(),
+        )]
+        .into_iter()
+        .collect();
+        div().size_full().p_4().child(
+            AgentGraphView::new(graph())
+                .notes(notes)
+                .on_fork(move |id, _, _| log(&fork, format!("fork {id}"))),
+        )
+    }
+}
+
+#[gpui::test]
+fn writers_offer_fork_and_show_their_attempt_lineage(cx: &mut TestAppContext) {
+    let events: Log = Rc::default();
+    let host_log = events.clone();
+    let (_host, cx) = cx.add_window_view(move |_, _| ForkGraphHost { log: host_log });
+    cx.run_until_parked();
+    assert!(click(cx, "graph-fork-writer-web"));
+    assert!(click(cx, "graph-fork-writer-api"));
+    assert!(cx.debug_bounds("graph-fork-orchestrator").is_none());
+    assert!(cx.debug_bounds("graph-fork-helper-tests-1").is_none());
+    assert!(cx.debug_bounds("graph-note-writer-api").is_some());
+    assert!(cx.debug_bounds("graph-note-writer-web").is_none());
+    assert_eq!(*events.borrow(), ["fork writer-web", "fork writer-api"]);
+}
+
+#[gpui::test]
+fn without_a_fork_handler_no_fork_button_is_drawn(cx: &mut TestAppContext) {
+    let events: Log = Rc::default();
+    let host_log = events.clone();
+    let (_host, cx) = cx.add_window_view(move |_, _| GraphHost {
+        graph: graph(),
+        log: host_log,
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("graph-fork-writer-api").is_none());
+}
+
 struct EmptyGraphHost;
 
 impl Render for EmptyGraphHost {

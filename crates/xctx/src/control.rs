@@ -744,7 +744,8 @@ impl Workspace {
             {
                 self.error(format!("could not post to the Inbox: {e}"), cx);
             } else {
-                self.info(title, cx);
+                // Offer the review sheet where the user is looking.
+                self.info(format!("{title}: press ⌘⇧R in the space"), cx);
             }
         }
         cx.notify();
