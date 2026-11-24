@@ -105,8 +105,13 @@ pub fn entry_kind(kind: ItemKind) -> InboxKind {
     }
 }
 
-/// The panel entries for the pending items, newest first, with secrets masked.
-pub fn inbox_entries(inbox: &Inbox, redactor: &Redactor) -> Vec<InboxEntry> {
+/// The panel entries for the pending items, newest first, with secrets masked. The widenings in `approving`
+/// (being approved now) are drawn busy, so they cannot be approved or denied again until it finishes.
+pub fn inbox_entries(
+    inbox: &Inbox,
+    redactor: &Redactor,
+    approving: &HashSet<ItemId>,
+) -> Vec<InboxEntry> {
     inbox
         .list(&Filter::default())
         .into_iter()
@@ -119,7 +124,8 @@ pub fn inbox_entries(inbox: &Inbox, redactor: &Redactor) -> Vec<InboxEntry> {
                 preview.title,
             )
             .detail(preview.detail)
-            .production(production);
+            .production(production)
+            .busy(approving.contains(&item.id));
             if let Some(space) = preview.space {
                 entry = entry.space(space.as_str().to_owned());
             }
@@ -217,6 +223,32 @@ pub fn widen_refusal(
     None
 }
 
+/// Why Inbox item `item` cannot be denied or dismissed now, if it cannot: it is a widening being approved
+/// (`approving`), and turning it down while its worktrees are being added would leave the space widened under a
+/// denied request.
+pub fn settle_refusal(approving: &HashSet<ItemId>, item: &ItemId) -> Option<String> {
+    approving.contains(item).then(|| {
+        "this request is being approved; wait until it finishes before denying or dismissing it"
+            .to_owned()
+    })
+}
+
+/// What approving a widening ends with, from what `xctx_core::widen` returned. A space that already has
+/// everything asked for ([`xctx_core::Error::EmptyWiden`], say because an earlier approval widened it but
+/// marking the request approved failed) counts as widened with nothing added, so the request is settled instead
+/// of staying pending for good. Other errors are kept.
+pub fn widen_outcome(
+    result: xctx_core::Result<WidenReport>,
+) -> Result<WidenReport, xctx_core::Error> {
+    match result {
+        Err(xctx_core::Error::EmptyWiden(_)) => Ok(WidenReport {
+            added_repos: Vec::new(),
+            production_enabled: false,
+        }),
+        other => other,
+    }
+}
+
 /// What the status bar says once space `id` is widened; `production_requested` is whether the widening asked
 /// for production (a space may have run with it before).
 pub fn widen_message(id: &SpaceId, report: &WidenReport, production_requested: bool) -> String {
@@ -282,6 +314,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let id = ItemId::new(id);
+        if matches!(action, InboxAction::Reject | InboxAction::Dismiss)
+            && let Some(why) = settle_refusal(&self.widen_approvals, &id)
+        {
+            self.info(why, cx);
+            return;
+        }
         match action {
             InboxAction::Review => {
                 self.plan_review = Some(id);
@@ -393,7 +431,8 @@ impl Workspace {
 
     /// Approve a request to widen a space: add the worktrees (and switch to production) in the background, then
     /// mark it approved, give each new repo a writer and, when the space is open, an agent pane, and check the
-    /// space with mise again. Refused while the same request is being approved or the space is not active.
+    /// space with mise again. Refused while the same request is being approved or the space is not active. A
+    /// space that already has everything asked for settles the request (see [`widen_outcome`]).
     fn approve_widen(&mut self, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.inbox.as_ref().and_then(|inbox| inbox.get(&id)) else {
             return;
@@ -435,7 +474,7 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.return_store(store, cx);
                 this.widen_approvals.remove(&id);
-                match result {
+                match widen_outcome(result) {
                     Ok(report) => {
                         this.space_widened(&id, &space_id, &report, production, window, cx)
                     }
@@ -676,7 +715,7 @@ impl Workspace {
         }
 
         let entries = match &self.inbox {
-            Some(inbox) => inbox_entries(inbox, &self.redactor),
+            Some(inbox) => inbox_entries(inbox, &self.redactor, &self.widen_approvals),
             None => Vec::new(),
         };
         let entity = cx.entity().downgrade();
@@ -753,6 +792,35 @@ mod tests {
     }
 
     #[test]
+    fn a_widening_being_approved_cannot_be_denied_or_dismissed() {
+        let item = ItemId::new("inbox-1");
+        let approving = HashSet::from([item.clone()]);
+        assert!(settle_refusal(&approving, &item).is_some_and(|w| w.contains("being approved")));
+        assert_eq!(settle_refusal(&approving, &ItemId::new("inbox-2")), None);
+        assert_eq!(settle_refusal(&HashSet::new(), &item), None);
+    }
+
+    #[test]
+    fn a_space_that_already_has_everything_settles_the_widening() {
+        let id = SpaceId::new("s");
+        let settled = widen_outcome(Err(xctx_core::Error::EmptyWiden(id.clone())));
+        let report = settled.ok();
+        assert!(
+            report
+                .as_ref()
+                .is_some_and(|r| r.added_repos.is_empty() && !r.production_enabled)
+        );
+        if let Some(report) = report {
+            assert_eq!(
+                widen_message(&id, &report, true),
+                "s already had everything asked for"
+            );
+        }
+        let failed = widen_outcome(Err(xctx_core::Error::SpaceNotFound(id.clone())));
+        assert!(matches!(failed, Err(xctx_core::Error::SpaceNotFound(_))));
+    }
+
+    #[test]
     fn entries_are_pending_redacted_and_marked() -> TestResult {
         let dir = tempfile::tempdir()?;
         let mut inbox = Inbox::open(dir.path())?;
@@ -765,7 +833,7 @@ mod tests {
             None,
             Source::Agent,
         )?;
-        inbox.post(
+        let widen = inbox.post(
             ItemBody::SpaceWiden(SpaceWiden {
                 space: SpaceId::new("s"),
                 add_repos: vec![],
@@ -800,10 +868,15 @@ mod tests {
         )?;
         inbox.dismiss(&settled)?;
         let redactor = Redactor::new([("T".to_owned(), "tok-55555".to_owned())]);
-        let entries = inbox_entries(&inbox, &redactor);
+        let entries = inbox_entries(&inbox, &redactor, &HashSet::new());
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].kind, InboxKind::MissingEnvVar);
         assert!(entries[1].production && entries[1].space.as_deref() == Some("s"));
+        assert!(entries.iter().all(|e| !e.busy));
+        let approving = HashSet::from([widen]);
+        let entries = inbox_entries(&inbox, &redactor, &approving);
+        let busy: Vec<bool> = entries.iter().map(|e| e.busy).collect();
+        assert_eq!(busy, [false, true, false]);
         assert_eq!(entries[2].id.as_ref(), notice.as_str());
         assert_eq!(entries[2].title.as_ref(), "used [REDACTED:T]");
         Ok(())

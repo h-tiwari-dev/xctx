@@ -231,7 +231,9 @@ impl SharedSpacePanel {
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .min_w_0()
+                            .max_w(px(180.0))
+                            .truncate()
                             .text_size(Theme::TEXT_XS)
                             .text_color(theme.text_subtle)
                             .child(format!("by {}", contract.author)),
@@ -240,8 +242,11 @@ impl SharedSpacePanel {
             .children(summary)
             .child(
                 div()
+                    .id("shared-contract-spec")
                     .flex()
                     .flex_col()
+                    .min_w_0()
+                    .overflow_x_scroll()
                     .p(Theme::SPACE_2)
                     .rounded(Theme::RADIUS_SM)
                     .border_1()
@@ -285,6 +290,8 @@ impl SharedSpacePanel {
             .map(|message| {
                 let to = message.to.clone().map(|to| {
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_size(Theme::TEXT_XS)
                         .text_color(theme.text_subtle)
                         .child(format!("-> {to}"))
@@ -301,12 +308,15 @@ impl SharedSpacePanel {
                             .flex()
                             .items_center()
                             .gap(Theme::SPACE_2)
+                            .min_w_0()
                             .child(
                                 Badge::new(message_kind_label(message.kind))
                                     .tone(message_kind_tone(message.kind)),
                             )
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_size(Theme::TEXT_SM)
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.text)
@@ -400,6 +410,9 @@ impl SharedSpacePanel {
                     .child(
                         div()
                             .flex_none()
+                            .min_w_0()
+                            .max_w(px(140.0))
+                            .truncate()
                             .text_size(Theme::TEXT_XS)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.text_muted)

@@ -2,8 +2,10 @@
 //! [`TerminalConfig`] that starts them in the right worktree with the space's environment.
 //!
 //! Everything here is decided from a [`ProgramSearch`] rather than the process environment directly, so it can be
-//! tested without touching the user's `PATH` or home directory.
+//! tested without touching the user's `PATH` or home directory. The one exception is the scratch directory, which
+//! follows `XCTX_DATA_DIR` (see [`scratch_dir_for`]).
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
@@ -13,10 +15,11 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use xctx_channel::ScratchDir;
 use xctx_core::Space;
-use xctx_layout::{PaneKind, PaneRole};
+use xctx_layout::{PaneId, PaneKind, PaneRole, RolePane};
 use xctx_term::TerminalConfig;
+
+use crate::space_graph::scratch_dir_for;
 
 /// The shell used when `$SHELL` is unset or empty.
 pub const DEFAULT_SHELL: &str = "/bin/zsh";
@@ -260,14 +263,19 @@ pub enum AgentStart {
     Fresh,
 }
 
-/// How an agent pane of `new` role added by a split starts in `space`: [`AgentStart::Fresh`] when one of
-/// `others` (the space's other panes) is an agent in the same worktree, whose session `pi --continue` would
-/// resume, else [`AgentStart::Continue`].
+/// How an agent pane of `new` role added by a split starts in `space`: [`AgentStart::Fresh`] when it runs a
+/// new lane of the space's graph (`new_lane`, such as a helper added from the graph panel), which has no session
+/// of its own, or when one of `others` (the space's other panes) is an agent in the same worktree, whose session
+/// `pi --continue` would resume; else [`AgentStart::Continue`].
 pub fn split_agent_start<'a>(
     space: &Space,
     new: &PaneRole,
     others: impl IntoIterator<Item = &'a PaneRole>,
+    new_lane: bool,
 ) -> AgentStart {
+    if new_lane {
+        return AgentStart::Fresh;
+    }
     let worktree = pane_worktree(space, new);
     let shared = others
         .into_iter()
@@ -277,6 +285,41 @@ pub fn split_agent_start<'a>(
     } else {
         AgentStart::Continue
     }
+}
+
+/// How each of `panes` starts when space `space` is reopened, in order. In each worktree one agent pane resumes
+/// the worktree's last session (`pi --continue`): the first of `preferred` (the panes bound to the repos'
+/// writers) working there, else the first agent pane there. Every other agent pane in that worktree starts
+/// [`AgentStart::Fresh`], so two `pi` processes never resume one session. Panes that are not agents get
+/// [`AgentStart::Continue`], which they ignore.
+pub fn restore_agent_starts(
+    space: &Space,
+    panes: &[RolePane],
+    preferred: &[PaneId],
+) -> Vec<AgentStart> {
+    let agents = || panes.iter().filter(|p| p.role.kind == PaneKind::Agent);
+    let mut resuming: HashMap<Option<&Path>, PaneId> = HashMap::new();
+    for pane in agents().filter(|p| preferred.contains(&p.id)) {
+        resuming
+            .entry(pane_worktree(space, &pane.role))
+            .or_insert(pane.id);
+    }
+    for pane in agents() {
+        resuming
+            .entry(pane_worktree(space, &pane.role))
+            .or_insert(pane.id);
+    }
+    panes
+        .iter()
+        .map(|pane| {
+            let resumes = resuming.get(&pane_worktree(space, &pane.role)) == Some(&pane.id);
+            if pane.role.kind != PaneKind::Agent || resumes {
+                AgentStart::Continue
+            } else {
+                AgentStart::Fresh
+            }
+        })
+        .collect()
 }
 
 /// What to start in a pane, and a notice for the user when it is not what the pane's role asked for (for example
@@ -296,8 +339,8 @@ pub const AGENT_ID_ENV: &str = "XCTX_AGENT_ID";
 /// `helper:<kind>`.
 pub const AGENT_ROLE_ENV: &str = "XCTX_AGENT_ROLE";
 
-/// The environment variable naming the space's scratch directory, `/tmp/xctx-scratch/<slug>`, which is removed
-/// on Ship or Discard.
+/// The environment variable naming the space's scratch directory (see [`scratch_dir_for`]), which is removed on
+/// Ship or Discard.
 pub const SCRATCH_DIR_ENV: &str = "XCTX_SCRATCH_DIR";
 
 /// The agent of a space's graph a pane runs as.
@@ -310,7 +353,8 @@ pub struct PaneAgent {
 }
 
 impl PaneLaunch {
-    /// The same launch, run as `agent` when there is one: [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`] are set.
+    /// The same launch, run as `agent` when there is one: [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`] are set. Without
+    /// one they stay empty, as [`pane_launch`] sets them.
     pub fn with_agent(mut self, agent: Option<&PaneAgent>) -> PaneLaunch {
         if let Some(agent) = agent {
             self.config = self
@@ -335,8 +379,9 @@ pub fn pane_worktree<'a>(space: &'a Space, role: &PaneRole) -> Option<&'a Path> 
 /// The config that starts a pane of `role` in `space`: its program (`pi` for agents, `lazygit` for git panes,
 /// the login shell for shells), run in the repo's worktree with the space's `PORT`, `XCTX_SPACE` and
 /// `MISE_ENV`, the space's scratch directory as [`SCRATCH_DIR_ENV`], and `XCTX_CONTROL_SOCKET` when the control
-/// socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice. The agent a pane
-/// runs as is added with [`PaneLaunch::with_agent`].
+/// socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice. [`AGENT_ID_ENV`]
+/// and [`AGENT_ROLE_ENV`] are set empty, so the agent identity of an xctx this one runs inside never leaks into
+/// its panes; the agent a pane runs as is added with [`PaneLaunch::with_agent`].
 pub fn pane_launch(
     space: &Space,
     role: &PaneRole,
@@ -386,7 +431,8 @@ pub fn pane_launch(
     for (key, value) in space.env() {
         config = config.env(key, value);
     }
-    if let Ok(scratch) = ScratchDir::for_space(space.id.as_str()) {
+    config = config.env(AGENT_ID_ENV, "").env(AGENT_ROLE_ENV, "");
+    if let Ok(scratch) = scratch_dir_for(space.id.as_str()) {
         config = config.env(SCRATCH_DIR_ENV, scratch.root().to_string_lossy());
     }
     if let Some(control) = &search.control {
@@ -579,13 +625,91 @@ mod tests {
         let space = space(Path::new("/code"));
         let new = role(PaneKind::Agent, "api");
         let others = [role(PaneKind::Agent, "api"), role(PaneKind::Shell, "web")];
-        assert_eq!(split_agent_start(&space, &new, &others), AgentStart::Fresh);
+        assert_eq!(
+            split_agent_start(&space, &new, &others, false),
+            AgentStart::Fresh
+        );
         let elsewhere = [role(PaneKind::Agent, "web"), role(PaneKind::Shell, "api")];
         assert_eq!(
-            split_agent_start(&space, &new, &elsewhere),
+            split_agent_start(&space, &new, &elsewhere, false),
             AgentStart::Continue
         );
-        assert_eq!(split_agent_start(&space, &new, &[]), AgentStart::Continue);
+        assert_eq!(
+            split_agent_start(&space, &new, &[], false),
+            AgentStart::Continue
+        );
+    }
+
+    #[test]
+    fn a_helper_pane_always_starts_fresh() {
+        let space = space(Path::new("/code"));
+        let new = role(PaneKind::Agent, "api");
+        // Even alone in its worktree, a new lane never resumes another agent's session.
+        assert_eq!(
+            split_agent_start(&space, &new, &[], true),
+            AgentStart::Fresh
+        );
+        let elsewhere = [role(PaneKind::Agent, "web")];
+        assert_eq!(
+            split_agent_start(&space, &new, &elsewhere, true),
+            AgentStart::Fresh
+        );
+    }
+
+    fn role_pane(id: u64, kind: PaneKind, repo: &str) -> RolePane {
+        RolePane {
+            id: PaneId(id),
+            role: role(kind, repo),
+        }
+    }
+
+    #[test]
+    fn a_reopened_space_resumes_one_agent_per_worktree() {
+        let space = space(Path::new("/code"));
+        let panes = [
+            role_pane(1, PaneKind::Agent, "api"),
+            role_pane(2, PaneKind::Shell, "api"),
+            role_pane(3, PaneKind::Agent, "api"),
+            role_pane(4, PaneKind::Agent, "web"),
+            role_pane(5, PaneKind::Agent, "web"),
+            role_pane(6, PaneKind::Git, "web"),
+        ];
+        use AgentStart::{Continue, Fresh};
+        assert_eq!(
+            restore_agent_starts(&space, &panes, &[]),
+            [Continue, Continue, Fresh, Continue, Fresh, Continue]
+        );
+        // The pane bound to a repo's writer resumes, not the first agent pane in its worktree.
+        assert_eq!(
+            restore_agent_starts(&space, &panes, &[PaneId(3), PaneId(4)]),
+            [Fresh, Continue, Continue, Continue, Fresh, Continue]
+        );
+        // A pane in an unknown repo works in the first worktree, so it shares api's session.
+        let unknown = [
+            role_pane(1, PaneKind::Agent, "api"),
+            role_pane(2, PaneKind::Agent, "gone"),
+        ];
+        assert_eq!(
+            restore_agent_starts(&space, &unknown, &[]),
+            [Continue, Fresh]
+        );
+    }
+
+    #[test]
+    fn panes_that_run_no_agent_get_an_empty_agent_identity() -> TestResult {
+        let root = tempfile::tempdir()?;
+        executable(&root.path().join("bin/pi"))?;
+        executable(&root.path().join("bin/lazygit"))?;
+        let space = space(root.path());
+        let search = search(root.path());
+        for kind in [PaneKind::Shell, PaneKind::Git, PaneKind::Agent] {
+            let launch = pane_launch(&space, &role(kind, "api"), &AgentStart::Fresh, &search)
+                .with_agent(None);
+            // Set, not missing, so an outer xctx's XCTX_AGENT_ID never reaches the pane.
+            assert_eq!(env(&launch, AGENT_ID_ENV), Some(""), "{kind:?}");
+            assert_eq!(env(&launch, AGENT_ROLE_ENV), Some(""), "{kind:?}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -785,12 +909,11 @@ mod tests {
             &search,
         )
         .with_agent(Some(&agent));
+        let scratch = scratch_dir_for("fix-retry")?;
+        let scratch = scratch.root().to_str();
         assert_eq!(env(&launch, AGENT_ID_ENV), Some("writer-api"));
         assert_eq!(env(&launch, AGENT_ROLE_ENV), Some("writer"));
-        assert_eq!(
-            env(&launch, SCRATCH_DIR_ENV),
-            Some("/tmp/xctx-scratch/fix-retry")
-        );
+        assert_eq!(env(&launch, SCRATCH_DIR_ENV), scratch);
 
         let shell = pane_launch(
             &space,
@@ -799,12 +922,9 @@ mod tests {
             &search,
         )
         .with_agent(None);
-        assert_eq!(env(&shell, AGENT_ID_ENV), None);
-        assert_eq!(env(&shell, AGENT_ROLE_ENV), None);
-        assert_eq!(
-            env(&shell, SCRATCH_DIR_ENV),
-            Some("/tmp/xctx-scratch/fix-retry")
-        );
+        assert_eq!(env(&shell, AGENT_ID_ENV), Some(""));
+        assert_eq!(env(&shell, AGENT_ROLE_ENV), Some(""));
+        assert_eq!(env(&shell, SCRATCH_DIR_ENV), scratch);
         Ok(())
     }
 }

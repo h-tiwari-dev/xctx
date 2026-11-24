@@ -10,7 +10,7 @@ use xctx_ui::{AgentGraphView, LoopBar, SharedSpacePanel, SharedTab, Theme, helpe
 
 use crate::space_graph::{
     SpaceGraphState, add_role, channel_error, graph_error, loop_advance, loop_error, pane_agent,
-    remove_lane, set_agent_paused, sync_pane_bindings,
+    pending_loop_approvals, remove_lane, set_agent_paused_and_tell, sync_pane_bindings,
 };
 use crate::space_tab::SpaceTab;
 use crate::spawn::PaneAgent;
@@ -149,6 +149,9 @@ impl Workspace {
     }
 
     /// Add a helper of `kind` to the graph and split a new agent pane, in the space's first repo, that runs as it.
+    /// The pane always starts a fresh `pi` session (see [`Workspace::split_for_agent`]), never resuming another
+    /// agent's. When the pane cannot be split, the helper is taken out of the graph again so no lane is left
+    /// without a pane.
     fn add_helper_lane(&mut self, kind: HelperKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(added) = self.panel_change(cx, |state, space| {
             let lane = add_role(state, &space.id, AgentRole::Helper { kind }, None)?;
@@ -176,11 +179,45 @@ impl Workspace {
                 format!("Added {} ({agent}) to {id}", helper_kind_label(kind)),
                 cx,
             ),
-            Err(e) => self.show_op_error(e, cx),
+            Err(e) => {
+                let removed = self.change_graph_of(&id, |state, space| {
+                    remove_lane(state, &space.id, agent.as_str())
+                });
+                cx.notify();
+                self.show_op_error(e, cx);
+                if let Err(e) = removed {
+                    self.show_op_error(e, cx);
+                }
+            }
         }
     }
 
-    /// Remove a writer or helper from the graph. Its pane keeps running.
+    /// Approve next: approve the stage change the loop of the space being shown waits for, and dismiss its
+    /// pending loop approval notices in the Inbox so they do not pile up.
+    fn approve_next_stage(&mut self, cx: &mut Context<Self>) {
+        let approved = self.panel_change(cx, |state, space| {
+            state.change(|doc| {
+                doc.loop_run
+                    .approve_next_stage()
+                    .map_err(|e| loop_error(&space.id, e))
+            })?;
+            Ok(space.id.clone())
+        });
+        let Some(id) = approved else {
+            return;
+        };
+        let Some(inbox) = self.inbox.as_mut() else {
+            return;
+        };
+        for item in pending_loop_approvals(inbox, &id) {
+            if let Err(e) = inbox.dismiss(&item) {
+                self.error(format!("could not update the Inbox: {e}"), cx);
+                return;
+            }
+        }
+    }
+
+    /// Remove a helper from the graph (the panel offers Remove only on helpers). Its pane keeps running.
     fn remove_agent_lane(&mut self, agent: &AgentNodeId, cx: &mut Context<Self>) {
         if let Some(node) = self.panel_change(cx, |state, space| {
             remove_lane(state, &space.id, agent.as_str())
@@ -256,15 +293,7 @@ impl Workspace {
                 });
             })
             .on_approve_next(move |_, cx| {
-                let _ = approve.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, space| {
-                        state.change(|doc| {
-                            doc.loop_run
-                                .approve_next_stage()
-                                .map_err(|e| loop_error(&space.id, e))
-                        })
-                    });
-                });
+                let _ = approve.update(cx, |this, cx| this.approve_next_stage(cx));
             })
             .on_reset(move |_, cx| {
                 let _ = reset.update(cx, |this, cx| {
@@ -299,7 +328,7 @@ impl Workspace {
                 let agent = agent.clone();
                 let _ = pause.update(cx, |this, cx| {
                     this.panel_change(cx, |state, space| {
-                        set_agent_paused(state, &space.id, agent.as_str(), true)
+                        set_agent_paused_and_tell(state, &space.id, agent.as_str(), true)
                     });
                 });
             })
@@ -307,7 +336,7 @@ impl Workspace {
                 let agent = agent.clone();
                 let _ = resume.update(cx, |this, cx| {
                     this.panel_change(cx, |state, space| {
-                        set_agent_paused(state, &space.id, agent.as_str(), false)
+                        set_agent_paused_and_tell(state, &space.id, agent.as_str(), false)
                     });
                 });
             })

@@ -67,8 +67,9 @@ pub(crate) struct PendingDraft {
 }
 
 /// A request whose answer shows stored text to an agent (`inbox.list`, `channel.list`, `contract.get`,
-/// `contract.agree`) that arrived before the startup mise check learned the secret values to mask, answered once
-/// it has.
+/// `contract.set`, `contract.agree`) that arrived before the startup mise check learned the secret values to
+/// mask, answered once it has. They wait in one queue and are answered in the order they arrived, so a
+/// `contract.agree` never applies to a contract revision set after it.
 pub(crate) struct PendingMaskedRead {
     call: Call,
     responder: Responder,
@@ -354,8 +355,26 @@ fn to_json<T: Serialize>(result: Result<T, RpcError>) -> Result<Value, RpcError>
 #[derive(Clone, Debug)]
 struct MiseCheck {
     space: SpaceId,
+    /// The `MISE_ENV` the space's panes run with ([`Space::effective_mise_env`]).
+    mise_env: String,
     repo: String,
     dir: PathBuf,
+}
+
+/// The worktrees of `spaces` that exist, to check with mise under the `MISE_ENV` each space's panes run with.
+fn mise_checks(spaces: &[Space]) -> Vec<MiseCheck> {
+    spaces
+        .iter()
+        .flat_map(|space| {
+            space.repos.iter().map(|repo| MiseCheck {
+                space: space.id.clone(),
+                mise_env: space.effective_mise_env().to_owned(),
+                repo: repo.name.clone(),
+                dir: repo.worktree.clone(),
+            })
+        })
+        .filter(|c| c.dir.is_dir())
+        .collect()
 }
 
 /// What checking a space's worktrees with mise found.
@@ -494,6 +513,7 @@ impl Workspace {
             call @ (Call::InboxList(_)
             | Call::ChannelList(_)
             | Call::ContractGet(_)
+            | Call::ContractSet(_)
             | Call::ContractAgree(_)) => {
                 if !self.mise_ready {
                     self.pending_masked_reads
@@ -528,9 +548,6 @@ impl Workspace {
             }),
             Call::ChannelPost(p) => self.graph_call(&p.space, cx, |state, space, _| {
                 channel_post(state, &space.id, &p)
-            }),
-            Call::ContractSet(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
-                contract_set(state, &space.id, &p, redactor)
             }),
             Call::LoopStatus(p) => {
                 self.graph_call(&p.space, cx, |state, _, _| Ok(state.loop_run().clone()))
@@ -568,6 +585,9 @@ impl Workspace {
             }),
             Call::ContractGet(p) => self.graph_call(&p.space, cx, |state, _, redactor| {
                 Ok(contract_get(state, redactor))
+            }),
+            Call::ContractSet(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
+                contract_set(state, &space.id, &p, redactor)
             }),
             Call::ContractAgree(p) => self.graph_call(&p.space, cx, |state, space, redactor| {
                 contract_agree(state, &space.id, &p.agent, redactor)
@@ -821,8 +841,9 @@ impl Workspace {
         Ok(draft_result(id.as_str().to_owned(), &draft))
     }
 
-    /// Check the worktrees of `spaces` with mise in the background: post the required variables that are not
-    /// set to the Inbox (resolving ones that are set now), and learn the secret values to mask.
+    /// Check the worktrees of `spaces` with mise in the background, under the `MISE_ENV` each space's panes run
+    /// with (`production` once it is widened to production): post the required variables that are not set to the
+    /// Inbox (resolving ones that are set now), and learn the secret values to mask.
     pub(crate) fn check_mise(&mut self, spaces: Vec<Space>, cx: &mut Context<Self>) {
         self.run_mise_check(spaces, false, cx);
     }
@@ -841,17 +862,7 @@ impl Workspace {
             }
             return;
         };
-        let checks: Vec<MiseCheck> = spaces
-            .iter()
-            .flat_map(|space| {
-                space.repos.iter().map(|repo| MiseCheck {
-                    space: space.id.clone(),
-                    repo: repo.name.clone(),
-                    dir: repo.worktree.clone(),
-                })
-            })
-            .filter(|c| c.dir.is_dir())
-            .collect();
+        let checks = mise_checks(&spaces);
         if checks.is_empty() {
             if startup {
                 self.startup_mise_checked(cx);
@@ -869,7 +880,8 @@ impl Workspace {
                         checks: checks
                             .into_iter()
                             .map(|check| {
-                                let report = runner.inspect(&check.dir, Some(check.space.as_str()));
+                                let report =
+                                    runner.inspect(&check.dir, Some(check.mise_env.as_str()));
                                 (check, report)
                             })
                             .collect(),
@@ -900,7 +912,7 @@ impl Workspace {
                 && let Err(e) = inbox.sync_missing(
                     &check.repo,
                     &check.dir,
-                    Some(check.space.as_str()),
+                    Some(check.mise_env.as_str()),
                     Some(check.space.clone()),
                     &report,
                 )
@@ -1204,6 +1216,28 @@ mod tests {
         });
         assert_eq!(long.kind, BannerKind::Info);
         assert_eq!(long.message.chars().count(), MAX_STATUS_CHARS);
+    }
+
+    #[test]
+    fn mise_checks_use_the_mise_env_the_panes_run_with() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let mut plain = space("rate-limit");
+        plain.repos[0].worktree = root.path().to_path_buf();
+        let mut production = plain.clone();
+        production.id = SpaceId::new("prod-bug");
+        production.production = true;
+        let mut gone = space("gone");
+        gone.repos[0].worktree = root.path().join("missing");
+        let checks = mise_checks(&[plain, production, gone]);
+        let envs: Vec<(&str, &str)> = checks
+            .iter()
+            .map(|c| (c.space.as_str(), c.mise_env.as_str()))
+            .collect();
+        assert_eq!(
+            envs,
+            [("rate-limit", "rate-limit"), ("prod-bug", "production")]
+        );
+        Ok(())
     }
 
     #[test]

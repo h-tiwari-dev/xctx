@@ -1,6 +1,10 @@
 //! The loop bar: a space's `Write -> Test -> Probe -> Review` loop as a strip of stage pills, its status, its
 //! iteration and turn counts, the autonomy selector, and the action the loop's status allows.
 //!
+//! It is drawn in two rows so it fits the 560px graph panel without scrolling sideways: the stages, status and
+//! counter first, then the autonomy selector and the actions. Each row wraps rather than overflows, so the
+//! actions are always in view.
+//!
 //! The bar draws a [`LoopRun`] the app passes in and reports what the user did through callbacks. It keeps no
 //! state.
 
@@ -237,10 +241,6 @@ impl LoopBar {
     }
 }
 
-fn separator(theme: &Theme) -> gpui::Div {
-    div().flex_none().w(px(1.0)).h(px(16.0)).bg(theme.divider)
-}
-
 impl RenderOnce for LoopBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx);
@@ -335,20 +335,12 @@ impl RenderOnce for LoopBar {
             button
         });
 
-        div()
-            .id("loop-bar")
+        let pipeline = div()
             .flex()
-            .flex_none()
+            .flex_wrap()
             .items_center()
-            .w_full()
-            .min_h(px(34.0))
-            .px(Theme::SPACE_2)
             .gap(Theme::SPACE_2)
-            .overflow_x_scroll()
-            .bg(theme.surface)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(Theme::RADIUS_MD)
+            .min_w_0()
             .child(
                 div()
                     .flex_none()
@@ -373,8 +365,15 @@ impl RenderOnce for LoopBar {
                     .text_size(Theme::TEXT_XS)
                     .text_color(theme.text_muted)
                     .child(loop_counter(&self.run)),
-            )
-            .child(div().flex_1())
+            );
+
+        let controls = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(Theme::SPACE_2)
+            .min_w_0()
             .child(
                 div()
                     .flex()
@@ -388,7 +387,6 @@ impl RenderOnce for LoopBar {
                     .bg(theme.bg)
                     .children(autonomy_pills),
             )
-            .child(separator(&theme))
             .child(
                 div()
                     .flex()
@@ -396,7 +394,23 @@ impl RenderOnce for LoopBar {
                     .items_center()
                     .gap(Theme::SPACE_1)
                     .children(actions),
-            )
+            );
+
+        div()
+            .id("loop-bar")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .p(Theme::SPACE_2)
+            .gap(Theme::SPACE_2)
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(Theme::RADIUS_MD)
+            .child(pipeline)
+            .child(controls)
     }
 }
 

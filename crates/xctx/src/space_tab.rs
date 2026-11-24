@@ -9,7 +9,6 @@ use gpui::{
     AnyElement, App, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled,
     Subscription, Window, div,
 };
-use xctx_channel::ScratchDir;
 use xctx_control::{ErrorCode, RpcError};
 use xctx_core::{Space, SpaceId, SpaceShape};
 use xctx_graph::AgentNodeId;
@@ -21,8 +20,9 @@ use xctx_ui::{PaneView, SharedTab, SplitView, Theme, pane_kind_label};
 
 use crate::lifecycle::reshape_space;
 use crate::persist::{restore_layout, save_layout};
+use crate::space_graph::{scratch_dir_for, writer_panes};
 use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
-use crate::spawn::{AgentStart, pane_launch, split_agent_start};
+use crate::spawn::{AgentStart, pane_launch, restore_agent_starts, split_agent_start};
 use crate::workspace::{View, Workspace, open_space_refusal, wait_message};
 
 /// A layout error of space `id` as a control error: unknown panes are not found, the rest conflicts.
@@ -141,7 +141,8 @@ impl Workspace {
     }
 
     /// Open the space's tab if it is not open yet: restore its saved layout (or make a fresh one) and start every
-    /// pane, agents resuming their last session. Returns whether the tab is open. It is refused, with the reason
+    /// pane, one agent per worktree resuming its last session and the others starting fresh (see
+    /// [`restore_agent_starts`]). Returns whether the tab is open. It is refused, with the reason
     /// shown, while the space's ship or discard runs, and while the store (with the saved layout) is busy.
     pub(crate) fn open_space(
         &mut self,
@@ -178,9 +179,16 @@ impl Workspace {
         };
         let panes = restored.layout.panes();
         self.tabs
-            .insert(id.clone(), SpaceTab::new(space, restored.layout));
-        for pane in &panes {
-            self.spawn_pane(id, pane, &AgentStart::Continue, window, cx);
+            .insert(id.clone(), SpaceTab::new(space.clone(), restored.layout));
+        self.sync_agent_panes(id);
+        let preferred = self
+            .graphs
+            .get(id)
+            .map(|state| writer_panes(state.graph(), &panes))
+            .unwrap_or_default();
+        let starts = restore_agent_starts(&space, &panes, &preferred);
+        for (pane, start) in panes.iter().zip(&starts) {
+            self.spawn_pane(id, pane, start, window, cx);
         }
         if let Some(reason) = restored.fallback {
             self.info(format!("{reason}; opened a fresh layout"), cx);
@@ -220,7 +228,7 @@ impl Workspace {
         let Some(tab) = self.tabs.get(id) else {
             return;
         };
-        if let Ok(scratch) = ScratchDir::for_space(id.as_str()) {
+        if let Ok(scratch) = scratch_dir_for(id.as_str()) {
             // Best effort: agents may write there with their own tools, which need the directory.
             let _ = std::fs::create_dir_all(scratch.root());
         }
@@ -421,7 +429,8 @@ impl Workspace {
     }
 
     /// Split as [`Workspace::split_in`] does, binding the new pane to `agent` of the space's graph (when given)
-    /// before it starts, so it runs as that agent.
+    /// before it starts, so it runs as that agent. A pane split for an agent (a new lane, such as a helper) always
+    /// starts fresh: `pi --continue` would resume the session of another agent in the worktree.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn split_for_agent(
         &mut self,
@@ -456,7 +465,7 @@ impl Workspace {
             .filter(|other| other.id != pane.id)
             .map(|other| other.role)
             .collect();
-        let start = split_agent_start(&tab.space, &pane.role, &others);
+        let start = split_agent_start(&tab.space, &pane.role, &others, agent.is_some());
         if let Some(agent) = &agent
             && let Err(e) = self.bind_agent_pane(id, agent, pane.id)
         {

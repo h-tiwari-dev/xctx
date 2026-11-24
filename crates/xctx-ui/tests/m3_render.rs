@@ -108,7 +108,6 @@ fn agent_graph_buttons_report_the_agent_and_what_was_chosen(cx: &mut TestAppCont
         "graph-pause-writer-api",
         "graph-talk-writer-api",
         "graph-resume-writer-web",
-        "graph-remove-writer-web",
         "graph-pause-helper-tests-1",
         "graph-talk-helper-tests-1",
         "graph-remove-helper-tests-1",
@@ -118,9 +117,11 @@ fn agent_graph_buttons_report_the_agent_and_what_was_chosen(cx: &mut TestAppCont
     ] {
         assert!(click(cx, selector), "{selector} is drawn");
     }
-    // The orchestrator cannot be removed, a paused agent is not paused again, a running one is not resumed,
-    // and an agent with no pane cannot be talked to.
+    // The orchestrator and writers cannot be removed, a paused agent is not paused again, a running one is not
+    // resumed, and an agent with no pane cannot be talked to.
     assert!(cx.debug_bounds("graph-remove-orchestrator").is_none());
+    assert!(cx.debug_bounds("graph-remove-writer-api").is_none());
+    assert!(cx.debug_bounds("graph-remove-writer-web").is_none());
     assert!(cx.debug_bounds("graph-pause-writer-web").is_none());
     assert!(cx.debug_bounds("graph-resume-writer-api").is_none());
     assert!(cx.debug_bounds("graph-talk-writer-web").is_none());
@@ -133,7 +134,6 @@ fn agent_graph_buttons_report_the_agent_and_what_was_chosen(cx: &mut TestAppCont
             "pause writer-api",
             "talk writer-api",
             "resume writer-web",
-            "remove writer-web",
             "pause helper-tests-1",
             "talk helper-tests-1",
             "remove helper-tests-1",
@@ -364,6 +364,52 @@ impl Render for LoopHost {
                 .on_reset(move |_, _| log(&reset, "reset"))
                 .on_autonomy(move |level, _, _| log(&autonomy, format!("autonomy {level:?}"))),
         )
+    }
+}
+
+/// The width of the app's agent graph panel, which the loop bar sits in.
+const GRAPH_PANEL_WIDTH: f32 = 560.0;
+
+struct NarrowLoopHost {
+    run: LoopRun,
+}
+
+impl Render for NarrowLoopHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(gpui::px(GRAPH_PANEL_WIDTH))
+            .child(LoopBar::new(self.run.clone()).budget(10, 400))
+    }
+}
+
+/// Whether the element named `selector` is drawn entirely within the graph panel's width.
+fn fits_the_panel(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+    cx.debug_bounds(selector)
+        .is_some_and(|b| b.origin.x + b.size.width <= gpui::px(GRAPH_PANEL_WIDTH))
+}
+
+#[gpui::test]
+fn the_loop_bar_actions_fit_the_graph_panel(cx: &mut TestAppContext) {
+    // A long status badge and a budget counter, with the widest action row (Reset and Start).
+    let mut blocked = LoopRun::new(AutonomyLevel::WithinBudget {
+        max_iterations: 10,
+        max_turns: 400,
+    });
+    blocked.start().expect("an idle loop starts");
+    blocked.advance(true).expect("a running loop advances");
+    blocked.block("the contract tests failed on retry_after in three places");
+
+    let (_host, cx) = cx.add_window_view(move |_, _| NarrowLoopHost { run: blocked });
+    cx.run_until_parked();
+    for selector in [
+        "loop-reset",
+        "loop-start",
+        "loop-autonomy-ask",
+        "loop-autonomy-budget",
+        "loop-autonomy-checks",
+        "loop-stage-review",
+    ] {
+        assert!(fits_the_panel(cx, selector), "{selector} fits in 560px");
     }
 }
 
