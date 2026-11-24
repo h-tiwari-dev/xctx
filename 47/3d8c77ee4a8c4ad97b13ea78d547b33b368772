@@ -1,0 +1,21 @@
+crates/xctx/src/space_tab.rs
+  s_454cbc0ae53d08::t_e7cba57eac90f6 5,14,542-549,553-567,574
+crates/xctx/src/dialogs.rs
+  s_454cbc0ae53d08::t_5a5a2d38e73081 3-4,341,345-346,348,360,363-376,385,405
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "473d8c77ee4a8c4ad97b13ea78d547b33b368772",
+  "prompts": {},
+  "sessions": {
+    "s_454cbc0ae53d08": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20a12-24fe-707c-a4e1-c5c56bedc009",
+        "model": "gemini-4-neon"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
