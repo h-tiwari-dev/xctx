@@ -135,6 +135,10 @@ fn a_failed_launch_removes_what_it_made_and_saves_nothing() -> TestResult {
             .join("blocked")
             .exists()
     );
+    assert!(
+        !repos.code.join("payments-worktrees").exists(),
+        "the worktrees folder the launch made is removed with its worktree"
+    );
     assert!(!xgit::branch_exists(&repos.payments, "space/blocked")?);
     assert!(!xgit::branch_exists(&repos.checkout_web, "space/blocked")?);
     let exclude = fs::read_to_string(repos.payments.join(".git/info/exclude"))?;
@@ -694,9 +698,9 @@ fn widen_to_production_sets_the_flag_and_the_terminal_mise_env() -> TestResult {
         "prod-hotfix",
         "the slug still names its mise file"
     );
-    assert_eq!(saved.effective_mise_env(), "production");
+    assert_eq!(saved.effective_mise_env(), "production,prod-hotfix");
     let env = saved.env();
-    assert!(env.contains(&("MISE_ENV".into(), "production".into())));
+    assert!(env.contains(&("MISE_ENV".into(), "production,prod-hotfix".into())));
     assert!(env.contains(&("PORT".into(), "4001".into())));
     assert!(env.contains(&("XCTX_SPACE".into(), "prod-hotfix".into())));
     assert_eq!(saved.repos, space.repos);
@@ -792,6 +796,7 @@ fn a_failed_widen_removes_what_it_made_and_leaves_the_space_as_it_was() -> TestR
             .join("rollback-check")
             .exists()
     );
+    assert!(!root.path.join("code").join("api-worktrees").exists());
     assert!(!xgit::branch_exists(&api, "space/rollback-check")?);
     assert!(!xgit::branch_exists(
         &repos.checkout_web,
@@ -837,6 +842,13 @@ fn a_widen_the_store_cannot_save_is_rolled_back() -> TestResult {
             .join("store-failure")
             .exists()
     );
+    assert!(
+        !repos
+            .code
+            .join("web")
+            .join("checkout-web-worktrees")
+            .exists()
+    );
     assert!(!xgit::branch_exists(
         &repos.checkout_web,
         "space/store-failure"
@@ -862,6 +874,60 @@ fn widen_never_takes_over_an_existing_space_branch() -> TestResult {
     );
     assert_eq!(store.space(&space.id), Some(&space));
     assert_eq!(xgit::list_worktrees(&repos.checkout_web)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn widen_rolls_back_when_a_space_branch_appears_while_it_runs() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let api = root.path.join("code").join("api");
+    make_repo(&api, &[("README.md", "api\n")])?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("late branch", &[&repos.payments]))?;
+
+    // Making api's worktree runs its post-checkout hook, which makes checkout-web's space branch after widen
+    // checked that it was free.
+    let hook = api.join(".git").join("hooks").join("post-checkout");
+    fs::create_dir_all(hook.parent().ok_or("hooks folder")?)?;
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR\n\
+             git -C '{}' branch space/late-branch\n",
+            repos.checkout_web.display()
+        ),
+    )?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+
+    let result = widen(
+        &mut store,
+        &space.id,
+        widen_repos(&[&api, &repos.checkout_web]),
+    );
+    assert!(
+        matches!(&result, Err(Error::SpaceBranchTaken { repo, branch })
+            if repo == &repos.checkout_web && branch == "space/late-branch"),
+        "{result:?}"
+    );
+    assert!(!root.path.join("code").join("api-worktrees").exists());
+    assert!(!xgit::branch_exists(&api, "space/late-branch")?);
+    assert!(
+        !repos
+            .code
+            .join("web")
+            .join("checkout-web-worktrees")
+            .exists(),
+        "the worktree on the branch widen did not make is removed"
+    );
+    assert!(
+        xgit::branch_exists(&repos.checkout_web, "space/late-branch")?,
+        "a branch widen did not make is kept"
+    );
+    assert_eq!(xgit::list_worktrees(&repos.checkout_web)?.len(), 1);
+    assert_eq!(store.space(&space.id), Some(&space));
     Ok(())
 }
 

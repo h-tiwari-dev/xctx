@@ -9,7 +9,8 @@
 //! - [`Client`] connects to a running window and makes calls; `xctx-ctl` is a thin CLI over it.
 //!
 //! Nothing on the socket can approve an Inbox item, launch a space or widen one: `space.draft` and
-//! `space.widen_propose` only propose. Approval stays with the user in the window.
+//! `space.widen_propose` only propose. Approval stays with the user in the window. Resuming a paused agent and
+//! setting a loop's autonomy need [`Capability::Steer`], which [`ServerConfig::default`] does not grant.
 
 #![warn(missing_docs)]
 

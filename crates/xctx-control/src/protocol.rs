@@ -303,17 +303,26 @@ impl Response {
 pub enum Capability {
     /// Look at spaces, layouts, the Inbox, agent graphs, channels, contracts and loops.
     Read,
-    /// Rearrange a space: split, close, focus, zoom and reshape panes; pause, resume, add and remove agent lanes;
-    /// advance a loop and set its autonomy.
+    /// Rearrange a space: split, close, focus, zoom and reshape panes; pause, add and remove agent lanes; advance a
+    /// loop.
     Layout,
     /// Propose work and tell the user things: draft or propose widening a space, post to the Inbox, the channel or
     /// the contract, set the status line.
     Propose,
+    /// Steer on the user's behalf: resume a paused agent and set how far a loop runs without asking. These undo a
+    /// user's pause or loosen a user's gate, so [`crate::ServerConfig::default`] (what pane agents get) leaves it
+    /// out.
+    Steer,
 }
 
 impl Capability {
     /// Every capability.
-    pub const ALL: [Capability; 3] = [Capability::Read, Capability::Layout, Capability::Propose];
+    pub const ALL: [Capability; 4] = [
+        Capability::Read,
+        Capability::Layout,
+        Capability::Propose,
+        Capability::Steer,
+    ];
 }
 
 /// A method of the protocol, without its parameters.
@@ -459,11 +468,10 @@ impl Method {
             | Method::PaneFocus
             | Method::PaneZoom
             | Method::GraphPause
-            | Method::GraphResume
             | Method::GraphAddLane
             | Method::GraphRemoveLane
-            | Method::LoopAdvance
-            | Method::LoopSetAutonomy => Capability::Layout,
+            | Method::LoopAdvance => Capability::Layout,
+            Method::GraphResume | Method::LoopSetAutonomy => Capability::Steer,
             Method::SpaceDraft
             | Method::InboxPost
             | Method::StatusSet
@@ -530,10 +538,10 @@ impl Method {
             Method::InboxPost => "title=<text> [body=<text>] [space=<slug>]",
             Method::StatusSet => "message=<text> [level=info|success|warning|error] [space=<slug>]",
             Method::GraphGet | Method::ContractGet | Method::LoopStatus => "space=<slug>",
-            Method::GraphPause
-            | Method::GraphResume
-            | Method::GraphRemoveLane
-            | Method::ContractAgree => "space=<slug> agent=<id>",
+            Method::GraphPause | Method::GraphResume | Method::GraphRemoveLane => {
+                "space=<slug> agent=<id>"
+            }
+            Method::ContractAgree => "space=<slug> agent=<id> [version=<n>]",
             Method::GraphAddLane => {
                 "space=<slug> role=writer|helper [repo=<name>] [kind=tests|reviewer|probe] [label=<text>]"
             }
@@ -696,8 +704,7 @@ pub struct StatusSetParams {
     pub space: Option<String>,
 }
 
-/// Parameters that name one agent of a space: `graph.pause`, `graph.resume`, `graph.remove_lane`,
-/// `contract.agree`.
+/// Parameters that name one agent of a space: `graph.pause`, `graph.resume`, `graph.remove_lane`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentParams {
@@ -705,6 +712,20 @@ pub struct AgentParams {
     pub space: String,
     /// The agent's id in the space's graph.
     pub agent: String,
+}
+
+/// `contract.agree`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractAgreeParams {
+    /// The space's slug.
+    pub space: String,
+    /// The agreeing agent's id in the space's graph.
+    pub agent: String,
+    /// The contract version the agent read and agrees to (as `contract.get` reports it). Optional; clients that do
+    /// not know the field leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
 }
 
 /// The kind of lane `graph.add_lane` adds.
@@ -903,7 +924,7 @@ pub enum Call {
     /// See [`Method::ContractSet`].
     ContractSet(ContractSetParams),
     /// See [`Method::ContractAgree`].
-    ContractAgree(AgentParams),
+    ContractAgree(ContractAgreeParams),
     /// See [`Method::LoopStatus`].
     LoopStatus(SpaceParams),
     /// See [`Method::LoopAdvance`].
@@ -1031,10 +1052,8 @@ impl Call {
             Call::InboxPost(p) => to_value(p),
             Call::StatusSet(p) => to_value(p),
             Call::GraphGet(p) | Call::ContractGet(p) | Call::LoopStatus(p) => to_value(p),
-            Call::GraphPause(p)
-            | Call::GraphResume(p)
-            | Call::GraphRemoveLane(p)
-            | Call::ContractAgree(p) => to_value(p),
+            Call::GraphPause(p) | Call::GraphResume(p) | Call::GraphRemoveLane(p) => to_value(p),
+            Call::ContractAgree(p) => to_value(p),
             Call::GraphAddLane(p) => to_value(p),
             Call::ChannelPost(p) => to_value(p),
             Call::ChannelList(p) => to_value(p),
@@ -1058,10 +1077,8 @@ impl Call {
             Call::InboxPost(p) => p.space.as_deref(),
             Call::StatusSet(p) => p.space.as_deref(),
             Call::GraphGet(p) | Call::ContractGet(p) | Call::LoopStatus(p) => Some(&p.space),
-            Call::GraphPause(p)
-            | Call::GraphResume(p)
-            | Call::GraphRemoveLane(p)
-            | Call::ContractAgree(p) => Some(&p.space),
+            Call::GraphPause(p) | Call::GraphResume(p) | Call::GraphRemoveLane(p) => Some(&p.space),
+            Call::ContractAgree(p) => Some(&p.space),
             Call::GraphAddLane(p) => Some(&p.space),
             Call::ChannelPost(p) => Some(&p.space),
             Call::ChannelList(p) => Some(&p.space),
@@ -1329,7 +1346,16 @@ mod tests {
                 summary: "the payload both repos agree on".into(),
                 spec: "{\"amount_cents\": \"u64\"}".into(),
             }),
-            Call::ContractAgree(agent()),
+            Call::ContractAgree(ContractAgreeParams {
+                space: "s".into(),
+                agent: "writer-api".into(),
+                version: Some(2),
+            }),
+            Call::ContractAgree(ContractAgreeParams {
+                space: "s".into(),
+                agent: "writer-web".into(),
+                version: None,
+            }),
             Call::LoopStatus(space()),
             Call::LoopAdvance(LoopAdvanceParams {
                 space: "s".into(),
@@ -1433,12 +1459,50 @@ mod tests {
     }
 
     #[test]
+    fn contract_agree_takes_an_optional_version() -> Result<(), RpcError> {
+        let without = Call::parse(
+            "contract.agree",
+            Some(json!({"space": "s", "agent": "writer-api"})),
+        )?;
+        assert_eq!(
+            without,
+            Call::ContractAgree(ContractAgreeParams {
+                space: "s".into(),
+                agent: "writer-api".into(),
+                version: None,
+            })
+        );
+        assert_eq!(
+            without.params(),
+            json!({"space": "s", "agent": "writer-api"}),
+            "an absent version stays off the wire"
+        );
+        let with = Call::parse(
+            "contract.agree",
+            Some(json!({"space": "s", "agent": "writer-api", "version": 3})),
+        )?;
+        assert_eq!(
+            with.params(),
+            json!({"space": "s", "agent": "writer-api", "version": 3})
+        );
+        let negative = Call::parse(
+            "contract.agree",
+            Some(json!({"space": "s", "agent": "writer-api", "version": -1})),
+        );
+        assert_eq!(
+            negative.err().and_then(|e| e.kind()),
+            Some(ErrorCode::InvalidParams)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn m3_methods_need_the_capabilities_their_effects_call_for() {
-        use Capability::{Layout, Propose, Read};
+        use Capability::{Layout, Propose, Read, Steer};
         let expected = [
             (Method::GraphGet, Read),
             (Method::GraphPause, Layout),
-            (Method::GraphResume, Layout),
+            (Method::GraphResume, Steer),
             (Method::GraphAddLane, Layout),
             (Method::GraphRemoveLane, Layout),
             (Method::ChannelPost, Propose),
@@ -1448,7 +1512,7 @@ mod tests {
             (Method::ContractAgree, Propose),
             (Method::LoopStatus, Read),
             (Method::LoopAdvance, Layout),
-            (Method::LoopSetAutonomy, Layout),
+            (Method::LoopSetAutonomy, Steer),
             (Method::SpaceWidenPropose, Propose),
         ];
         for (method, capability) in expected {

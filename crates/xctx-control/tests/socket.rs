@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use xctx_control::protocol::{
-    PaneParams, PaneSplitParams, PaneSplitResult, SpaceListResult, SpaceSummary,
+    AgentParams, ContractAgreeParams, LoopAutonomy, LoopSetAutonomyParams, PaneParams,
+    PaneSplitParams, PaneSplitResult, SpaceListResult, SpaceSummary,
 };
 use xctx_control::{
     Call, Capability, Client, ControlError, ErrorCode, Incoming, PROTOCOL_VERSION, Responder,
@@ -120,6 +121,58 @@ fn methods_outside_the_granted_capabilities_are_forbidden() -> TestResult {
         matches!(&result, Err(ControlError::Rpc(e)) if e.kind() == Some(ErrorCode::Forbidden)),
         "{result:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn the_default_config_forbids_pane_agents_to_resume_agents_or_raise_loop_autonomy() -> TestResult {
+    let steering = [
+        Call::GraphResume(AgentParams {
+            space: "rate-limit".into(),
+            agent: "writer-api".into(),
+        }),
+        Call::LoopSetAutonomy(LoopSetAutonomyParams {
+            space: "rate-limit".into(),
+            autonomy: LoopAutonomy::UntilChecksPass,
+            max_iterations: None,
+            max_turns: None,
+        }),
+    ];
+    let pause = Call::GraphPause(AgentParams {
+        space: "rate-limit".into(),
+        agent: "writer-api".into(),
+    });
+    let answer_all = |incoming: Incoming| incoming.respond(Ok(json!({})));
+
+    let (_dir, path) = temp()?;
+    assert!(
+        !ServerConfig::default()
+            .capabilities
+            .contains(&Capability::Steer)
+    );
+    let _server = Server::bind(&path, ServerConfig::default(), answer_all)?;
+    let mut client = Client::connect(&path)?;
+    for call in &steering {
+        let result = client.call(call);
+        assert!(
+            matches!(&result, Err(ControlError::Rpc(e))
+                if e.kind() == Some(ErrorCode::Forbidden) && e.message.contains("Steer")),
+            "{}: {result:?}",
+            call.method()
+        );
+    }
+    assert!(client.call(&pause).is_ok(), "pausing stays with Layout");
+
+    let (_steer_dir, steer_path) = temp()?;
+    let trusted = ServerConfig {
+        capabilities: Capability::ALL.into_iter().collect(),
+        ..ServerConfig::default()
+    };
+    let _trusted_server = Server::bind(&steer_path, trusted, answer_all)?;
+    let mut trusted_client = Client::connect(&steer_path)?;
+    for call in &steering {
+        assert!(trusted_client.call(call).is_ok(), "{}", call.method());
+    }
     Ok(())
 }
 
@@ -422,6 +475,42 @@ fn xctx_ctl_calls_the_window_with_the_space_from_the_environment() -> TestResult
     assert_eq!(calls.len(), 2);
     assert!(
         matches!(&calls[0], Call::PaneSplit(p) if p.space == "rate-limit" && p.pane == Some(PaneId(3)))
+    );
+    Ok(())
+}
+
+#[test]
+fn xctx_ctl_takes_the_calling_agent_from_the_environment() -> TestResult {
+    let (_dir, path) = temp()?;
+    let seen: Arc<Mutex<Vec<Call>>> = Arc::default();
+    let _server = Server::bind(&path, ServerConfig::default(), {
+        let seen = Arc::clone(&seen);
+        move |incoming: Incoming| {
+            if let Ok(mut seen) = seen.lock() {
+                seen.push(incoming.call().clone());
+            }
+            incoming.respond(Ok(json!({})));
+        }
+    })?;
+    let out = Command::new(env!("CARGO_BIN_EXE_xctx-ctl"))
+        .args(["contract.agree", "version=2"])
+        .env("XCTX_CONTROL_SOCKET", &path)
+        .env("XCTX_SPACE", "rate-limit")
+        .env("XCTX_AGENT_ID", "writer-api")
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = seen.lock().map_err(|e| e.to_string())?.clone();
+    assert_eq!(
+        calls,
+        [Call::ContractAgree(ContractAgreeParams {
+            space: "rate-limit".into(),
+            agent: "writer-api".into(),
+            version: Some(2),
+        })]
     );
     Ok(())
 }

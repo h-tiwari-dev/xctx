@@ -4,9 +4,11 @@
 //! xctx-ctl [--socket <path>] [--compact] <method> [key=value | key:=<json>]...
 //! ```
 //!
-//! `key=value` passes a string, except that `pane`, `since_id`, `limit`, `max_iterations` and `max_turns` are
-//! numbers, `all`, `checks_passed` and `production` booleans, and `repos` a comma-separated list. `key:=<json>` passes any JSON value. Methods about a space take `space` from `$XCTX_SPACE` when it is not
-//! given, so an agent in a space's pane can say `xctx-ctl pane.split axis=vertical`.
+//! `key=value` passes a string, except that `pane`, `since_id`, `limit`, `max_iterations`, `max_turns` and
+//! `version` are numbers, `all`, `checks_passed` and `production` booleans, and `repos` a comma-separated list.
+//! `key:=<json>` passes any JSON value. Methods about a space take `space` from `$XCTX_SPACE` when it is not
+//! given, so an agent in a space's pane can say `xctx-ctl pane.split axis=vertical`. Likewise `channel.post`
+//! takes `from`, `contract.set` `author` and `contract.agree` `agent` from `$XCTX_AGENT_ID`.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -19,8 +21,19 @@ use crate::protocol::{Call, Method, RpcError};
 /// The environment variable a space's panes have, naming the space. `xctx-ctl` uses it as the default `space`.
 pub const SPACE_ENV: &str = "XCTX_SPACE";
 
+/// The environment variable an agent's pane has, naming the agent in its space's graph. `xctx-ctl` uses it as the
+/// default for the parameter that names the calling agent (see [`agent_key`]).
+pub const AGENT_ENV: &str = "XCTX_AGENT_ID";
+
 /// Parameters that are numbers when given as `key=value`.
-const INTEGER_KEYS: &[&str] = &["pane", "since_id", "limit", "max_iterations", "max_turns"];
+const INTEGER_KEYS: &[&str] = &[
+    "pane",
+    "since_id",
+    "limit",
+    "max_iterations",
+    "max_turns",
+    "version",
+];
 /// Parameters that are booleans when given as `key=value`.
 const BOOL_KEYS: &[&str] = &["all", "checks_passed", "production"];
 /// Parameters that are comma-separated lists when given as `key=value`.
@@ -63,10 +76,24 @@ pub fn defaults_space(method: Method) -> bool {
     )
 }
 
-/// Parse the arguments after the program name. `default_space` is `$XCTX_SPACE`.
+/// The parameter of `method` that names the calling agent, which `xctx-ctl` takes from `$XCTX_AGENT_ID` when it
+/// is not given: `from` for `channel.post`, `author` for `contract.set`, `agent` for `contract.agree`. `None` for
+/// methods that name no caller (`graph.pause` and the like name the agent acted on, so they get no default).
+pub fn agent_key(method: Method) -> Option<&'static str> {
+    match method {
+        Method::ChannelPost => Some("from"),
+        Method::ContractSet => Some("author"),
+        Method::ContractAgree => Some("agent"),
+        _ => None,
+    }
+}
+
+/// Parse the arguments after the program name. `default_space` is `$XCTX_SPACE` and `default_agent`
+/// `$XCTX_AGENT_ID`; an empty one counts as unset.
 pub fn parse_args(
     args: impl IntoIterator<Item = String>,
     default_space: Option<&str>,
+    default_agent: Option<&str>,
 ) -> Result<Command, UsageError> {
     let mut socket = None;
     let mut compact = false;
@@ -109,6 +136,12 @@ pub fn parse_args(
         && let Some(space) = default_space.filter(|s| !s.is_empty())
     {
         params.insert("space".into(), Value::String(space.to_owned()));
+    }
+    if let Some(key) = agent_key(m)
+        && !params.contains_key(key)
+        && let Some(agent) = default_agent.filter(|s| !s.is_empty())
+    {
+        params.insert(key.into(), Value::String(agent.to_owned()));
     }
     let call = Call::parse(m.name(), Some(Value::Object(params)))?;
     Ok(Command::Call {
@@ -180,7 +213,9 @@ pub fn help() -> String {
         out,
         "\nenvironment:\n  \
          {CONTROL_SOCKET_ENV:<20} the socket (else control.sock in the xctx data directory)\n  \
-         {SPACE_ENV:<20} the default space=, set in every pane of a space\n\n\
+         {SPACE_ENV:<20} the default space=, set in every pane of a space\n  \
+         {AGENT_ENV:<20} the default from= (channel.post), author= (contract.set) and agent= \
+         (contract.agree), set in every agent's pane\n\n\
          The result is printed as JSON. Exit status: 0 ok, 1 the window refused or the call failed, \
          2 bad arguments, 3 no window.\n\
          Nothing here approves, launches or widens: space.draft posts a Plan Gate and space.widen_propose a \
@@ -194,8 +229,8 @@ mod tests {
     use super::*;
     use crate::StatusLevel;
     use crate::protocol::{
-        AgentParams, ChannelListParams, ChannelPostParams, ContractSetParams, GraphAddLaneParams,
-        HelperKind, InboxListParams, LaneRole, LoopAdvanceParams, LoopAutonomy,
+        AgentParams, ChannelListParams, ChannelPostParams, ContractAgreeParams, ContractSetParams,
+        GraphAddLaneParams, HelperKind, InboxListParams, LaneRole, LoopAdvanceParams, LoopAutonomy,
         LoopSetAutonomyParams, PaneParams, PaneSplitParams, SpaceDraftParams, SpaceParams,
         SpaceWidenProposeParams, StatusSetParams,
     };
@@ -206,7 +241,7 @@ mod tests {
     }
 
     fn call(s: &str, space: Option<&str>) -> Result<Call, UsageError> {
-        match parse_args(args(s), space)? {
+        match parse_args(args(s), space, None)? {
             Command::Call { call, .. } => Ok(call),
             other => Err(UsageError(format!("not a call: {other:?}"))),
         }
@@ -214,8 +249,8 @@ mod tests {
 
     #[test]
     fn no_args_and_help_print_help() -> Result<(), UsageError> {
-        assert_eq!(parse_args(args(""), None)?, Command::Help);
-        assert_eq!(parse_args(args("--help"), None)?, Command::Help);
+        assert_eq!(parse_args(args(""), None, None)?, Command::Help);
+        assert_eq!(parse_args(args("--help"), None, None)?, Command::Help);
         assert!(help().contains("pane.split"));
         Ok(())
     }
@@ -281,7 +316,7 @@ mod tests {
             })
         );
         let with_space = vec!["space.draft".to_owned(), "task=set x:=y".to_owned()];
-        let Command::Call { call: draft, .. } = parse_args(with_space, None)? else {
+        let Command::Call { call: draft, .. } = parse_args(with_space, None, None)? else {
             return Err(UsageError("space.draft is not a call".into()));
         };
         assert_eq!(
@@ -307,7 +342,7 @@ mod tests {
 
     #[test]
     fn options_are_read_before_the_method() -> Result<(), UsageError> {
-        let parsed = parse_args(args("--socket /tmp/s.sock --compact ping"), None)?;
+        let parsed = parse_args(args("--socket /tmp/s.sock --compact ping"), None, None)?;
         assert_eq!(
             parsed,
             Command::Call {
@@ -369,6 +404,7 @@ mod tests {
                 ]
                 .map(str::to_owned),
                 here,
+                None,
             )?,
             Command::Call {
                 socket: None,
@@ -408,7 +444,19 @@ mod tests {
         );
         assert_eq!(
             call("contract.agree agent=writer-api", here)?,
-            Call::ContractAgree(agent())
+            Call::ContractAgree(ContractAgreeParams {
+                space: "here".into(),
+                agent: "writer-api".into(),
+                version: None,
+            })
+        );
+        assert_eq!(
+            call("contract.agree agent=writer-api version=3", here)?,
+            Call::ContractAgree(ContractAgreeParams {
+                space: "here".into(),
+                agent: "writer-api".into(),
+                version: Some(3),
+            })
         );
         assert_eq!(call("loop.status", here)?, Call::LoopStatus(space()));
         assert_eq!(
@@ -452,6 +500,66 @@ mod tests {
         Ok(())
     }
 
+    fn call_by(s: &str, agent: Option<&str>) -> Result<Call, UsageError> {
+        match parse_args(args(s), Some("here"), agent)? {
+            Command::Call { call, .. } => Ok(call),
+            other => Err(UsageError(format!("not a call: {other:?}"))),
+        }
+    }
+
+    #[test]
+    fn the_calling_agent_comes_from_xctx_agent_id_unless_given() -> Result<(), UsageError> {
+        let me = Some("writer-api");
+        assert_eq!(
+            call_by("channel.post kind=finding body=done", me)?,
+            Call::ChannelPost(ChannelPostParams {
+                space: "here".into(),
+                from: "writer-api".into(),
+                to: None,
+                kind: "finding".into(),
+                body: "done".into(),
+            })
+        );
+        assert_eq!(
+            call_by("contract.set title=t summary=s spec=x", me)?,
+            Call::ContractSet(ContractSetParams {
+                space: "here".into(),
+                author: "writer-api".into(),
+                title: "t".into(),
+                summary: "s".into(),
+                spec: "x".into(),
+            })
+        );
+        assert_eq!(
+            call_by("contract.agree version=2", me)?,
+            Call::ContractAgree(ContractAgreeParams {
+                space: "here".into(),
+                agent: "writer-api".into(),
+                version: Some(2),
+            })
+        );
+        assert_eq!(
+            call_by("contract.agree agent=writer-web", me)?,
+            Call::ContractAgree(ContractAgreeParams {
+                space: "here".into(),
+                agent: "writer-web".into(),
+                version: None,
+            }),
+            "an explicit agent wins"
+        );
+        assert!(
+            call_by("graph.pause", me).is_err(),
+            "the agent acted on is never defaulted"
+        );
+        assert!(call_by("contract.agree", None).is_err());
+        assert!(
+            call_by("contract.agree", Some("")).is_err(),
+            "an empty XCTX_AGENT_ID counts as unset"
+        );
+        assert!(call_by("channel.post kind=finding body=done", Some("")).is_err());
+        Ok(())
+    }
+
     #[test]
     fn help_lists_every_m3_method() {
         let text = help();
@@ -459,6 +567,7 @@ mod tests {
             assert!(text.contains(m.name()), "{m}");
         }
         assert!(text.contains("space.widen_propose"));
+        assert!(text.contains(AGENT_ENV));
     }
 
     #[test]
@@ -474,11 +583,13 @@ mod tests {
             "loop.set_autonomy space=s autonomy=within_budget max_turns=-1",
             "space.widen_propose space=s production=sure",
             "contract.set space=s author=a title=t summary=s",
+            "contract.agree space=s agent=a version=latest",
+            "contract.agree space=s agent=a version=-1",
         ] {
-            assert!(parse_args(args(bad), None).is_err(), "{bad}");
+            assert!(parse_args(args(bad), None, None).is_err(), "{bad}");
         }
         assert!(
-            parse_args(args("graph.get"), None).is_err(),
+            parse_args(args("graph.get"), None, None).is_err(),
             "without $XCTX_SPACE a space must be given"
         );
     }
@@ -494,7 +605,7 @@ mod tests {
             "--bogus ping",
             "pane.close =1",
         ] {
-            assert!(parse_args(args(bad), None).is_err(), "{bad}");
+            assert!(parse_args(args(bad), None, None).is_err(), "{bad}");
         }
     }
 }

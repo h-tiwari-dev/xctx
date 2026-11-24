@@ -188,8 +188,8 @@ pub struct Space {
     pub created_at: u64,
     /// Its repositories.
     pub repos: Vec<SpaceRepo>,
-    /// True once a [`widen`] the user approved switched the space's terminals to `MISE_ENV=production`. Absent
-    /// in stores written before Milestone 3, which read as false.
+    /// True once a [`widen`] the user approved added `production` to the space's `MISE_ENV` (see
+    /// [`Space::effective_mise_env`]). Absent in stores written before Milestone 3, which read as false.
     #[serde(default)]
     pub production: bool,
 }
@@ -206,14 +206,15 @@ impl Space {
         self.id.as_str()
     }
 
-    /// The `MISE_ENV` the space's terminals run with: `production` once [`Space::production`] is set, else its slug
-    /// ([`Space::mise_env`]). Under `production` mise does not load `mise.<slug>.toml`; the space's `PORT` and
-    /// `XCTX_SPACE` still reach its terminals through [`Space::env`].
-    pub fn effective_mise_env(&self) -> &str {
+    /// The `MISE_ENV` the space's terminals run with: its slug ([`Space::mise_env`]), or `production,<slug>` once
+    /// [`Space::production`] is set. mise loads every listed environment's file in order and the later one wins, so
+    /// under production `mise.production.toml` is layered in and `mise.<slug>.toml` (the space's `PORT`,
+    /// `XCTX_SPACE` and the values given with [`mise::set_space_var`]) still applies on top of it.
+    pub fn effective_mise_env(&self) -> String {
         if self.production {
-            PRODUCTION_MISE_ENV
+            format!("{PRODUCTION_MISE_ENV},{}", self.mise_env())
         } else {
-            self.mise_env()
+            self.mise_env().to_owned()
         }
     }
 
@@ -226,12 +227,12 @@ impl Space {
     /// [`Space::effective_mise_env`]).
     pub fn env(&self) -> Vec<(String, String)> {
         let mut env = mise::space_env_vars(self.id.as_str(), self.port);
-        env.push(("MISE_ENV".to_owned(), self.effective_mise_env().to_owned()));
+        env.push(("MISE_ENV".to_owned(), self.effective_mise_env()));
         env
     }
 }
 
-/// The `MISE_ENV` a space switched to production runs with.
+/// The `MISE_ENV` a space switched to production adds before its slug (see [`Space::effective_mise_env`]).
 pub const PRODUCTION_MISE_ENV: &str = "production";
 
 /// The branch for the space `slug`: `space/<slug>`.
@@ -324,11 +325,16 @@ fn slug_in_use(targets: &[(DraftRepo, git::MainWorktree)], slug: &str) -> Result
     Ok(false)
 }
 
-/// Undo what a failed launch made, newest first. Errors here are dropped: the launch error is what the user sees.
+/// Undo what a failed launch or widening made, newest first, and remove a `<repo>-worktrees/` folder left empty.
+/// Errors here are dropped: the launch error is what the user sees.
 fn roll_back(slug: &str, made: &[SpaceRepo]) {
     for repo in made.iter().rev() {
         let _ = git::remove_worktree(&repo.repo, &repo.worktree, true);
         let _ = mise::remove_space_mise_file(&repo.worktree, &repo.repo, slug);
+        if let Some(parent) = repo.worktree.parent() {
+            // Only succeeds while the folder is empty, so other worktrees (or a bare repository's folder) stay.
+            let _ = std::fs::remove_dir(parent);
+        }
         if repo.branch_created {
             let _ = git::delete_branch(&repo.repo, &repo.branch);
         }
@@ -497,12 +503,13 @@ fn same_repo(a: &Path, b: &Path) -> bool {
 /// main checkout, so two paths into one repository count once) gets a worktree on `space/<slug>` started from its
 /// main checkout's HEAD (its default branch for a bare layout) and a git-ignored `mise.<slug>.toml` with the space's
 /// `PORT` and `XCTX_SPACE`, under a [`SpaceRepo::name`] unique within the space (`-2`, `-3`, ... as in [`launch`]).
-/// With `request.production`, [`Space::production`] is set so [`Space::effective_mise_env`] is `production`.
+/// With `request.production`, [`Space::production`] is set so [`Space::effective_mise_env`] is `production,<slug>`.
 ///
 /// Fails with [`Error::SpaceNotFound`] or [`Error::SpaceNotActive`] for a space that cannot be widened,
 /// [`Error::EmptyWiden`] when nothing would change, and [`Error::SpaceBranchTaken`] when a new repository already
-/// has a `space/<slug>` branch or worktree folder. All or nothing: if any repository or the store update fails,
-/// every worktree, mise file and branch this call made is removed and the saved space is unchanged.
+/// has a `space/<slug>` branch or worktree folder (also when one appears while the worktrees are made). All or
+/// nothing: if any repository or the store update fails, every worktree, mise file and branch this call made is
+/// removed and the saved space is unchanged.
 pub fn widen(store: &mut Store, id: &SpaceId, request: WidenRequest) -> Result<WidenReport> {
     let mut space = active_space(store, id)?;
     if request.repos.is_empty() && !request.production {
@@ -538,6 +545,15 @@ pub fn widen(store: &mut Store, id: &SpaceId, request: WidenRequest) -> Result<W
     let mut made: Vec<SpaceRepo> = Vec::new();
     for (draft_repo, main) in &targets {
         match launch_repo(draft_repo, main, &slug, &space.title, space.port) {
+            Ok(repo) if !repo.branch_created => {
+                // The branch appeared after the check above: the worktree is on someone else's branch.
+                made.push(repo);
+                roll_back(&slug, &made);
+                return Err(Error::SpaceBranchTaken {
+                    repo: main.path.clone(),
+                    branch,
+                });
+            }
             Ok(repo) => made.push(repo),
             Err(e) => {
                 roll_back(&slug, &made);
