@@ -9,7 +9,9 @@ use gpui::{
     AnyElement, App, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled,
     Subscription, Window, div,
 };
+use xctx_control::{ErrorCode, RpcError};
 use xctx_core::{Space, SpaceId, SpaceShape};
+use xctx_layout::LayoutError;
 use xctx_layout::{FocusDirection, PaneId, PaneKind, PaneRole, RolePane, Shape, SplitAxis};
 use xctx_term::TerminalSession;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
@@ -20,6 +22,16 @@ use crate::persist::{restore_layout, save_layout};
 use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
 use crate::spawn::{AgentStart, pane_launch};
 use crate::workspace::{View, Workspace, open_space_refusal, wait_message};
+
+/// A layout error of space `id` as a control error: unknown panes are not found, the rest conflicts.
+pub(crate) fn layout_error(id: &SpaceId, error: LayoutError) -> RpcError {
+    match error {
+        LayoutError::UnknownPane(pane) => {
+            RpcError::not_found(format!("space {id} has no pane {}", pane.0))
+        }
+        other => RpcError::conflict(format!("{id}: {other}")),
+    }
+}
 
 /// How long after the last divider drag movement the layout is saved.
 const DRAG_PERSIST_DELAY: Duration = Duration::from_millis(400);
@@ -337,23 +349,76 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Split the focused pane with a new shell in its repo.
+    /// Split the focused pane of the space being shown with a new shell in its repo.
     pub(crate) fn split(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.active_space_id() else {
             return;
         };
-        let Some(tab) = self.tabs.get_mut(&id) else {
-            return;
-        };
-        match tab.layout.split_focused(axis) {
-            Ok(pane) => {
-                self.spawn_pane(&id, &pane, &AgentStart::Continue, window, cx);
-                self.persist(&id, cx);
-                self.focus_active_pane(window, cx);
-                cx.notify();
-            }
-            Err(e) => self.error(format!("could not split: {e}"), cx),
+        if let Err(e) = self.split_in(&id, None, axis, PaneKind::Shell, None, window, cx) {
+            self.show_op_error(e, cx);
         }
+    }
+
+    /// Show a failed pane operation: refusals (such as closing the last pane) as info, failures as errors.
+    pub(crate) fn show_op_error(&mut self, error: RpcError, cx: &mut Context<Self>) {
+        match error.kind() {
+            Some(ErrorCode::Conflict) => self.info(error.message, cx),
+            _ => self.error(error.message, cx),
+        }
+    }
+
+    /// Whether `id` is the space being shown, whose panes have the keyboard focus.
+    fn is_shown(&self, id: &SpaceId) -> bool {
+        self.view == View::Space(id.clone())
+    }
+
+    /// After a layout change in `id`: save it, focus its focused pane if it is shown, and redraw.
+    fn layout_changed(&mut self, id: &SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+        self.persist(id, cx);
+        if self.is_shown(id) {
+            self.focus_active_pane(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Split `target` (the focused pane when `None`) of an open space with a new pane of `kind` in `repo` (the
+    /// target's repo when `None`), and start it. Returns the new pane.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn split_in(
+        &mut self,
+        id: &SpaceId,
+        target: Option<PaneId>,
+        axis: SplitAxis,
+        kind: PaneKind,
+        repo: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<PaneId, RpcError> {
+        let tab = self.open_tab_mut(id)?;
+        if let Some(repo) = &repo
+            && !tab.space.repos.iter().any(|r| &r.name == repo)
+        {
+            let names: Vec<&str> = tab.space.repos.iter().map(|r| r.name.as_str()).collect();
+            return Err(RpcError::invalid_params(format!(
+                "space {id} has no repo {repo}; its repos are {}",
+                names.join(", ")
+            )));
+        }
+        let target = target.unwrap_or_else(|| tab.layout.focused());
+        let pane = tab
+            .layout
+            .split(target, axis, kind, repo)
+            .map_err(|e| layout_error(id, e))?;
+        self.spawn_pane(id, &pane, &AgentStart::Continue, window, cx);
+        self.layout_changed(id, window, cx);
+        Ok(pane.id)
+    }
+
+    /// The open tab of `id`, or an error saying the space is not open.
+    fn open_tab_mut(&mut self, id: &SpaceId) -> Result<&mut SpaceTab, RpcError> {
+        self.tabs
+            .get_mut(id)
+            .ok_or_else(|| RpcError::conflict(format!("space {id} is not open")))
     }
 
     /// Close `pane` of the space being shown, stopping its program. The last pane stays open.
@@ -361,25 +426,36 @@ impl Workspace {
         let Some(id) = self.active_space_id() else {
             return;
         };
-        let Some(tab) = self.tabs.get_mut(&id) else {
-            return;
-        };
+        if let Err(e) = self.close_pane_in(&id, pane, window, cx) {
+            self.show_op_error(e, cx);
+        }
+    }
+
+    /// Close `pane` of an open space, stopping its program. The last pane stays open (a
+    /// [`ErrorCode::Conflict`]).
+    pub(crate) fn close_pane_in(
+        &mut self,
+        id: &SpaceId,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), RpcError> {
+        let tab = self.open_tab_mut(id)?;
+        if !tab.layout.tree().contains(pane) {
+            return Err(RpcError::not_found(format!(
+                "space {id} has no pane {}",
+                pane.0
+            )));
+        }
         if tab.layout.tree().panes().len() <= 1 {
-            self.info(
+            return Err(RpcError::conflict(
                 "This is the space's last pane; Discard or Ship the space to close it, or ⌘⇧W to close the window",
-                cx,
-            );
-            return;
+            ));
         }
-        match tab.layout.close(pane) {
-            Ok(_) => {
-                tab.terminals.remove(&pane);
-                self.persist(&id, cx);
-                self.focus_active_pane(window, cx);
-                cx.notify();
-            }
-            Err(e) => self.error(format!("could not close the pane: {e}"), cx),
-        }
+        tab.layout.close(pane).map_err(|e| layout_error(id, e))?;
+        tab.terminals.remove(&pane);
+        self.layout_changed(id, window, cx);
+        Ok(())
     }
 
     /// Close the focused pane of the space being shown.
@@ -391,20 +467,30 @@ impl Workspace {
 
     /// Focus `pane` of the space being shown, in the tree and its terminal. A change of focus is saved.
     pub(crate) fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.active_space_id() else {
-            return;
-        };
-        let Some(tab) = self.tabs.get_mut(&id) else {
-            return;
-        };
-        let changed = tab.layout.focused() != pane;
-        if tab.layout.focus(pane).is_ok() {
-            if changed {
-                self.persist(&id, cx);
-            }
-            self.focus_active_pane(window, cx);
-            cx.notify();
+        if let Some(id) = self.active_space_id() {
+            let _ = self.focus_pane_in(&id, pane, window, cx);
         }
+    }
+
+    /// Focus `pane` of an open space, and its terminal if the space is shown. A change of focus is saved.
+    pub(crate) fn focus_pane_in(
+        &mut self,
+        id: &SpaceId,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), RpcError> {
+        let tab = self.open_tab_mut(id)?;
+        let changed = tab.layout.focused() != pane;
+        tab.layout.focus(pane).map_err(|e| layout_error(id, e))?;
+        if changed {
+            self.persist(id, cx);
+        }
+        if self.is_shown(id) {
+            self.focus_active_pane(window, cx);
+        }
+        cx.notify();
+        Ok(())
     }
 
     /// Move focus to the neighbouring pane in `direction`.
@@ -481,6 +567,30 @@ impl Workspace {
         });
     }
 
+    /// Zoom `pane` of an open space (focusing it), or toggle the zoom of its focused pane when `None`. Returns the
+    /// zoomed pane afterwards.
+    pub(crate) fn zoom_in(
+        &mut self,
+        id: &SpaceId,
+        pane: Option<PaneId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<PaneId>, RpcError> {
+        let tab = self.open_tab_mut(id)?;
+        let zoomed = match pane {
+            Some(pane) => tab
+                .layout
+                .set_zoom(Some(pane))
+                .map_err(|e| layout_error(id, e))?,
+            None => {
+                tab.layout.toggle_zoom();
+                tab.layout.tree().zoomed()
+            }
+        };
+        self.layout_changed(id, window, cx);
+        Ok(zoomed)
+    }
+
     fn set_split_ratio(&mut self, split: xctx_layout::SplitId, ratio: f32, cx: &mut Context<Self>) {
         let Some(id) = self.active_space_id() else {
             return;
@@ -500,43 +610,51 @@ impl Workspace {
         let Some(id) = self.active_space_id() else {
             return;
         };
+        if let Err(e) = self.reshape_in(&id, shape, window, cx) {
+            self.show_op_error(e, cx);
+        }
+    }
+
+    /// Reshape an open space, as [`Workspace::reshape`] does for the space being shown.
+    pub(crate) fn reshape_in(
+        &mut self,
+        id: &SpaceId,
+        shape: Shape,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), RpcError> {
         if self
-            .tabs
-            .get(&id)
-            .is_some_and(|tab| is_current_shape(tab.space.shape, shape))
+            .open_tab_mut(id)
+            .is_ok_and(|tab| is_current_shape(tab.space.shape, shape))
         {
-            return;
+            return Ok(());
         }
         if let Some(busy) = &self.busy {
-            self.error(wait_message(busy), cx);
-            return;
+            return Err(RpcError::conflict(wait_message(busy)));
         }
         let Some(store) = self.store.as_mut() else {
-            self.error("the store is not available", cx);
-            return;
+            return Err(RpcError::internal("the store is not available"));
         };
-        let Some(tab) = self.tabs.get_mut(&id) else {
-            return;
+        let Some(tab) = self.tabs.get_mut(id) else {
+            return Err(RpcError::conflict(format!("space {id} is not open")));
         };
-        let (result, warning) = match reshape_space(store, &mut tab.space, &mut tab.layout, shape) {
-            Ok(done) => done,
-            Err(e) => {
-                self.error(e, cx);
-                return;
-            }
-        };
+        let (result, warning) = reshape_space(store, &mut tab.space, &mut tab.layout, shape)
+            .map_err(RpcError::internal)?;
         for pane in &result.removed {
             tab.terminals.remove(&pane.id);
         }
         for pane in &result.added {
-            self.spawn_pane(&id, pane, &AgentStart::Continue, window, cx);
+            self.spawn_pane(id, pane, &AgentStart::Continue, window, cx);
         }
         self.refresh_spaces();
         if let Some(warning) = warning {
             self.error(warning, cx);
         }
-        self.focus_active_pane(window, cx);
+        if self.is_shown(id) {
+            self.focus_active_pane(window, cx);
+        }
         cx.notify();
+        Ok(())
     }
 
     /// Stop every terminal of the space and close its tab, after saving its layout. Returns the

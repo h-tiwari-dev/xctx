@@ -197,6 +197,7 @@ impl Workspace {
                             this.task_prompt.update(cx, |prompt, cx| prompt.clear(cx));
                         }
                         this.refresh_spaces();
+                        this.check_mise(vec![launched.space.clone()], cx);
                         this.open_launched_space(
                             launched.space,
                             launched.layout,

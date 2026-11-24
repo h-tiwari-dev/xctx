@@ -6208,12 +6208,15 @@ dependencies = [
 name = "xctx"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpui",
  "gpui_platform",
  "serde",
  "serde_json",
  "tempfile",
+ "xctx-control",
  "xctx-core",
+ "xctx-inbox",
  "xctx-layout",
  "xctx-term",
  "xctx-term-view",

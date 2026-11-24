@@ -237,6 +237,7 @@ mod tests {
             Call::SpaceDraft(SpaceDraftParams {
                 task: "fix".into(),
                 repos: Some(vec!["api".into(), "web".into()]),
+                rationale: None,
             })
         );
         assert_eq!(
