@@ -1,7 +1,8 @@
 //! The space model and its lifecycle. A [`SpaceDraft`] is a proposal that touches nothing on disk; [`launch`] turns
 //! it into a [`Space`] with a worktree per repository on branch `space/<slug>`, each with its own git-ignored
-//! `mise.<slug>.toml`. [`ship`] pushes and opens pull requests, then removes the worktrees; [`discard`] only removes
-//! the worktrees. Both keep the branches.
+//! `mise.<slug>.toml`. [`widen`] adds repositories to an active space, or switches it to `MISE_ENV=production`.
+//! [`ship`] pushes and opens pull requests, then removes the worktrees; [`discard`] only removes the worktrees. Both
+//! keep the branches.
 
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -187,6 +188,10 @@ pub struct Space {
     pub created_at: u64,
     /// Its repositories.
     pub repos: Vec<SpaceRepo>,
+    /// True once a [`widen`] the user approved switched the space's terminals to `MISE_ENV=production`. Absent
+    /// in stores written before Milestone 3, which read as false.
+    #[serde(default)]
+    pub production: bool,
 }
 
 impl Space {
@@ -195,9 +200,21 @@ impl Space {
         space_branch(self.id.as_str())
     }
 
-    /// The `MISE_ENV` the space's terminals run with: its slug.
+    /// The space's own `MISE_ENV` name: its slug, which names its `mise.<slug>.toml`. See
+    /// [`Space::effective_mise_env`] for the value its terminals actually run with.
     pub fn mise_env(&self) -> &str {
         self.id.as_str()
+    }
+
+    /// The `MISE_ENV` the space's terminals run with: `production` once [`Space::production`] is set, else its slug
+    /// ([`Space::mise_env`]). Under `production` mise does not load `mise.<slug>.toml`; the space's `PORT` and
+    /// `XCTX_SPACE` still reach its terminals through [`Space::env`].
+    pub fn effective_mise_env(&self) -> &str {
+        if self.production {
+            PRODUCTION_MISE_ENV
+        } else {
+            self.mise_env()
+        }
     }
 
     /// The name of the space's mise file in each worktree.
@@ -205,13 +222,17 @@ impl Space {
         mise::mise_file_name(self.id.as_str())
     }
 
-    /// The environment the space's terminals run with: `PORT`, `XCTX_SPACE` and `MISE_ENV`.
+    /// The environment the space's terminals run with: `PORT`, `XCTX_SPACE` and `MISE_ENV` (its
+    /// [`Space::effective_mise_env`]).
     pub fn env(&self) -> Vec<(String, String)> {
         let mut env = mise::space_env_vars(self.id.as_str(), self.port);
-        env.push(("MISE_ENV".to_owned(), self.mise_env().to_owned()));
+        env.push(("MISE_ENV".to_owned(), self.effective_mise_env().to_owned()));
         env
     }
 }
+
+/// The `MISE_ENV` a space switched to production runs with.
+pub const PRODUCTION_MISE_ENV: &str = "production";
 
 /// The branch for the space `slug`: `space/<slug>`.
 pub fn space_branch(slug: &str) -> String {
@@ -417,6 +438,7 @@ pub fn launch(store: &mut Store, draft: SpaceDraft) -> Result<Space> {
         port,
         created_at: now_secs(),
         repos: made,
+        production: false,
     };
     if let Err(e) = store.upsert_space(space.clone()) {
         roll_back(&slug, &space.repos);
@@ -437,6 +459,103 @@ fn active_space(store: &Store, id: &SpaceId) -> Result<Space> {
         });
     }
     Ok(space)
+}
+
+/// What a user approved adding to an active space: repositories, a switch to `MISE_ENV=production`, or both.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WidenRequest {
+    /// Repositories to add a worktree of, each by its main checkout or any directory inside it. Ones the space
+    /// already has are skipped.
+    #[serde(default)]
+    pub repos: Vec<DraftRepo>,
+    /// Switch the space's terminals to `MISE_ENV=production`.
+    #[serde(default)]
+    pub production: bool,
+}
+
+/// What [`widen`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WidenReport {
+    /// The repositories added, in request order, as they are now saved in the space.
+    pub added_repos: Vec<SpaceRepo>,
+    /// Whether the space now runs with `MISE_ENV=production` (it may already have before this widening).
+    pub production_enabled: bool,
+}
+
+/// Whether two repository paths are the same directory, comparing canonical paths when both can be resolved.
+fn same_repo(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Widen an active space with what the user approved. Each repository the space does not already have (compared by
+/// main checkout, so two paths into one repository count once) gets a worktree on `space/<slug>` started from its
+/// main checkout's HEAD (its default branch for a bare layout) and a git-ignored `mise.<slug>.toml` with the space's
+/// `PORT` and `XCTX_SPACE`, under a [`SpaceRepo::name`] unique within the space (`-2`, `-3`, ... as in [`launch`]).
+/// With `request.production`, [`Space::production`] is set so [`Space::effective_mise_env`] is `production`.
+///
+/// Fails with [`Error::SpaceNotFound`] or [`Error::SpaceNotActive`] for a space that cannot be widened,
+/// [`Error::EmptyWiden`] when nothing would change, and [`Error::SpaceBranchTaken`] when a new repository already
+/// has a `space/<slug>` branch or worktree folder. All or nothing: if any repository or the store update fails,
+/// every worktree, mise file and branch this call made is removed and the saved space is unchanged.
+pub fn widen(store: &mut Store, id: &SpaceId, request: WidenRequest) -> Result<WidenReport> {
+    let mut space = active_space(store, id)?;
+    if request.repos.is_empty() && !request.production {
+        return Err(Error::EmptyWiden(id.clone()));
+    }
+    let slug = space.id.as_str().to_owned();
+    let branch = space.branch();
+    let mut targets: Vec<(DraftRepo, git::MainWorktree)> = Vec::new();
+    for draft_repo in &request.repos {
+        let main = git::main_worktree(&draft_repo.path)?;
+        let known = space.repos.iter().any(|r| same_repo(&r.repo, &main.path))
+            || targets.iter().any(|(_, m)| same_repo(&m.path, &main.path));
+        if !known {
+            targets.push((draft_repo.clone(), main));
+        }
+    }
+    if targets.is_empty() && (!request.production || space.production) {
+        return Err(Error::EmptyWiden(id.clone()));
+    }
+    for (_, main) in &targets {
+        if git::branch_exists(&main.path, &branch)? || git::worktree_path(main, &slug).exists() {
+            return Err(Error::SpaceBranchTaken {
+                repo: main.path.clone(),
+                branch,
+            });
+        }
+    }
+    let mut names: Vec<String> = space.repos.iter().map(|r| r.name.clone()).collect();
+    for (draft_repo, _) in &mut targets {
+        draft_repo.name = unique_repo_name(&draft_repo.name, &names);
+        names.push(draft_repo.name.clone());
+    }
+    let mut made: Vec<SpaceRepo> = Vec::new();
+    for (draft_repo, main) in &targets {
+        match launch_repo(draft_repo, main, &slug, &space.title, space.port) {
+            Ok(repo) => made.push(repo),
+            Err(e) => {
+                roll_back(&slug, &made);
+                return Err(e);
+            }
+        }
+    }
+    space.repos.extend(made.iter().cloned());
+    space.production |= request.production;
+    let production_enabled = space.production;
+    if let Err(e) = store.upsert_space(space) {
+        roll_back(&slug, &made);
+        return Err(e);
+    }
+    Ok(WidenReport {
+        added_repos: made,
+        production_enabled,
+    })
 }
 
 /// Fail with [`Error::DirtyWorktrees`] when any worktree of the space that still exists has uncommitted changes.

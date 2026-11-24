@@ -390,6 +390,7 @@ mod tests {
             port: 4007,
             created_at: 0,
             repos: vec![repo("api"), repo("web")],
+            production: false,
         }
     }
 

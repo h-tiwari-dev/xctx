@@ -8,8 +8,8 @@
 //! - [`Server`] binds the socket and hands each authorised request to the app as an [`Incoming`].
 //! - [`Client`] connects to a running window and makes calls; `xctx-ctl` is a thin CLI over it.
 //!
-//! Nothing on the socket can approve an Inbox item or launch a space: `space.draft` only proposes. Approval
-//! stays with the user in the window.
+//! Nothing on the socket can approve an Inbox item, launch a space or widen one: `space.draft` and
+//! `space.widen_propose` only propose. Approval stays with the user in the window.
 
 #![warn(missing_docs)]
 

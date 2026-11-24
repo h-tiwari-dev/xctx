@@ -4,8 +4,8 @@
 //! xctx-ctl [--socket <path>] [--compact] <method> [key=value | key:=<json>]...
 //! ```
 //!
-//! `key=value` passes a string, except that `pane` is a number, `all` a boolean and `repos` a comma-separated
-//! list. `key:=<json>` passes any JSON value. Methods about a space take `space` from `$XCTX_SPACE` when it is not
+//! `key=value` passes a string, except that `pane`, `since_id`, `limit`, `max_iterations` and `max_turns` are
+//! numbers, `all`, `checks_passed` and `production` booleans, and `repos` a comma-separated list. `key:=<json>` passes any JSON value. Methods about a space take `space` from `$XCTX_SPACE` when it is not
 //! given, so an agent in a space's pane can say `xctx-ctl pane.split axis=vertical`.
 
 use std::fmt::Write as _;
@@ -20,9 +20,9 @@ use crate::protocol::{Call, Method, RpcError};
 pub const SPACE_ENV: &str = "XCTX_SPACE";
 
 /// Parameters that are numbers when given as `key=value`.
-const INTEGER_KEYS: &[&str] = &["pane"];
+const INTEGER_KEYS: &[&str] = &["pane", "since_id", "limit", "max_iterations", "max_turns"];
 /// Parameters that are booleans when given as `key=value`.
-const BOOL_KEYS: &[&str] = &["all"];
+const BOOL_KEYS: &[&str] = &["all", "checks_passed", "production"];
 /// Parameters that are comma-separated lists when given as `key=value`.
 const LIST_KEYS: &[&str] = &["repos"];
 
@@ -173,8 +173,8 @@ pub fn help() -> String {
          methods:\n",
     );
     for m in Method::ALL {
-        let _ = writeln!(out, "  {:<14} {}", m.name(), m.usage());
-        let _ = writeln!(out, "  {:<14}   {}", "", m.summary());
+        let _ = writeln!(out, "  {:<20} {}", m.name(), m.usage());
+        let _ = writeln!(out, "  {:<20}   {}", "", m.summary());
     }
     let _ = write!(
         out,
@@ -183,7 +183,8 @@ pub fn help() -> String {
          {SPACE_ENV:<20} the default space=, set in every pane of a space\n\n\
          The result is printed as JSON. Exit status: 0 ok, 1 the window refused or the call failed, \
          2 bad arguments, 3 no window.\n\
-         Nothing here approves or launches: space.draft posts a Plan Gate the user approves in the window.\n"
+         Nothing here approves, launches or widens: space.draft posts a Plan Gate and space.widen_propose a \
+         space widening, which the user approves in the window.\n"
     );
     out
 }
@@ -193,7 +194,10 @@ mod tests {
     use super::*;
     use crate::StatusLevel;
     use crate::protocol::{
-        InboxListParams, PaneParams, PaneSplitParams, SpaceDraftParams, StatusSetParams,
+        AgentParams, ChannelListParams, ChannelPostParams, ContractSetParams, GraphAddLaneParams,
+        HelperKind, InboxListParams, LaneRole, LoopAdvanceParams, LoopAutonomy,
+        LoopSetAutonomyParams, PaneParams, PaneSplitParams, SpaceDraftParams, SpaceParams,
+        SpaceWidenProposeParams, StatusSetParams,
     };
     use xctx_layout::{PaneId, SplitAxis};
 
@@ -313,6 +317,170 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn m3_methods_parse_with_typed_keys_and_the_default_space() -> Result<(), UsageError> {
+        let here = Some("here");
+        let space = || SpaceParams {
+            space: "here".into(),
+        };
+        let agent = || AgentParams {
+            space: "here".into(),
+            agent: "writer-api".into(),
+        };
+        assert_eq!(call("graph.get", here)?, Call::GraphGet(space()));
+        assert_eq!(
+            call("graph.pause agent=writer-api", here)?,
+            Call::GraphPause(agent())
+        );
+        assert_eq!(
+            call("graph.resume agent=writer-api", here)?,
+            Call::GraphResume(agent())
+        );
+        assert_eq!(
+            call(
+                "graph.add_lane role=helper kind=tests repo=api label=unit",
+                here
+            )?,
+            Call::GraphAddLane(GraphAddLaneParams {
+                space: "here".into(),
+                role: LaneRole::Helper,
+                repo: Some("api".into()),
+                kind: Some(HelperKind::Tests),
+                label: Some("unit".into()),
+            })
+        );
+        assert_eq!(
+            call("graph.remove_lane agent=writer-api space=there", here)?,
+            Call::GraphRemoveLane(AgentParams {
+                space: "there".into(),
+                agent: "writer-api".into(),
+            })
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    "channel.post",
+                    "from=writer-api",
+                    "to=writer-web",
+                    "kind=question",
+                    "body=is amount in cents?",
+                ]
+                .map(str::to_owned),
+                here,
+            )?,
+            Command::Call {
+                socket: None,
+                compact: false,
+                call: Call::ChannelPost(ChannelPostParams {
+                    space: "here".into(),
+                    from: "writer-api".into(),
+                    to: Some("writer-web".into()),
+                    kind: "question".into(),
+                    body: "is amount in cents?".into(),
+                }),
+            }
+        );
+        assert_eq!(
+            call("channel.list kind=finding since_id=41 limit=20", here)?,
+            Call::ChannelList(ChannelListParams {
+                space: "here".into(),
+                to: None,
+                kind: Some("finding".into()),
+                since_id: Some(41),
+                limit: Some(20),
+            })
+        );
+        assert_eq!(call("contract.get", here)?, Call::ContractGet(space()));
+        assert_eq!(
+            call(
+                "contract.set author=orchestrator title=charge summary=payload spec=amount_cents:u64",
+                here
+            )?,
+            Call::ContractSet(ContractSetParams {
+                space: "here".into(),
+                author: "orchestrator".into(),
+                title: "charge".into(),
+                summary: "payload".into(),
+                spec: "amount_cents:u64".into(),
+            })
+        );
+        assert_eq!(
+            call("contract.agree agent=writer-api", here)?,
+            Call::ContractAgree(agent())
+        );
+        assert_eq!(call("loop.status", here)?, Call::LoopStatus(space()));
+        assert_eq!(
+            call("loop.advance checks_passed=yes", here)?,
+            Call::LoopAdvance(LoopAdvanceParams {
+                space: "here".into(),
+                checks_passed: Some(true),
+            })
+        );
+        assert_eq!(
+            call("loop.advance", here)?,
+            Call::LoopAdvance(LoopAdvanceParams {
+                space: "here".into(),
+                checks_passed: None,
+            })
+        );
+        assert_eq!(
+            call(
+                "loop.set_autonomy autonomy=within_budget max_iterations=3 max_turns=40",
+                here
+            )?,
+            Call::LoopSetAutonomy(LoopSetAutonomyParams {
+                space: "here".into(),
+                autonomy: LoopAutonomy::WithinBudget,
+                max_iterations: Some(3),
+                max_turns: Some(40),
+            })
+        );
+        assert_eq!(
+            call(
+                "space.widen_propose repos=web,api production=true rationale=consumer",
+                here
+            )?,
+            Call::SpaceWidenPropose(SpaceWidenProposeParams {
+                space: "here".into(),
+                repos: Some(vec!["web".into(), "api".into()]),
+                production: true,
+                rationale: Some("consumer".into()),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn help_lists_every_m3_method() {
+        let text = help();
+        for m in Method::ALL {
+            assert!(text.contains(m.name()), "{m}");
+        }
+        assert!(text.contains("space.widen_propose"));
+    }
+
+    #[test]
+    fn m3_mistakes_are_usage_errors() {
+        for bad in [
+            "graph.pause space=s",
+            "graph.add_lane space=s role=boss",
+            "graph.add_lane space=s role=helper kind=lint",
+            "channel.post space=s from=a body=hi",
+            "channel.list space=s limit=many",
+            "loop.advance space=s checks_passed=maybe",
+            "loop.set_autonomy space=s autonomy=yolo",
+            "loop.set_autonomy space=s autonomy=within_budget max_turns=-1",
+            "space.widen_propose space=s production=sure",
+            "contract.set space=s author=a title=t summary=s",
+        ] {
+            assert!(parse_args(args(bad), None).is_err(), "{bad}");
+        }
+        assert!(
+            parse_args(args("graph.get"), None).is_err(),
+            "without $XCTX_SPACE a space must be given"
+        );
     }
 
     #[test]

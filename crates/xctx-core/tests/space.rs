@@ -7,9 +7,9 @@ use common::{TestResult, add_bare_remote, commit_file, git, make_repo, make_repo
 use xctx_core::git as xgit;
 use xctx_core::space::{
     DraftRepo, PullRequestOutcome, ShipOptions, ShipOutcome, ShipSkipReason, SpaceDraft,
-    SpaceShape, SpaceStatus,
+    SpaceShape, SpaceStatus, WidenRequest,
 };
-use xctx_core::{Error, Store, discard, launch, ship};
+use xctx_core::{Error, Store, discard, launch, ship, widen};
 
 fn draft(task: &str, repos: &[&Path]) -> SpaceDraft {
     let mut draft = SpaceDraft::new(task);
@@ -602,5 +602,314 @@ fn unknown_spaces_are_reported() -> TestResult {
         discard(&mut store, &id, true),
         Err(Error::SpaceNotFound(_))
     ));
+    Ok(())
+}
+
+fn widen_repos(repos: &[&Path]) -> WidenRequest {
+    WidenRequest {
+        repos: repos
+            .iter()
+            .map(|r| DraftRepo::new(*r, "widened"))
+            .collect(),
+        production: false,
+    }
+}
+
+#[test]
+fn widen_adds_a_worktree_and_mise_file_for_a_new_repo() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("checkout limits", &[&repos.payments]))?;
+    let payments_src = repos.payments.join("src");
+
+    let report = widen(
+        &mut store,
+        &space.id,
+        widen_repos(&[&repos.checkout_web, &payments_src, &repos.checkout_web]),
+    )?;
+    assert_eq!(
+        report.added_repos.len(),
+        1,
+        "repos already in the space and repeats are skipped"
+    );
+    assert!(!report.production_enabled);
+    let web = &report.added_repos[0];
+    assert_eq!(web.name, "checkout-web");
+    assert_eq!(web.repo, repos.checkout_web);
+    assert_eq!(web.branch, "space/checkout-limits");
+    assert_eq!(web.reason, "widened");
+    assert!(web.branch_created);
+    assert_eq!(web.base_commit, xgit::head_commit(&repos.checkout_web)?);
+    assert_eq!(
+        xgit::current_branch(&web.worktree)?.as_deref(),
+        Some("space/checkout-limits")
+    );
+    let mise = fs::read_to_string(web.worktree.join(space.mise_file_name()))?;
+    assert!(mise.contains("PORT = \"4001\""), "{mise}");
+    assert!(mise.contains("XCTX_SPACE = \"checkout-limits\""), "{mise}");
+    assert!(!xgit::is_dirty(&web.worktree)?, "the mise file is ignored");
+
+    let saved = Store::open(root.path.join("data"))?
+        .space(&space.id)
+        .cloned()
+        .ok_or("the widened space is saved")?;
+    assert_eq!(saved.repos.len(), 2);
+    assert_eq!(
+        saved.repos[0], space.repos[0],
+        "existing repos are untouched"
+    );
+    assert_eq!(&saved.repos[1], web);
+    assert!(!saved.production);
+    assert_eq!(saved.port, space.port);
+    Ok(())
+}
+
+#[test]
+fn widen_to_production_sets_the_flag_and_the_terminal_mise_env() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("prod hotfix", &[&repos.payments]))?;
+    assert!(!space.production);
+    assert_eq!(space.effective_mise_env(), "prod-hotfix");
+
+    let report = widen(
+        &mut store,
+        &space.id,
+        WidenRequest {
+            repos: Vec::new(),
+            production: true,
+        },
+    )?;
+    assert!(report.added_repos.is_empty());
+    assert!(report.production_enabled);
+    let saved = Store::open(root.path.join("data"))?
+        .space(&space.id)
+        .cloned()
+        .ok_or("the widened space is saved")?;
+    assert!(saved.production);
+    assert_eq!(
+        saved.mise_env(),
+        "prod-hotfix",
+        "the slug still names its mise file"
+    );
+    assert_eq!(saved.effective_mise_env(), "production");
+    let env = saved.env();
+    assert!(env.contains(&("MISE_ENV".into(), "production".into())));
+    assert!(env.contains(&("PORT".into(), "4001".into())));
+    assert!(env.contains(&("XCTX_SPACE".into(), "prod-hotfix".into())));
+    assert_eq!(saved.repos, space.repos);
+
+    // Adding a repo later keeps production on.
+    let report = widen(&mut store, &space.id, widen_repos(&[&repos.checkout_web]))?;
+    assert!(report.production_enabled);
+    assert_eq!(report.added_repos.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn widen_refuses_requests_that_change_nothing_and_spaces_that_are_not_active() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("nothing new", &[&repos.payments]))?;
+
+    assert!(matches!(
+        widen(&mut store, &space.id, WidenRequest::default()),
+        Err(Error::EmptyWiden(_))
+    ));
+    assert!(matches!(
+        widen(&mut store, &space.id, widen_repos(&[&repos.payments])),
+        Err(Error::EmptyWiden(_))
+    ));
+    let production = WidenRequest {
+        repos: Vec::new(),
+        production: true,
+    };
+    widen(&mut store, &space.id, production.clone())?;
+    assert!(
+        matches!(
+            widen(&mut store, &space.id, production.clone()),
+            Err(Error::EmptyWiden(_))
+        ),
+        "production is already on"
+    );
+    assert!(matches!(
+        widen(&mut store, &space.id, widen_repos(&[&repos.notes])),
+        Err(Error::NotARepository(_))
+    ));
+
+    assert!(matches!(
+        widen(
+            &mut store,
+            &xctx_core::SpaceId::new("nope"),
+            production.clone()
+        ),
+        Err(Error::SpaceNotFound(_))
+    ));
+    discard(&mut store, &space.id, false)?;
+    assert!(matches!(
+        widen(&mut store, &space.id, widen_repos(&[&repos.checkout_web])),
+        Err(Error::SpaceNotActive { .. })
+    ));
+    assert!(!xgit::branch_exists(
+        &repos.checkout_web,
+        "space/nothing-new"
+    )?);
+    Ok(())
+}
+
+#[test]
+fn a_failed_widen_removes_what_it_made_and_leaves_the_space_as_it_was() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let api = root.path.join("code").join("api");
+    make_repo(&api, &[("README.md", "api\n")])?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("rollback check", &[&repos.payments]))?;
+    let before = store.space(&space.id).cloned();
+
+    // api's worktree is made, then checkout-web fails: the folder its worktree goes in is a file.
+    fs::write(repos.code.join("web").join("checkout-web-worktrees"), "x")?;
+    let result = widen(
+        &mut store,
+        &space.id,
+        WidenRequest {
+            repos: vec![
+                DraftRepo::new(&api, "widened"),
+                DraftRepo::new(&repos.checkout_web, "widened"),
+            ],
+            production: true,
+        },
+    );
+    assert!(matches!(result, Err(Error::Command { .. })), "{result:?}");
+    assert!(
+        !root
+            .path
+            .join("code")
+            .join("api-worktrees")
+            .join("rollback-check")
+            .exists()
+    );
+    assert!(!xgit::branch_exists(&api, "space/rollback-check")?);
+    assert!(!xgit::branch_exists(
+        &repos.checkout_web,
+        "space/rollback-check"
+    )?);
+    assert_eq!(xgit::list_worktrees(&api)?.len(), 1);
+    let exclude = fs::read_to_string(api.join(".git/info/exclude"))?;
+    assert!(!exclude.contains("mise.rollback-check.toml"), "{exclude}");
+
+    assert_eq!(store.space(&space.id).cloned(), before);
+    assert_eq!(
+        Store::open(root.path.join("data"))?
+            .space(&space.id)
+            .cloned(),
+        before
+    );
+    let existing = &space.repos[0];
+    assert!(existing.worktree.join(space.mise_file_name()).exists());
+    assert!(xgit::branch_exists(&repos.payments, &existing.branch)?);
+    assert_eq!(xgit::list_worktrees(&repos.payments)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_widen_the_store_cannot_save_is_rolled_back() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let data = root.path.join("data");
+    let mut store = Store::open(&data)?;
+    let space = launch(&mut store, draft("store failure", &[&repos.payments]))?;
+
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o555))?;
+    let result = widen(&mut store, &space.id, widen_repos(&[&repos.checkout_web]));
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755))?;
+    assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
+    assert!(
+        !repos
+            .code
+            .join("web")
+            .join("checkout-web-worktrees")
+            .join("store-failure")
+            .exists()
+    );
+    assert!(!xgit::branch_exists(
+        &repos.checkout_web,
+        "space/store-failure"
+    )?);
+    assert_eq!(store.space(&space.id), Some(&space));
+    assert_eq!(Store::open(&data)?.space(&space.id), Some(&space));
+    Ok(())
+}
+
+#[test]
+fn widen_never_takes_over_an_existing_space_branch() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("taken branch", &[&repos.payments]))?;
+    git(&repos.checkout_web, &["branch", "space/taken-branch"])?;
+
+    let result = widen(&mut store, &space.id, widen_repos(&[&repos.checkout_web]));
+    assert!(
+        matches!(&result, Err(Error::SpaceBranchTaken { repo, branch })
+            if repo == &repos.checkout_web && branch == "space/taken-branch"),
+        "{result:?}"
+    );
+    assert_eq!(store.space(&space.id), Some(&space));
+    assert_eq!(xgit::list_worktrees(&repos.checkout_web)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn widen_gives_repos_with_a_folder_name_already_in_the_space_unique_names() -> TestResult {
+    let root = temp_root()?;
+    let work_api = root.path.join("work").join("api");
+    let oss_api = root.path.join("oss").join("api");
+    let fork_api = root.path.join("fork").join("api");
+    for (dir, text) in [(&work_api, "work"), (&oss_api, "oss"), (&fork_api, "fork")] {
+        make_repo(dir, &[("README.md", text)])?;
+    }
+    let mut store = Store::open(root.path.join("data"))?;
+    let space = launch(&mut store, draft("api names", &[&work_api]))?;
+
+    let report = widen(&mut store, &space.id, widen_repos(&[&oss_api, &fork_api]))?;
+    let names: Vec<&str> = report.added_repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["api-2", "api-3"]);
+    let saved = store.space(&space.id).ok_or("the space is saved")?;
+    let names: Vec<&str> = saved.repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["api", "api-2", "api-3"]);
+    let worktrees: std::collections::HashSet<_> = saved.repos.iter().map(|r| &r.worktree).collect();
+    assert_eq!(worktrees.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn spaces_saved_before_the_production_flag_load_as_not_production() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let data = root.path.join("data");
+    let mut store = Store::open(&data)?;
+    let space = launch(&mut store, draft("old store", &[&repos.payments]))?;
+
+    let path = data.join("spaces.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let saved = json
+        .get_mut("spaces")
+        .and_then(|s| s.get_mut(0))
+        .and_then(|s| s.as_object_mut())
+        .ok_or("spaces.json has the space")?;
+    assert!(saved.remove("production").is_some());
+    fs::write(&path, serde_json::to_vec_pretty(&json)?)?;
+
+    let reopened = Store::open(&data)?;
+    let loaded = reopened.space(&space.id).ok_or("the space loads")?;
+    assert!(!loaded.production);
+    assert_eq!(loaded, &space);
+    assert_eq!(loaded.effective_mise_env(), "old-store");
     Ok(())
 }

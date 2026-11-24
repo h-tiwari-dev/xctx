@@ -422,6 +422,23 @@ impl Workspace {
                 }
                 to_json(self.control_draft(&params, cx))
             }
+            Call::GraphGet(_)
+            | Call::GraphPause(_)
+            | Call::GraphResume(_)
+            | Call::GraphAddLane(_)
+            | Call::GraphRemoveLane(_)
+            | Call::ChannelPost(_)
+            | Call::ChannelList(_)
+            | Call::ContractGet(_)
+            | Call::ContractSet(_)
+            | Call::ContractAgree(_)
+            | Call::LoopStatus(_)
+            | Call::LoopAdvance(_)
+            | Call::LoopSetAutonomy(_)
+            | Call::SpaceWidenPropose(_) => Err(RpcError::internal(format!(
+                "{}: not implemented yet (M3 Wave 3)",
+                call.method()
+            ))),
         };
         responder.respond(result);
     }
@@ -718,6 +735,7 @@ mod tests {
                 branch_created: true,
                 reason: "name matches".into(),
             }],
+            production: false,
         }
     }
 

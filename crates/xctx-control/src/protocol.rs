@@ -301,11 +301,13 @@ impl Response {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Look at spaces, layouts and the Inbox.
+    /// Look at spaces, layouts, the Inbox, agent graphs, channels, contracts and loops.
     Read,
-    /// Rearrange a space's panes: split, close, focus, zoom, reshape.
+    /// Rearrange a space: split, close, focus, zoom and reshape panes; pause, resume, add and remove agent lanes;
+    /// advance a loop and set its autonomy.
     Layout,
-    /// Propose work and tell the user things: draft a space, post to the Inbox, set the status line.
+    /// Propose work and tell the user things: draft or propose widening a space, post to the Inbox, the channel or
+    /// the contract, set the status line.
     Propose,
 }
 
@@ -341,11 +343,40 @@ pub enum Method {
     InboxPost,
     /// `status.set`: show a message in the status line.
     StatusSet,
+    /// `graph.get`: a space's agent graph.
+    GraphGet,
+    /// `graph.pause`: pause an agent.
+    GraphPause,
+    /// `graph.resume`: resume a paused agent.
+    GraphResume,
+    /// `graph.add_lane`: add a writer or helper lane to a space's agent graph.
+    GraphAddLane,
+    /// `graph.remove_lane`: remove an agent's lane.
+    GraphRemoveLane,
+    /// `channel.post`: post a message to a space's channel.
+    ChannelPost,
+    /// `channel.list`: a space's channel messages.
+    ChannelList,
+    /// `contract.get`: a space's shared contract.
+    ContractGet,
+    /// `contract.set`: propose a new version of a space's shared contract.
+    ContractSet,
+    /// `contract.agree`: record an agent's agreement to the current contract.
+    ContractAgree,
+    /// `loop.status`: a space's loop stage and autonomy.
+    LoopStatus,
+    /// `loop.advance`: move a space's loop to its next stage.
+    LoopAdvance,
+    /// `loop.set_autonomy`: set how far a space's loop runs without asking.
+    LoopSetAutonomy,
+    /// `space.widen_propose`: propose adding repos to a space or switching it to production; posts a space
+    /// widening to the Inbox and never widens.
+    SpaceWidenPropose,
 }
 
 impl Method {
     /// Every method, in the order `xctx-ctl help` lists them.
-    pub const ALL: [Method; 12] = [
+    pub const ALL: [Method; 26] = [
         Method::Ping,
         Method::SpaceList,
         Method::SpaceDraft,
@@ -358,6 +389,20 @@ impl Method {
         Method::InboxList,
         Method::InboxPost,
         Method::StatusSet,
+        Method::GraphGet,
+        Method::GraphPause,
+        Method::GraphResume,
+        Method::GraphAddLane,
+        Method::GraphRemoveLane,
+        Method::ChannelPost,
+        Method::ChannelList,
+        Method::ContractGet,
+        Method::ContractSet,
+        Method::ContractAgree,
+        Method::LoopStatus,
+        Method::LoopAdvance,
+        Method::LoopSetAutonomy,
+        Method::SpaceWidenPropose,
     ];
 
     /// The name on the wire.
@@ -375,6 +420,20 @@ impl Method {
             Method::InboxList => "inbox.list",
             Method::InboxPost => "inbox.post",
             Method::StatusSet => "status.set",
+            Method::GraphGet => "graph.get",
+            Method::GraphPause => "graph.pause",
+            Method::GraphResume => "graph.resume",
+            Method::GraphAddLane => "graph.add_lane",
+            Method::GraphRemoveLane => "graph.remove_lane",
+            Method::ChannelPost => "channel.post",
+            Method::ChannelList => "channel.list",
+            Method::ContractGet => "contract.get",
+            Method::ContractSet => "contract.set",
+            Method::ContractAgree => "contract.agree",
+            Method::LoopStatus => "loop.status",
+            Method::LoopAdvance => "loop.advance",
+            Method::LoopSetAutonomy => "loop.set_autonomy",
+            Method::SpaceWidenPropose => "space.widen_propose",
         }
     }
 
@@ -386,15 +445,32 @@ impl Method {
     /// What a connection must be granted to call it.
     pub fn capability(self) -> Capability {
         match self {
-            Method::Ping | Method::SpaceList | Method::LayoutGet | Method::InboxList => {
-                Capability::Read
-            }
+            Method::Ping
+            | Method::SpaceList
+            | Method::LayoutGet
+            | Method::InboxList
+            | Method::GraphGet
+            | Method::ChannelList
+            | Method::ContractGet
+            | Method::LoopStatus => Capability::Read,
             Method::SpaceReshape
             | Method::PaneSplit
             | Method::PaneClose
             | Method::PaneFocus
-            | Method::PaneZoom => Capability::Layout,
-            Method::SpaceDraft | Method::InboxPost | Method::StatusSet => Capability::Propose,
+            | Method::PaneZoom
+            | Method::GraphPause
+            | Method::GraphResume
+            | Method::GraphAddLane
+            | Method::GraphRemoveLane
+            | Method::LoopAdvance
+            | Method::LoopSetAutonomy => Capability::Layout,
+            Method::SpaceDraft
+            | Method::InboxPost
+            | Method::StatusSet
+            | Method::ChannelPost
+            | Method::ContractSet
+            | Method::ContractAgree
+            | Method::SpaceWidenPropose => Capability::Propose,
         }
     }
 
@@ -415,6 +491,26 @@ impl Method {
             Method::InboxList => "Inbox items, pending ones only unless all=true",
             Method::InboxPost => "post a notice to the Inbox",
             Method::StatusSet => "show a message in the status line",
+            Method::GraphGet => {
+                "a space's agent graph: orchestrator, writers, helpers and their states"
+            }
+            Method::GraphPause => "pause an agent",
+            Method::GraphResume => "resume a paused agent",
+            Method::GraphAddLane => {
+                "add a writer (at most one per repo) or helper lane to a space's agent graph"
+            }
+            Method::GraphRemoveLane => "remove an agent's lane from a space's agent graph",
+            Method::ChannelPost => "post a message to a space's channel, to everyone or one agent",
+            Method::ChannelList => "a space's channel messages, oldest first, secrets redacted",
+            Method::ContractGet => "a space's shared contract and who has agreed to it",
+            Method::ContractSet => "propose a new version of a space's shared contract",
+            Method::ContractAgree => "record an agent's agreement to the current contract",
+            Method::LoopStatus => "a space's loop stage, autonomy and budget",
+            Method::LoopAdvance => "move a space's loop to its next stage",
+            Method::LoopSetAutonomy => "set how far a space's loop runs without asking",
+            Method::SpaceWidenPropose => {
+                "propose adding repos or production to a space; posts to the Inbox, never widens"
+            }
         }
     }
 
@@ -433,6 +529,28 @@ impl Method {
             Method::InboxList => "[space=<slug>] [all=true]",
             Method::InboxPost => "title=<text> [body=<text>] [space=<slug>]",
             Method::StatusSet => "message=<text> [level=info|success|warning|error] [space=<slug>]",
+            Method::GraphGet | Method::ContractGet | Method::LoopStatus => "space=<slug>",
+            Method::GraphPause
+            | Method::GraphResume
+            | Method::GraphRemoveLane
+            | Method::ContractAgree => "space=<slug> agent=<id>",
+            Method::GraphAddLane => {
+                "space=<slug> role=writer|helper [repo=<name>] [kind=tests|reviewer|probe] [label=<text>]"
+            }
+            Method::ChannelPost => "space=<slug> from=<agent> kind=<kind> body=<text> [to=<agent>]",
+            Method::ChannelList => {
+                "space=<slug> [to=<agent>] [kind=<kind>] [since_id=<n>] [limit=<n>]"
+            }
+            Method::ContractSet => {
+                "space=<slug> author=<agent> title=<text> summary=<text> spec=<text>"
+            }
+            Method::LoopAdvance => "space=<slug> [checks_passed=true|false]",
+            Method::LoopSetAutonomy => {
+                "space=<slug> autonomy=ask_each_step|within_budget|until_checks_pass [max_iterations=<n>] [max_turns=<n>]"
+            }
+            Method::SpaceWidenPropose => {
+                "space=<slug> [repos=<name>,<name>...] [production=true] [rationale=<text>]"
+            }
         }
     }
 }
@@ -475,7 +593,7 @@ pub struct SpaceReshapeParams {
     pub shape: Shape,
 }
 
-/// Parameters that name only a space: `layout.get`.
+/// Parameters that name only a space: `layout.get`, `graph.get`, `contract.get`, `loop.status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpaceParams {
@@ -578,6 +696,167 @@ pub struct StatusSetParams {
     pub space: Option<String>,
 }
 
+/// Parameters that name one agent of a space: `graph.pause`, `graph.resume`, `graph.remove_lane`,
+/// `contract.agree`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentParams {
+    /// The space's slug.
+    pub space: String,
+    /// The agent's id in the space's graph.
+    pub agent: String,
+}
+
+/// The kind of lane `graph.add_lane` adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneRole {
+    /// An agent that edits one repo. A repo has at most one writer.
+    Writer,
+    /// A read-only agent that tests, reviews or probes.
+    Helper,
+}
+
+/// What a helper lane does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelperKind {
+    /// Runs the tests.
+    Tests,
+    /// Reviews the diff.
+    Reviewer,
+    /// Exercises the running app.
+    Probe,
+}
+
+/// `graph.add_lane`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphAddLaneParams {
+    /// The space's slug.
+    pub space: String,
+    /// A writer or a helper.
+    pub role: LaneRole,
+    /// The repo the lane works in, by its name in the space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// What a helper lane does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<HelperKind>,
+    /// A name for the lane shown in the graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// `channel.post`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPostParams {
+    /// The space's slug.
+    pub space: String,
+    /// The posting agent's id.
+    pub from: String,
+    /// The agent it is for; everyone in the space when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The message's kind, as the space's channel names it.
+    pub kind: String,
+    /// The message.
+    pub body: String,
+}
+
+/// `channel.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelListParams {
+    /// The space's slug.
+    pub space: String,
+    /// Only messages for this agent (and those for everyone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Only messages of this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Only messages with a larger id than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_id: Option<u64>,
+    /// At most this many messages, the newest ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `contract.set`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractSetParams {
+    /// The space's slug.
+    pub space: String,
+    /// The proposing agent's id.
+    pub author: String,
+    /// A short name for the contract.
+    pub title: String,
+    /// One or two sentences on what it fixes.
+    pub summary: String,
+    /// The contract itself: an API shape, event payload or schema.
+    pub spec: String,
+}
+
+/// `loop.advance`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopAdvanceParams {
+    /// The space's slug.
+    pub space: String,
+    /// Whether the stage being left passed its checks; unknown when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_passed: Option<bool>,
+}
+
+/// How far a space's loop runs without asking the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopAutonomy {
+    /// Pause at every stage change and post an Inbox gate.
+    AskEachStep,
+    /// Run up to the iteration and turn budget, then pause.
+    WithinBudget,
+    /// Run until the tests and review pass or a failure blocks.
+    UntilChecksPass,
+}
+
+/// `loop.set_autonomy`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopSetAutonomyParams {
+    /// The space's slug.
+    pub space: String,
+    /// The autonomy level.
+    pub autonomy: LoopAutonomy,
+    /// The most write-test-probe-review iterations to run before pausing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
+    /// The most agent turns to run before pausing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+}
+
+/// `space.widen_propose`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpaceWidenProposeParams {
+    /// The space's slug.
+    pub space: String,
+    /// Repos to add, by indexed name or path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos: Option<Vec<String>>,
+    /// Switch the space's terminals to `MISE_ENV=production`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub production: bool,
+    /// Why, shown with the Inbox item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
 /// A parsed request: a method and its typed parameters.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
@@ -605,6 +884,34 @@ pub enum Call {
     InboxPost(InboxPostParams),
     /// See [`Method::StatusSet`].
     StatusSet(StatusSetParams),
+    /// See [`Method::GraphGet`].
+    GraphGet(SpaceParams),
+    /// See [`Method::GraphPause`].
+    GraphPause(AgentParams),
+    /// See [`Method::GraphResume`].
+    GraphResume(AgentParams),
+    /// See [`Method::GraphAddLane`].
+    GraphAddLane(GraphAddLaneParams),
+    /// See [`Method::GraphRemoveLane`].
+    GraphRemoveLane(AgentParams),
+    /// See [`Method::ChannelPost`].
+    ChannelPost(ChannelPostParams),
+    /// See [`Method::ChannelList`].
+    ChannelList(ChannelListParams),
+    /// See [`Method::ContractGet`].
+    ContractGet(SpaceParams),
+    /// See [`Method::ContractSet`].
+    ContractSet(ContractSetParams),
+    /// See [`Method::ContractAgree`].
+    ContractAgree(AgentParams),
+    /// See [`Method::LoopStatus`].
+    LoopStatus(SpaceParams),
+    /// See [`Method::LoopAdvance`].
+    LoopAdvance(LoopAdvanceParams),
+    /// See [`Method::LoopSetAutonomy`].
+    LoopSetAutonomy(LoopSetAutonomyParams),
+    /// See [`Method::SpaceWidenPropose`].
+    SpaceWidenPropose(SpaceWidenProposeParams),
 }
 
 fn params<P: DeserializeOwned>(method: Method, params: Option<Value>) -> Result<P, RpcError> {
@@ -661,6 +968,20 @@ impl Call {
             Method::InboxList => Call::InboxList(params(m, raw)?),
             Method::InboxPost => Call::InboxPost(params(m, raw)?),
             Method::StatusSet => Call::StatusSet(params(m, raw)?),
+            Method::GraphGet => Call::GraphGet(params(m, raw)?),
+            Method::GraphPause => Call::GraphPause(params(m, raw)?),
+            Method::GraphResume => Call::GraphResume(params(m, raw)?),
+            Method::GraphAddLane => Call::GraphAddLane(params(m, raw)?),
+            Method::GraphRemoveLane => Call::GraphRemoveLane(params(m, raw)?),
+            Method::ChannelPost => Call::ChannelPost(params(m, raw)?),
+            Method::ChannelList => Call::ChannelList(params(m, raw)?),
+            Method::ContractGet => Call::ContractGet(params(m, raw)?),
+            Method::ContractSet => Call::ContractSet(params(m, raw)?),
+            Method::ContractAgree => Call::ContractAgree(params(m, raw)?),
+            Method::LoopStatus => Call::LoopStatus(params(m, raw)?),
+            Method::LoopAdvance => Call::LoopAdvance(params(m, raw)?),
+            Method::LoopSetAutonomy => Call::LoopSetAutonomy(params(m, raw)?),
+            Method::SpaceWidenPropose => Call::SpaceWidenPropose(params(m, raw)?),
         })
     }
 
@@ -679,6 +1000,20 @@ impl Call {
             Call::InboxList(_) => Method::InboxList,
             Call::InboxPost(_) => Method::InboxPost,
             Call::StatusSet(_) => Method::StatusSet,
+            Call::GraphGet(_) => Method::GraphGet,
+            Call::GraphPause(_) => Method::GraphPause,
+            Call::GraphResume(_) => Method::GraphResume,
+            Call::GraphAddLane(_) => Method::GraphAddLane,
+            Call::GraphRemoveLane(_) => Method::GraphRemoveLane,
+            Call::ChannelPost(_) => Method::ChannelPost,
+            Call::ChannelList(_) => Method::ChannelList,
+            Call::ContractGet(_) => Method::ContractGet,
+            Call::ContractSet(_) => Method::ContractSet,
+            Call::ContractAgree(_) => Method::ContractAgree,
+            Call::LoopStatus(_) => Method::LoopStatus,
+            Call::LoopAdvance(_) => Method::LoopAdvance,
+            Call::LoopSetAutonomy(_) => Method::LoopSetAutonomy,
+            Call::SpaceWidenPropose(_) => Method::SpaceWidenPropose,
         }
     }
 
@@ -695,6 +1030,18 @@ impl Call {
             Call::InboxList(p) => to_value(p),
             Call::InboxPost(p) => to_value(p),
             Call::StatusSet(p) => to_value(p),
+            Call::GraphGet(p) | Call::ContractGet(p) | Call::LoopStatus(p) => to_value(p),
+            Call::GraphPause(p)
+            | Call::GraphResume(p)
+            | Call::GraphRemoveLane(p)
+            | Call::ContractAgree(p) => to_value(p),
+            Call::GraphAddLane(p) => to_value(p),
+            Call::ChannelPost(p) => to_value(p),
+            Call::ChannelList(p) => to_value(p),
+            Call::ContractSet(p) => to_value(p),
+            Call::LoopAdvance(p) => to_value(p),
+            Call::LoopSetAutonomy(p) => to_value(p),
+            Call::SpaceWidenPropose(p) => to_value(p),
         }
     }
 
@@ -710,6 +1057,18 @@ impl Call {
             Call::InboxList(p) => p.space.as_deref(),
             Call::InboxPost(p) => p.space.as_deref(),
             Call::StatusSet(p) => p.space.as_deref(),
+            Call::GraphGet(p) | Call::ContractGet(p) | Call::LoopStatus(p) => Some(&p.space),
+            Call::GraphPause(p)
+            | Call::GraphResume(p)
+            | Call::GraphRemoveLane(p)
+            | Call::ContractAgree(p) => Some(&p.space),
+            Call::GraphAddLane(p) => Some(&p.space),
+            Call::ChannelPost(p) => Some(&p.space),
+            Call::ChannelList(p) => Some(&p.space),
+            Call::ContractSet(p) => Some(&p.space),
+            Call::LoopAdvance(p) => Some(&p.space),
+            Call::LoopSetAutonomy(p) => Some(&p.space),
+            Call::SpaceWidenPropose(p) => Some(&p.space),
         }
     }
 }
@@ -854,6 +1213,20 @@ pub struct InboxPostResult {
     pub id: String,
 }
 
+/// The result of `channel.post`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPostResult {
+    /// The new message's id; pass it as `since_id` to `channel.list` to read only what came after.
+    pub id: u64,
+}
+
+/// The result of `space.widen_propose`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceWidenProposeResult {
+    /// The space widening item posted to the Inbox; the space widens only when the user approves it.
+    pub inbox_item: String,
+}
+
 /// The result of methods that only report success: `pane.close`, `pane.focus`, `status.set`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ack {}
@@ -906,6 +1279,202 @@ mod tests {
             let parsed = Call::parse(call.method().name(), Some(call.params()))?;
             assert_eq!(parsed, call);
         }
+        Ok(())
+    }
+
+    fn m3_calls() -> Vec<Call> {
+        let space = || SpaceParams { space: "s".into() };
+        let agent = || AgentParams {
+            space: "s".into(),
+            agent: "writer-api".into(),
+        };
+        vec![
+            Call::GraphGet(space()),
+            Call::GraphPause(agent()),
+            Call::GraphResume(agent()),
+            Call::GraphAddLane(GraphAddLaneParams {
+                space: "s".into(),
+                role: LaneRole::Helper,
+                repo: Some("api".into()),
+                kind: Some(HelperKind::Reviewer),
+                label: Some("second reviewer".into()),
+            }),
+            Call::GraphAddLane(GraphAddLaneParams {
+                space: "s".into(),
+                role: LaneRole::Writer,
+                repo: Some("web".into()),
+                kind: None,
+                label: None,
+            }),
+            Call::GraphRemoveLane(agent()),
+            Call::ChannelPost(ChannelPostParams {
+                space: "s".into(),
+                from: "writer-api".into(),
+                to: Some("writer-web".into()),
+                kind: "question".into(),
+                body: "is amount in cents?".into(),
+            }),
+            Call::ChannelList(ChannelListParams {
+                space: "s".into(),
+                to: None,
+                kind: Some("finding".into()),
+                since_id: Some(41),
+                limit: Some(20),
+            }),
+            Call::ContractGet(space()),
+            Call::ContractSet(ContractSetParams {
+                space: "s".into(),
+                author: "orchestrator".into(),
+                title: "charge event".into(),
+                summary: "the payload both repos agree on".into(),
+                spec: "{\"amount_cents\": \"u64\"}".into(),
+            }),
+            Call::ContractAgree(agent()),
+            Call::LoopStatus(space()),
+            Call::LoopAdvance(LoopAdvanceParams {
+                space: "s".into(),
+                checks_passed: Some(false),
+            }),
+            Call::LoopSetAutonomy(LoopSetAutonomyParams {
+                space: "s".into(),
+                autonomy: LoopAutonomy::WithinBudget,
+                max_iterations: Some(3),
+                max_turns: None,
+            }),
+            Call::SpaceWidenPropose(SpaceWidenProposeParams {
+                space: "s".into(),
+                repos: Some(vec!["web".into()]),
+                production: true,
+                rationale: Some("the event is consumed in web".into()),
+            }),
+        ]
+    }
+
+    #[test]
+    fn m3_calls_round_trip_through_their_params_and_name_their_space() -> Result<(), RpcError> {
+        let calls = m3_calls();
+        let mut methods: Vec<Method> = calls.iter().map(Call::method).collect();
+        methods.dedup();
+        assert_eq!(methods, Method::ALL[12..], "every M3 method is covered");
+        for call in calls {
+            let parsed = Call::parse(call.method().name(), Some(call.params()))?;
+            assert_eq!(parsed, call);
+            assert_eq!(call.space(), Some("s"), "{}", call.method());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn m3_params_use_snake_case_names_and_reject_unknown_values() -> Result<(), RpcError> {
+        let call = Call::parse(
+            "loop.set_autonomy",
+            Some(json!({"space": "s", "autonomy": "until_checks_pass"})),
+        )?;
+        assert_eq!(
+            call.params(),
+            json!({"space": "s", "autonomy": "until_checks_pass"})
+        );
+        let call = Call::parse(
+            "graph.add_lane",
+            Some(json!({"space": "s", "role": "helper", "kind": "probe"})),
+        )?;
+        assert_eq!(
+            call.params(),
+            json!({"space": "s", "role": "helper", "kind": "probe"})
+        );
+        let widen = Call::parse("space.widen_propose", Some(json!({"space": "s"})))?;
+        assert_eq!(
+            widen,
+            Call::SpaceWidenPropose(SpaceWidenProposeParams {
+                space: "s".into(),
+                repos: None,
+                production: false,
+                rationale: None,
+            })
+        );
+        assert_eq!(widen.params(), json!({"space": "s"}));
+        for (method, params) in [
+            (
+                "loop.set_autonomy",
+                json!({"space": "s", "autonomy": "yolo"}),
+            ),
+            (
+                "graph.add_lane",
+                json!({"space": "s", "role": "orchestrator"}),
+            ),
+            (
+                "graph.add_lane",
+                json!({"space": "s", "role": "helper", "kind": "lint"}),
+            ),
+            ("graph.pause", json!({"space": "s"})),
+            (
+                "channel.post",
+                json!({"space": "s", "from": "a", "body": "hi"}),
+            ),
+            ("channel.list", json!({"space": "s", "since_id": "x"})),
+            (
+                "contract.set",
+                json!({"space": "s", "author": "a", "title": "t", "summary": "s"}),
+            ),
+            ("loop.advance", json!({"space": "s", "checks": true})),
+            (
+                "space.widen_propose",
+                json!({"space": "s", "production": "yes"}),
+            ),
+        ] {
+            let err = Call::parse(method, Some(params)).err();
+            let err = err.map(|e| (e.kind(), e.message));
+            assert!(
+                matches!(&err, Some((Some(ErrorCode::InvalidParams), m)) if m.contains(&format!("usage: {method}"))),
+                "{method}: {err:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn m3_methods_need_the_capabilities_their_effects_call_for() {
+        use Capability::{Layout, Propose, Read};
+        let expected = [
+            (Method::GraphGet, Read),
+            (Method::GraphPause, Layout),
+            (Method::GraphResume, Layout),
+            (Method::GraphAddLane, Layout),
+            (Method::GraphRemoveLane, Layout),
+            (Method::ChannelPost, Propose),
+            (Method::ChannelList, Read),
+            (Method::ContractGet, Read),
+            (Method::ContractSet, Propose),
+            (Method::ContractAgree, Propose),
+            (Method::LoopStatus, Read),
+            (Method::LoopAdvance, Layout),
+            (Method::LoopSetAutonomy, Layout),
+            (Method::SpaceWidenPropose, Propose),
+        ];
+        for (method, capability) in expected {
+            assert_eq!(method.capability(), capability, "{method}");
+            assert!(!method.usage().is_empty(), "{method}");
+            assert!(!method.summary().is_empty(), "{method}");
+        }
+    }
+
+    #[test]
+    fn m3_results_have_stable_field_names() -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::to_value(ChannelPostResult { id: 7 })?,
+            json!({"id": 7})
+        );
+        let widen = SpaceWidenProposeResult {
+            inbox_item: "item-3".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&widen)?,
+            json!({"inbox_item": "item-3"})
+        );
+        assert_eq!(
+            serde_json::from_value::<SpaceWidenProposeResult>(json!({"inbox_item": "item-3"}))?,
+            widen
+        );
         Ok(())
     }
 

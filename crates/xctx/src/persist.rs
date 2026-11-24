@@ -130,6 +130,7 @@ mod tests {
                 branch_created: true,
                 reason: String::new(),
             }],
+            production: false,
         }
     }
 

@@ -19,7 +19,7 @@ pub use redact::Redactor;
 pub use space::{
     DiscardReport, DraftRepo, PullRequestOutcome, RemovedWorktree, RepoShipReport, ShipOptions,
     ShipOutcome, ShipReport, ShipSkipReason, Space, SpaceDraft, SpaceId, SpaceRepo, SpaceShape,
-    SpaceStatus, discard, launch, ship,
+    SpaceStatus, WidenReport, WidenRequest, discard, launch, ship, widen,
 };
 pub use store::Store;
 

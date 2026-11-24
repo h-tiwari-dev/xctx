@@ -69,6 +69,20 @@ pub enum Error {
     #[error("the draft has no repositories")]
     EmptyDraft,
 
+    /// A widening must add at least one repository the space does not already have, or switch it to production.
+    #[error("widening space {0} changes nothing: no new repositories and no switch to production")]
+    EmptyWiden(SpaceId),
+
+    /// A repository a widening would add already has the space's `space/<slug>` branch or worktree folder, left by
+    /// work the store does not know about; the widening stops rather than take it over.
+    #[error("{repo} already has {branch} or its worktree folder; refusing to take it over")]
+    SpaceBranchTaken {
+        /// The repository's main checkout (its bare directory for a bare layout).
+        repo: PathBuf,
+        /// The space's branch, `space/<slug>`.
+        branch: String,
+    },
+
     /// These repositories have uncommitted changes in the space's worktree, so the operation stopped before
     /// changing anything.
     #[error("uncommitted changes in {}; commit or discard them first", .repos.join(", "))]
