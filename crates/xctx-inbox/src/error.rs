@@ -49,6 +49,10 @@ pub enum InboxError {
     /// A Plan Gate cannot be approved without at least one repo.
     #[error("the plan in {0} has no repositories")]
     EmptyPlan(ItemId),
+
+    /// A space widening cannot be approved when it adds no repos and does not switch to production.
+    #[error("the widening in {0} changes nothing")]
+    EmptyWiden(ItemId),
 }
 
 /// The result type of the Inbox's fallible operations.

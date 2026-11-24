@@ -19,6 +19,11 @@ pub const INBOX_FILE: &str = "inbox.json";
 /// dropped.
 pub const MAX_SETTLED_ITEMS: usize = 200;
 
+/// How many notices from agents ([`Source::Agent`]) can be pending at once. Posting one more dismisses the
+/// oldest pending agent notice, so an agent posting in a loop cannot grow the Inbox or the badge count without
+/// limit.
+pub const MAX_PENDING_AGENT_NOTICES: usize = 100;
+
 const INBOX_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -89,6 +94,8 @@ impl Inbox {
                         supported: INBOX_VERSION,
                     });
                 }
+                let mut data = data;
+                data.next_id = data.next_id.max(next_free_id(&data.items));
                 (data, false)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => (InboxData::default(), true),
@@ -124,9 +131,14 @@ impl Inbox {
     }
 
     fn commit<R>(&mut self, change: impl FnOnce(&mut InboxData) -> Result<R>) -> Result<R> {
+        let now = (self.clock)();
         let mut data = self.data.clone();
         let result = change(&mut data)?;
-        prune(&mut data);
+        prune(&mut data, now);
+        // Nothing changed (e.g. a repeated mise check): no need to rewrite and fsync the file.
+        if data == self.data {
+            return Ok(result);
+        }
         let bytes = serde_json::to_vec_pretty(&data).map_err(|source| xctx_core::Error::Json {
             path: self.path.clone(),
             source,
@@ -169,7 +181,8 @@ impl Inbox {
     }
 
     /// Post a new pending item and return its id. A missing variable already pending for the same directory,
-    /// `MISE_ENV` and name is not posted twice; its id is returned instead.
+    /// `MISE_ENV` and name is not posted twice; its id is returned instead. A notice from [`Source::Agent`] beyond
+    /// [`MAX_PENDING_AGENT_NOTICES`] dismisses the oldest pending agent notice.
     pub fn post(
         &mut self,
         body: ItemBody,
@@ -248,7 +261,8 @@ impl Inbox {
     }
 
     /// Approve a pending Plan Gate or space widening and return it as approved; the app then launches or widens.
-    /// A Plan Gate with no repos cannot be approved.
+    /// A Plan Gate with no repos cannot be approved, nor a widening that adds no repos and does not switch to
+    /// production.
     pub fn approve(&mut self, id: &ItemId) -> Result<InboxItem> {
         self.settle(
             id,
@@ -259,6 +273,9 @@ impl Inbox {
             |item| match &item.body {
                 ItemBody::PlanGate(p) if p.draft.repos.is_empty() => {
                     Err(InboxError::EmptyPlan(item.id.clone()))
+                }
+                ItemBody::SpaceWiden(w) if w.add_repos.is_empty() && !w.production => {
+                    Err(InboxError::EmptyWiden(item.id.clone()))
                 }
                 _ => Ok(()),
             },
@@ -332,7 +349,9 @@ impl Inbox {
 
     /// Bring the missing-variable items for one directory in line with a fresh mise inspection: post the
     /// variables `report` says are missing, and resolve pending ones for this directory and `MISE_ENV` that are
-    /// not missing any more. Returns the ids of the items now pending for it. Writes once.
+    /// not missing any more. A variable the user dismissed for this directory and `MISE_ENV` is not posted again
+    /// and has no id in the result. Returns the ids of the items now pending for it. Writes at most once, and not
+    /// at all when nothing changed.
     pub fn sync_missing(
         &mut self,
         repo: &str,
@@ -356,13 +375,21 @@ impl Inbox {
             }
             let mut ids = Vec::new();
             for var in &report.missing {
-                let existing = data.items.iter().find(|i| {
-                    i.is_pending()
-                        && matches!(&i.body, ItemBody::MissingEnvVar(m)
-                            if m.dir == dir && m.mise_env == mise_env && m.var.name == var.name)
-                });
-                if let Some(existing) = existing {
+                let same_var = |i: &&InboxItem| {
+                    matches!(&i.body, ItemBody::MissingEnvVar(m)
+                        if m.dir == dir && m.mise_env == mise_env && m.var.name == var.name)
+                };
+                if let Some(existing) = data.items.iter().filter(same_var).find(|i| i.is_pending())
+                {
                     ids.push(existing.id.clone());
+                    continue;
+                }
+                if data
+                    .items
+                    .iter()
+                    .filter(same_var)
+                    .any(|i| i.state == ItemState::Dismissed)
+                {
                     continue;
                 }
                 let id = ItemId::new(format!("inbox-{}", data.next_id));
@@ -389,8 +416,39 @@ impl Inbox {
     }
 }
 
-/// Drop the oldest decided items beyond [`MAX_SETTLED_ITEMS`].
-fn prune(data: &mut InboxData) {
+/// The lowest id number above every `inbox-<n>` in `items`, so a hand-edited `next_id` cannot repeat an id.
+fn next_free_id(items: &[InboxItem]) -> u64 {
+    items
+        .iter()
+        .filter_map(|i| i.id.as_str().strip_prefix("inbox-")?.parse::<u64>().ok())
+        .max()
+        .map_or(1, |n| n.saturating_add(1))
+}
+
+fn is_pending_agent_notice(item: &InboxItem) -> bool {
+    item.is_pending() && item.source == Source::Agent && item.kind() == ItemKind::Notice
+}
+
+/// Dismiss the oldest pending agent notices beyond [`MAX_PENDING_AGENT_NOTICES`], then drop the oldest decided
+/// items beyond [`MAX_SETTLED_ITEMS`].
+fn prune(data: &mut InboxData, now: u64) {
+    let agent_notices = data
+        .items
+        .iter()
+        .filter(|i| is_pending_agent_notice(i))
+        .count();
+    let mut excess = agent_notices.saturating_sub(MAX_PENDING_AGENT_NOTICES);
+    for item in data.items.iter_mut() {
+        if excess == 0 {
+            break;
+        }
+        if is_pending_agent_notice(item) {
+            item.state = ItemState::Dismissed;
+            item.updated_at = now;
+            excess -= 1;
+        }
+    }
+
     let settled = data.items.iter().filter(|i| !i.is_pending()).count();
     let mut excess = settled.saturating_sub(MAX_SETTLED_ITEMS);
     if excess == 0 {

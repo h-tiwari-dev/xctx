@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{TestResult, temp_root};
-use xctx_core::{Error, MiseRunner, Redactor};
+use xctx_core::{Error, MiseRunner, Redactor, mise};
 
 /// A mise that sees only `dir`: its own config, state and cache directories, `dir` trusted without writing to
 /// the user's trust list, and no global config.
@@ -110,6 +110,46 @@ fn a_set_variable_is_not_missing() -> TestResult {
         .inspect(&dir, None)?;
     let names: Vec<_> = report.missing.iter().map(|v| v.name.as_str()).collect();
     assert_eq!(names, ["XCTX_TEST_NEEDED_TOO"]);
+    Ok(())
+}
+
+#[test]
+fn a_value_set_for_a_space_is_a_secret_and_satisfies_the_requirement() -> TestResult {
+    let (_root, dir) = project(&[
+        (
+            "mise.toml",
+            "[env]\nSTRIPE_KEY = { required = \"from 1Password\" }\n",
+        ),
+        ("mise.s.toml", &mise::mise_file_contents("s", "S", 4001)),
+    ])?;
+    let before = isolated(&dir).inspect(&dir, Some("s"))?;
+    let names: Vec<_> = before.missing.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["STRIPE_KEY"]);
+
+    mise::set_space_var(&dir, "s", "STRIPE_KEY", "sk_live_\"42\"")?;
+    let after = isolated(&dir).inspect(&dir, Some("s"))?;
+    assert!(after.is_complete(), "{after:?}");
+    assert_eq!(
+        after.secrets.get("STRIPE_KEY").map(String::as_str),
+        Some("sk_live_\"42\"")
+    );
+    assert!(!after.secrets.contains_key("PORT"));
+    Ok(())
+}
+
+#[test]
+fn forced_colour_does_not_leak_into_missing_variable_help() -> TestResult {
+    let (_root, dir) = project(&[("mise.toml", CONFIG)])?;
+    let report = isolated(&dir)
+        .with_env("CLICOLOR_FORCE", "1")
+        .with_env("FORCE_COLOR", "1")
+        .inspect(&dir, None)?;
+    let names: Vec<_> = report.missing.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["XCTX_TEST_NEEDED", "XCTX_TEST_NEEDED_TOO"]);
+    assert_eq!(
+        report.missing[0].help.as_deref(),
+        Some("Ask the team for the staging key")
+    );
     Ok(())
 }
 

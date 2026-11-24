@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use xctx_core::{DraftRepo, EnvReport, RequiredVar, SpaceDraft, SpaceId, SpaceShape};
 use xctx_inbox::{
     Filter, INBOX_FILE, Inbox, InboxError, ItemBody, ItemId, ItemKind, ItemState, Level,
-    MAX_SETTLED_ITEMS, MissingEnvVar, Notice, PlanGate, Source, SpaceWiden, welcome_notice,
+    MAX_PENDING_AGENT_NOTICES, MAX_SETTLED_ITEMS, MissingEnvVar, Notice, PlanGate, Source,
+    SpaceWiden, welcome_notice,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -253,6 +254,161 @@ fn sync_missing_posts_new_vars_and_resolves_fixed_ones() -> TestResult {
     let prod = inbox.sync_missing("api", api, Some("production"), space, &report(&[]))?;
     assert!(prod.is_empty());
     assert_eq!(state(&inbox, &second[0]), Some(ItemState::Pending));
+    Ok(())
+}
+
+#[test]
+fn a_dismissed_missing_var_is_not_posted_again_by_sync() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    let api = Path::new("/code/api");
+    let space = Some(SpaceId::new("rate-limit"));
+    let first = inbox.sync_missing(
+        "api",
+        api,
+        Some("rate-limit"),
+        space.clone(),
+        &report(&["A", "B"]),
+    )?;
+    inbox.dismiss(&first[0])?;
+    let count = inbox.items().len();
+
+    let again = inbox.sync_missing(
+        "api",
+        api,
+        Some("rate-limit"),
+        space.clone(),
+        &report(&["A", "B"]),
+    )?;
+    assert_eq!(
+        again,
+        [first[1].clone()],
+        "A was dismissed, so it has no id"
+    );
+    assert_eq!(inbox.items().len(), count, "nothing new was posted");
+    assert_eq!(inbox.pending_count(), 1);
+    assert_eq!(
+        inbox.get(&first[0]).map(|i| i.state),
+        Some(ItemState::Dismissed)
+    );
+
+    // The dismissal is for that directory and MISE_ENV only.
+    let prod = inbox.sync_missing("api", api, Some("production"), space, &report(&["A"]))?;
+    assert_eq!(prod.len(), 1);
+    assert_ne!(prod[0], first[0]);
+    Ok(())
+}
+
+#[test]
+fn sync_missing_writes_nothing_when_nothing_changed() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    let api = Path::new("/code/api");
+    let space = Some(SpaceId::new("rate-limit"));
+    let first = inbox.sync_missing(
+        "api",
+        api,
+        Some("rate-limit"),
+        space.clone(),
+        &report(&["A"]),
+    )?;
+    let before = fs::read(dir.path().join(INBOX_FILE))?;
+
+    // A read-only directory makes any write fail, so these succeed only if they write nothing.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555))?;
+    let same = inbox.sync_missing(
+        "api",
+        api,
+        Some("rate-limit"),
+        space.clone(),
+        &report(&["A"]),
+    );
+    let other_dir = inbox.sync_missing("web", Path::new("/code/web"), None, None, &report(&[]));
+    let changed = inbox.sync_missing("api", api, Some("rate-limit"), space, &report(&["A", "B"]));
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))?;
+
+    assert_eq!(same?, first);
+    assert!(other_dir?.is_empty());
+    assert!(changed.is_err(), "a real change still writes");
+    assert_eq!(fs::read(dir.path().join(INBOX_FILE))?, before);
+    Ok(())
+}
+
+#[test]
+fn pending_agent_notices_are_capped_by_dismissing_the_oldest() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    inbox.set_clock(|| 7);
+    let app_notice = inbox.post(notice("from the app"), None, Source::App)?;
+    let gate = inbox.post(plan(&["api"]), None, Source::Agent)?;
+    let mut agent_ids = Vec::new();
+    for n in 0..MAX_PENDING_AGENT_NOTICES + 5 {
+        agent_ids.push(inbox.post(notice(&format!("n{n}")), None, Source::Agent)?);
+    }
+
+    let pending_agent_notices = |inbox: &Inbox| {
+        inbox
+            .items()
+            .iter()
+            .filter(|i| i.is_pending() && i.source == Source::Agent && i.kind() == ItemKind::Notice)
+            .count()
+    };
+    assert_eq!(pending_agent_notices(&inbox), MAX_PENDING_AGENT_NOTICES);
+    for id in &agent_ids[..5] {
+        let item = inbox.get(id).ok_or("oldest notice was dropped")?;
+        assert_eq!((item.state, item.updated_at), (ItemState::Dismissed, 7));
+    }
+    for id in &agent_ids[5..] {
+        assert_eq!(inbox.get(id).map(|i| i.state), Some(ItemState::Pending));
+    }
+    let state = |id: &ItemId| inbox.get(id).map(|i| i.state);
+    assert_eq!(state(&app_notice), Some(ItemState::Pending));
+    assert_eq!(state(&gate), Some(ItemState::Pending));
+    assert_eq!(inbox.pending_count(), MAX_PENDING_AGENT_NOTICES + 2);
+    assert_eq!(
+        pending_agent_notices(&Inbox::open(dir.path())?),
+        MAX_PENDING_AGENT_NOTICES
+    );
+    Ok(())
+}
+
+#[test]
+fn a_hand_edited_next_id_cannot_repeat_an_id() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    let a = inbox.post(notice("a"), None, Source::User)?;
+    let b = inbox.post(notice("b"), None, Source::User)?;
+    let path = dir.path().join(INBOX_FILE);
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    file["next_id"] = 1.into();
+    fs::write(&path, serde_json::to_vec(&file)?)?;
+
+    let mut reopened = Inbox::open(dir.path())?;
+    let c = reopened.post(notice("c"), None, Source::User)?;
+    assert!(c != a && c != b, "{c} repeats an id");
+    assert_eq!(c.as_str(), "inbox-3");
+    Ok(())
+}
+
+#[test]
+fn a_widening_that_changes_nothing_cannot_be_approved() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    let space = SpaceId::new("rate-limit");
+    let id = inbox.post(
+        ItemBody::SpaceWiden(SpaceWiden {
+            space: space.clone(),
+            add_repos: vec![],
+            production: false,
+            reason: "no reason".into(),
+        }),
+        Some(space),
+        Source::Agent,
+    )?;
+    assert!(matches!(inbox.approve(&id), Err(InboxError::EmptyWiden(_))));
+    assert_eq!(inbox.get(&id).map(|i| i.state), Some(ItemState::Pending));
+    assert_eq!(inbox.reject(&id, None)?.state, ItemState::Rejected);
     Ok(())
 }
 
