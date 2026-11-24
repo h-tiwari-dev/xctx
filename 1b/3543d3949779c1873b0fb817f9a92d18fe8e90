@@ -1,0 +1,61 @@
+crates/xctx-channel/tests/shared_space.rs
+  s_3c1d864b15e035::t_7d8bd379242874 290-344
+crates/xctx-channel/src/notes.rs
+  s_3c1d864b15e035::t_5419add04f5d0d 238-245,254-262
+  s_3c1d864b15e035::t_f2bcd6302b15ce 3-5,12-18,118-119,143-146,162,174-175,234-237,246-253,263-276
+  s_3c1d864b15e035::t_f1e91bf35f5c4c 277-279
+crates/xctx-channel/tests/scratch.rs
+  s_3c1d864b15e035::t_5419add04f5d0d 4,114-122,129-197
+crates/xctx-channel/src/error.rs
+  s_3c1d864b15e035::t_8a41fd978c57fc 21-22,45-54,67-73,76
+  s_3c1d864b15e035::t_67c41425bc76f8 74-75
+crates/xctx-channel/src/store.rs
+  s_3c1d864b15e035::t_c976d8441226a2 69-70,153-154,156-167,170,235,248
+crates/xctx-graph/tests/store.rs
+  s_3c1d864b15e035::t_10f08faa2db3f4 220-233
+  s_3c1d864b15e035::t_431f5d00a7fcfa 219
+crates/xctx-channel/src/contract.rs
+  s_3c1d864b15e035::t_c976d8441226a2 9,74,76-88,90-97,166-169,173-184,189,191
+  s_3c1d864b15e035::t_5419add04f5d0d 170-172,185-188
+  s_3c1d864b15e035::t_cf261e80af797b 190,192
+crates/xctx-graph/tests/graph.rs
+  s_3c1d864b15e035::t_10f08faa2db3f4 460-485,488-504
+  s_3c1d864b15e035::t_5419add04f5d0d 486-487
+crates/xctx-graph/src/store.rs
+  s_3c1d864b15e035::t_738c4c8c65e2d3 81,91
+crates/xctx-graph/src/error.rs
+  s_3c1d864b15e035::t_26741e644a91c8 49
+  s_3c1d864b15e035::t_738c4c8c65e2d3 48,50-64,98-99
+crates/xctx-channel/src/channel.rs
+  s_3c1d864b15e035::t_c976d8441226a2 99-100,133-134,245-260
+  s_3c1d864b15e035::t_cf0cf4185ae4bb 261-263
+crates/xctx-channel/src/lib.rs
+  s_3c1d864b15e035::t_f2bcd6302b15ce 28
+crates/xctx-graph/src/graph.rs
+  s_3c1d864b15e035::t_738c4c8c65e2d3 332-334,362,370-374,378
+  s_3c1d864b15e035::t_2b4e9c473e09c9 338,344,354-359
+  s_3c1d864b15e035::t_fd008d1442bab8 375-377
+crates/xctx-channel/Cargo.toml
+  s_3c1d864b15e035::t_12ea5d6e1515e7 8
+crates/xctx-channel/src/scratch.rs
+  s_3c1d864b15e035::t_12ea5d6e1515e7 6-9,13,23-25,29,48-54,89-133,138-141,149-150,153,155-156,165-171,175,190-191,193-197,212-213,242-243,245-247,252-254
+  s_3c1d864b15e035::t_5419add04f5d0d 134-137
+Cargo.lock
+  s_3c1d864b15e035::t_7dddcbf4380f24 6232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "1b3543d3949779c1873b0fb817f9a92d18fe8e90",
+  "prompts": {},
+  "sessions": {
+    "s_3c1d864b15e035": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20dba-7b53-75fa-ba38-c0055b46abf6",
+        "model": "claude-opus-5.5"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
