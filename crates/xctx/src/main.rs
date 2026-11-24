@@ -4,10 +4,12 @@
 mod control;
 mod dialogs;
 mod home;
+mod inbox_view;
 mod keymap;
 mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
+mod parent_agent;
 mod persist;
 mod space_layout;
 mod space_tab;

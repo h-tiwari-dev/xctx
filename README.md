@@ -4,14 +4,18 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
 
 **Status:** Milestone 1 is complete — Home, repo indexing & task drafting, per-space git worktrees & `mise.<slug>.toml`, truecolor PTY terminal (`pi`, `nvim`, `lazygit`), split/zoom/reshape panes (`Dev`/`Debug`/`Review`), layout persistence & agent resume (`pi --continue`), and Ship/Discard all work end-to-end. See [`docs/roadmap.md`](docs/roadmap.md) and [`docs/m2.md`](docs/m2.md) for what comes next.
 
-**Milestone 2 (in progress):** Wave 1 added the control socket and `xctx-ctl` CLI (`crates/xctx-control`), the Inbox and Plan Gate model (`crates/xctx-inbox`), and mise required-variable checks and secret redaction (`xctx-core`). Wave 3 connects the socket to the app:
+**Milestone 2:** waves 1 to 3 are in. xctx is now an agent-drivable harness:
 
-- The app opens the control socket at startup and answers every method.
-- Every pane gets `XCTX_CONTROL_SOCKET`, and has `xctx-ctl` on its `PATH`.
-- The Inbox starts with a welcome notice.
-- Required mise variables that are not set in a space's worktrees are posted to the Inbox, and mise's secret values are masked.
+- **Control socket and `xctx-ctl`.** Agents and scripts can list spaces, read and change layouts, draft spaces and post to the Inbox. Every pane gets `XCTX_CONTROL_SOCKET` and has `xctx-ctl` on its `PATH`.
+- **Parent Agent on Home.** A `pi` session in a drawer, told its role and given only its read and bash tools. It drafts spaces through `xctx-ctl space.draft`, writes no code, and cannot launch anything.
+- **Inbox on Home.** The status bar shows how many items are pending. The Inbox holds four kinds of item:
+  - **Plan Gates.** Review opens a card where you change the shape, drop or add repos, then Approve & launch or Reject.
+  - **Missing mise variables.** Each comes with mise's own help text. Set value writes the value into the space's git-ignored `mise.<slug>.toml`.
+  - **Notices** from agents.
+  - **Space widenings** are shown, but approving them is not supported yet.
+- **Secret redaction.** Values mise marks as secret are masked as `[REDACTED:NAME]` in everything agents and the Inbox see.
 
-The Inbox panel, Plan Gate approval and the Parent Agent drawer come with Wave 2 (`m2-ui`). Until then, Plan Gates wait in the Inbox, and `xctx-ctl inbox.list` shows them.
+Wave 4, review and hardening, is next.
 
 ## Prerequisites
 
@@ -63,6 +67,7 @@ mise run ctl -- --compact inbox.list all=true      # put options after --
 - `xctx-ctl` prints the result as JSON. Exit status: `0` ok, `1` the window refused the request, `2` bad arguments, `3` no window is running.
 - In a pane of xctx, `xctx-ctl` is already on `PATH`, and `XCTX_CONTROL_SOCKET` points at its window.
 - A request about a space that is not open yet opens its tab first, which starts its panes. `layout.get` is the exception: it reads the saved layout and starts nothing.
+- The Parent Agent runs in `parent-agent/` inside the data directory and resumes its session there (`pi --continue`). Its model and billing are whatever your `pi` is set up to use.
 - Nothing on the socket can approve or launch. `space.draft` posts a Plan Gate to the Inbox, and the space launches only when you approve it in the window.
 
 ### Trying it without touching your spaces
