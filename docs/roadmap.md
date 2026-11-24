@@ -28,7 +28,8 @@ See [`docs/m2.md`](m2.md).
 - **Mise environment hardening**: detect missing `required` env vars and route them to the Inbox with mise's help text;
   redact secret values in shared output.
 
-### Milestone 3 — Multi-agent graphs, shared contracts & autonomous loops
+### Milestone 3 — Multi-agent graphs, shared contracts & autonomous loops (in progress)
+See [`docs/m3.md`](m3.md).
 - **Orchestrator per space** + **one writer per repo** + read-only helpers (test runner, reviewer).
 - **Shared Space Store & Channel**: contract (API/schema/event shape), findings, shared notes, and `/tmp` scratch
   artifacts so writers coordinate without editing each other's repos.
