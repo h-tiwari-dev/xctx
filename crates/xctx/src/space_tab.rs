@@ -20,7 +20,7 @@ use xctx_ui::{PaneView, SplitView, Theme, pane_kind_label};
 use crate::lifecycle::reshape_space;
 use crate::persist::{restore_layout, save_layout};
 use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
-use crate::spawn::{AgentStart, pane_launch};
+use crate::spawn::{AgentStart, pane_launch, split_agent_start};
 use crate::workspace::{View, Workspace, open_space_refusal, wait_message};
 
 /// A layout error of space `id` as a control error: unknown panes are not found, the rest conflicts.
@@ -372,17 +372,26 @@ impl Workspace {
         self.view == View::Space(id.clone())
     }
 
-    /// After a layout change in `id`: save it, focus its focused pane if it is shown, and redraw.
+    /// Whether a layout change in `id` may move keyboard focus to its focused pane: only while the space is
+    /// shown and no dialog is open over it, so a control request never takes the keyboard from a dialog the
+    /// user is typing in. Closing the dialog focuses the focused pane.
+    fn may_focus_pane_of(&self, id: &SpaceId) -> bool {
+        self.is_shown(id) && self.dialog.is_none()
+    }
+
+    /// After a layout change in `id`: save it, focus its focused pane if it may (see
+    /// [`Workspace::may_focus_pane_of`]), and redraw.
     fn layout_changed(&mut self, id: &SpaceId, window: &mut Window, cx: &mut Context<Self>) {
         self.persist(id, cx);
-        if self.is_shown(id) {
+        if self.may_focus_pane_of(id) {
             self.focus_active_pane(window, cx);
         }
         cx.notify();
     }
 
     /// Split `target` (the focused pane when `None`) of an open space with a new pane of `kind` in `repo` (the
-    /// target's repo when `None`), and start it. Returns the new pane.
+    /// target's repo when `None`), and start it. A new agent resumes the worktree's last session only when no
+    /// other agent pane works there (see [`split_agent_start`]). Returns the new pane.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn split_in(
         &mut self,
@@ -409,7 +418,15 @@ impl Workspace {
             .layout
             .split(target, axis, kind, repo)
             .map_err(|e| layout_error(id, e))?;
-        self.spawn_pane(id, &pane, &AgentStart::Continue, window, cx);
+        let others: Vec<PaneRole> = tab
+            .layout
+            .panes()
+            .into_iter()
+            .filter(|other| other.id != pane.id)
+            .map(|other| other.role)
+            .collect();
+        let start = split_agent_start(&tab.space, &pane.role, &others);
+        self.spawn_pane(id, &pane, &start, window, cx);
         self.layout_changed(id, window, cx);
         Ok(pane.id)
     }
@@ -472,7 +489,8 @@ impl Workspace {
         }
     }
 
-    /// Focus `pane` of an open space, and its terminal if the space is shown. A change of focus is saved.
+    /// Focus `pane` of an open space, and its terminal if the space is shown with no dialog open. A change of
+    /// focus is saved.
     pub(crate) fn focus_pane_in(
         &mut self,
         id: &SpaceId,
@@ -486,7 +504,7 @@ impl Workspace {
         if changed {
             self.persist(id, cx);
         }
-        if self.is_shown(id) {
+        if self.may_focus_pane_of(id) {
             self.focus_active_pane(window, cx);
         }
         cx.notify();
@@ -650,7 +668,7 @@ impl Workspace {
         if let Some(warning) = warning {
             self.error(warning, cx);
         }
-        if self.is_shown(id) {
+        if self.may_focus_pane_of(id) {
             self.focus_active_pane(window, cx);
         }
         cx.notify();

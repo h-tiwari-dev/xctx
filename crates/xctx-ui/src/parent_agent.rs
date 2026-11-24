@@ -1,5 +1,6 @@
 //! The Parent Agent drawer on Home: the always-on agent that drafts spaces and owns the Inbox, shown as a
-//! header with its status and, when open, its terminal. It writes no code and never launches on its own.
+//! header with its status and, when open, its terminal. It never launches on its own: its drafts wait at the
+//! Plan Gate. Its no-code rule is advisory, a prompt rather than a sandbox.
 
 use std::rc::Rc;
 
@@ -49,8 +50,9 @@ impl AgentStatus {
     }
 }
 
-/// The line under the drawer's title.
-pub const PARENT_AGENT_ROLE: &str = "Drafts spaces from your tasks and owns the Inbox. Writes no code; nothing launches until you approve.";
+/// The line under the drawer's title. It says the no-code rule is only asked of the agent (it has a shell), while
+/// the Plan Gate is enforced.
+pub const PARENT_AGENT_ROLE: &str = "Drafts spaces from your tasks and owns the Inbox. Asked not to write code (advisory: it has a shell); nothing launches until you approve.";
 
 /// The default height of the open drawer's terminal.
 pub const DRAWER_HEIGHT: Pixels = px(280.0);

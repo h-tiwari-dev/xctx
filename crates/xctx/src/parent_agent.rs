@@ -1,7 +1,11 @@
 //! The Parent Agent: an always-on `pi` session in a drawer on Home that turns tasks into Plan Gates and keeps
-//! the user's spaces arranged, through `xctx-ctl`. It writes no code: `pi` runs with only its read and bash
-//! tools, in its own folder under the data directory, told its role, and nothing on the control socket can
-//! launch or approve.
+//! the user's spaces arranged, through `xctx-ctl`.
+//!
+//! Nothing on the control socket can launch or approve, so its drafts always wait at the Plan Gate. Its "writes
+//! no code" rule is advisory: `pi` gets only its read and bash tools and a prompt saying not to change anything,
+//! but bash is a full shell (and MCP tools and the user's pi extensions still load), so the prompt, not a
+//! sandbox, keeps it from editing files. It runs in its own folder beside the data directory, not inside it, so
+//! the store and the Inbox file are not in its working directory.
 
 use std::path::{Path, PathBuf};
 
@@ -13,10 +17,12 @@ use xctx_ui::AgentStatus;
 use crate::spawn::{AGENT_PROGRAM, ProgramSearch};
 use crate::workspace::Workspace;
 
-/// The folder under the data directory the Parent Agent runs in; `pi --continue` resumes its session there.
-pub const PARENT_AGENT_DIR: &str = "parent-agent";
+/// What the name of the folder the Parent Agent runs in adds to the data directory's name: it runs in
+/// `<data dir>-parent-agent` beside the data directory, and `pi --continue` resumes its session there.
+pub const PARENT_AGENT_DIR_SUFFIX: &str = "-parent-agent";
 
-/// The only `pi` tools the Parent Agent gets: it can look and run `xctx-ctl`, not edit or write files.
+/// The only `pi` tools the Parent Agent gets: read, and bash for `xctx-ctl`. Without `edit` and `write` it has
+/// no file-editing tools, but bash can still change files; only the prompt asks it not to.
 pub const PARENT_AGENT_TOOLS: &str = "read,bash";
 
 /// What the Parent Agent is told about its role, appended to `pi`'s system prompt.
@@ -88,11 +94,29 @@ pub fn parent_agent_config(search: &ProgramSearch, dir: &Path) -> Result<Termina
     Ok(config)
 }
 
-/// Where the Parent Agent runs: [`PARENT_AGENT_DIR`] in the data directory.
+/// Where the Parent Agent runs for the data directory `data_dir`: a sibling named after it with
+/// [`PARENT_AGENT_DIR_SUFFIX`] (`~/Library/Application Support/xctx-parent-agent` for the default one), outside
+/// the data directory so the store and the Inbox file are not in its working directory. Each data directory
+/// (such as a throwaway `XCTX_DATA_DIR`) gets its own.
+pub fn parent_agent_dir_for(data_dir: &Path) -> Result<PathBuf, String> {
+    match (data_dir.parent(), data_dir.file_name()) {
+        (Some(parent), Some(name)) => {
+            let mut dir_name = name.to_os_string();
+            dir_name.push(PARENT_AGENT_DIR_SUFFIX);
+            Ok(parent.join(dir_name))
+        }
+        _ => Err(format!(
+            "the Parent Agent has nowhere to run: the data directory {} has no parent folder",
+            data_dir.display()
+        )),
+    }
+}
+
+/// Where the Parent Agent runs: [`parent_agent_dir_for`] the data directory.
 pub fn parent_agent_dir() -> Result<PathBuf, String> {
-    xctx_core::store::data_dir()
-        .map(|dir| dir.join(PARENT_AGENT_DIR))
-        .map_err(|e| format!("the Parent Agent has nowhere to run: {e}"))
+    let data_dir = xctx_core::store::data_dir()
+        .map_err(|e| format!("the Parent Agent has nowhere to run: {e}"))?;
+    parent_agent_dir_for(&data_dir)
 }
 
 impl Workspace {
@@ -193,7 +217,7 @@ mod tests {
             socket: root.path().join("control.sock"),
             ctl_dir: Some(ctl_dir.clone()),
         });
-        let dir = root.path().join(PARENT_AGENT_DIR);
+        let dir = parent_agent_dir_for(&root.path().join("data"))?;
         let config = parent_agent_config(&search, &dir)?;
         assert_eq!(config.program, pi.to_string_lossy());
         let tools = config.args.iter().position(|a| a == "--tools");
@@ -215,6 +239,20 @@ mod tests {
             path.starts_with(&ctl_dir.to_string_lossy().into_owned()),
             "{path}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_agent_runs_beside_the_data_directory_not_inside_it() -> TestResult {
+        let data = Path::new("/tmp/xctx-try");
+        let dir = parent_agent_dir_for(data)?;
+        assert_eq!(dir, Path::new("/tmp/xctx-try-parent-agent"));
+        assert!(!dir.starts_with(data));
+        assert_eq!(
+            parent_agent_dir_for(Path::new("/Users/me/Library/Application Support/xctx"))?,
+            Path::new("/Users/me/Library/Application Support/xctx-parent-agent")
+        );
+        assert!(parent_agent_dir_for(Path::new("/")).is_err());
         Ok(())
     }
 

@@ -30,13 +30,16 @@ use crate::lifecycle::{home_dir, repo_for_draft};
 use crate::persist::restore_layout;
 use crate::space_layout::{SpaceLayout, layout_shape};
 use crate::spawn::{ControlEnv, ctl_dir_next_to};
-use crate::workspace::{Workspace, open_space_refusal, wait_message};
+use crate::workspace::{Workspace, wait_message};
 
 /// The reason given to repos an agent named in `space.draft`.
 pub const NAMED_BY_AGENT: &str = "named by the agent";
 
 /// The longest status message shown, in characters; longer ones are cut with an ellipsis.
 pub const MAX_STATUS_CHARS: usize = 300;
+
+/// What every `status.set` message starts with, so an agent's message is told apart from xctx's own.
+pub const AGENT_BANNER_PREFIX: &str = "agent";
 
 /// The running control socket: the server and the task that carries its requests to the workspace. Dropping
 /// it stops serving and removes the socket.
@@ -48,6 +51,13 @@ pub(crate) struct Control {
 /// A `space.draft` that arrived while the repo index was being built, answered once it is.
 pub(crate) struct PendingDraft {
     params: SpaceDraftParams,
+    responder: Responder,
+}
+
+/// An `inbox.list` that arrived before the startup mise check learned the secret values to mask, answered once
+/// it has.
+pub(crate) struct PendingInboxList {
+    params: InboxListParams,
     responder: Responder,
 }
 
@@ -76,6 +86,24 @@ pub fn space_list(spaces: &[Space]) -> SpaceListResult {
             })
             .collect(),
     }
+}
+
+/// The active space called `name` whose tab is open, for a request that changes its layout: as
+/// [`resolve_space`], and a conflict when the tab is not open, since opening it would start every pane (and
+/// agent) of the space without the user knowing.
+pub fn resolve_open_space(
+    spaces: &[Space],
+    in_flight: impl Fn(&SpaceId) -> bool,
+    is_open: impl Fn(&SpaceId) -> bool,
+    name: &str,
+) -> Result<SpaceId, RpcError> {
+    let id = resolve_space(spaces, in_flight, name)?;
+    if !is_open(&id) {
+        return Err(RpcError::conflict(format!(
+            "space {id} is not open; open it first"
+        )));
+    }
+    Ok(id)
 }
 
 /// The active space called `name`: not found (listing the active ones) when there is none, a conflict while it
@@ -211,11 +239,14 @@ pub fn notice_for(params: &InboxPostParams) -> Result<Notice, RpcError> {
 }
 
 /// The status bar message for `status.set`: warnings and errors stay until dismissed, the rest clear themselves.
-/// The space, when given, prefixes the message.
+/// It starts with [`AGENT_BANNER_PREFIX`] (and the space, when given), so it never reads as xctx's own message.
 pub fn status_banner(params: &StatusSetParams) -> StatusBanner {
     let mut message = match &params.space {
-        Some(space) => format!("{space}: {}", params.message.trim()),
-        None => params.message.trim().to_owned(),
+        Some(space) => format!(
+            "{AGENT_BANNER_PREFIX} in {space}: {}",
+            params.message.trim()
+        ),
+        None => format!("{AGENT_BANNER_PREFIX}: {}", params.message.trim()),
     };
     if message.chars().count() > MAX_STATUS_CHARS {
         message = message.chars().take(MAX_STATUS_CHARS - 1).collect();
@@ -367,12 +398,17 @@ impl Workspace {
                 if p.message.trim().is_empty() {
                     Err(RpcError::invalid_params("status.set: message is empty"))
                 } else {
-                    self.set_banner(status_banner(&p), cx);
+                    self.set_agent_banner(status_banner(&p), cx);
                     to_json(Ok(Ack {}))
                 }
             }
-            Call::InboxList(p) => {
-                to_json(self.with_inbox(|inbox, redactor| Ok(inbox_list(inbox, &p, redactor))))
+            Call::InboxList(params) => {
+                if !self.mise_ready {
+                    self.pending_inbox_lists
+                        .push(PendingInboxList { params, responder });
+                    return;
+                }
+                to_json(self.control_inbox_list(&params))
             }
             Call::InboxPost(p) => to_json(self.control_inbox_post(&p, cx)),
             Call::SpaceDraft(params) => {
@@ -395,7 +431,27 @@ impl Workspace {
         }
     }
 
-    /// Run `op` on the active space `name`, opening its tab (and starting its panes) if it is not open yet.
+    /// Answer the `inbox.list` requests that waited for the startup mise check.
+    pub(crate) fn flush_inbox_lists(&mut self) {
+        for pending in std::mem::take(&mut self.pending_inbox_lists) {
+            let result = to_json(self.control_inbox_list(&pending.params));
+            pending.responder.respond(result);
+        }
+    }
+
+    /// The startup mise check has finished (or there was nothing to check): the secrets it found are masked, so
+    /// `inbox.list` may answer.
+    fn startup_mise_checked(&mut self) {
+        self.mise_ready = true;
+        self.flush_inbox_lists();
+    }
+
+    /// `inbox.list`: the Inbox items, with secrets masked.
+    fn control_inbox_list(&self, params: &InboxListParams) -> Result<InboxListResult, RpcError> {
+        self.with_inbox(|inbox, redactor| Ok(inbox_list(inbox, params, redactor)))
+    }
+
+    /// Run `op` on the active space `name`, whose tab must be open (see [`resolve_open_space`]).
     fn in_open_space<T>(
         &mut self,
         name: &str,
@@ -403,22 +459,12 @@ impl Workspace {
         cx: &mut Context<Self>,
         op: impl FnOnce(&mut Self, &SpaceId, &mut Window, &mut Context<Self>) -> Result<T, RpcError>,
     ) -> Result<T, RpcError> {
-        let id = resolve_space(&self.spaces, |id| self.in_flight_spaces.contains(id), name)?;
-        if !self.tabs.contains_key(&id) {
-            let refusal = open_space_refusal(
-                &id,
-                self.in_flight_spaces.contains(&id),
-                false,
-                self.store.is_some(),
-                self.busy.as_deref(),
-            );
-            if let Some(reason) = refusal {
-                return Err(RpcError::conflict(reason));
-            }
-            if !self.open_space(&id, window, cx) {
-                return Err(RpcError::conflict(format!("could not open space {id}")));
-            }
-        }
+        let id = resolve_open_space(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            |id| self.tabs.contains_key(id),
+            name,
+        )?;
         op(self, &id, window, cx)
     }
 
@@ -531,7 +577,21 @@ impl Workspace {
     /// Check the worktrees of `spaces` with mise in the background: post the required variables that are not
     /// set to the Inbox (resolving ones that are set now), and learn the secret values to mask.
     pub(crate) fn check_mise(&mut self, spaces: Vec<Space>, cx: &mut Context<Self>) {
+        self.run_mise_check(spaces, false, cx);
+    }
+
+    /// Check every active space with mise, as [`Workspace::check_mise`] does, once at startup: `inbox.list`
+    /// requests wait until it has finished, so none is answered before the secrets to mask are known.
+    pub(crate) fn check_mise_at_startup(&mut self, cx: &mut Context<Self>) {
+        let spaces = self.spaces.clone();
+        self.run_mise_check(spaces, true, cx);
+    }
+
+    fn run_mise_check(&mut self, spaces: Vec<Space>, startup: bool, cx: &mut Context<Self>) {
         let Some(mise) = self.search.find("mise") else {
+            if startup {
+                self.startup_mise_checked();
+            }
             return;
         };
         let checks: Vec<MiseCheck> = spaces
@@ -546,6 +606,9 @@ impl Workspace {
             .filter(|c| c.dir.is_dir())
             .collect();
         if checks.is_empty() {
+            if startup {
+                self.startup_mise_checked();
+            }
             return;
         }
         let runner = MiseRunner::new()
@@ -566,7 +629,12 @@ impl Workspace {
                     }
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| this.apply_mise_findings(findings, cx));
+            let _ = this.update(cx, |this, cx| {
+                this.apply_mise_findings(findings, cx);
+                if startup {
+                    this.startup_mise_checked();
+                }
+            });
         })
         .detach();
     }
@@ -672,6 +740,22 @@ mod tests {
     }
 
     #[test]
+    fn layout_requests_on_a_closed_space_are_refused_without_opening_it() {
+        let spaces = [space("a"), space("b")];
+        let open = |id: &SpaceId| id.as_str() == "a";
+        assert_eq!(
+            resolve_open_space(&spaces, |_| false, open, "a").ok(),
+            Some(SpaceId::new("a"))
+        );
+        let closed = resolve_open_space(&spaces, |_| false, open, "b").err();
+        assert!(
+            matches!(&closed, Some(e) if e.kind() == Some(ErrorCode::Conflict) && e.message == "space b is not open; open it first")
+        );
+        let missing = resolve_open_space(&spaces, |_| false, open, "c").err();
+        assert!(missing.is_some_and(|e| e.kind() == Some(ErrorCode::NotFound)));
+    }
+
+    #[test]
     fn named_repos_must_be_indexed_or_real_repos() -> TestResult {
         let root = tempfile::tempdir()?;
         let params = |repos: Option<Vec<String>>| SpaceDraftParams {
@@ -773,7 +857,13 @@ mod tests {
             space: Some("rate-limit".into()),
         });
         assert_eq!(banner.kind, BannerKind::Error);
-        assert_eq!(banner.message.as_ref(), "rate-limit: tests failed");
+        assert_eq!(banner.message.as_ref(), "agent in rate-limit: tests failed");
+        let plain = status_banner(&StatusSetParams {
+            message: " done ".into(),
+            level: StatusLevel::Info,
+            space: None,
+        });
+        assert_eq!(plain.message.as_ref(), "agent: done");
         let long = status_banner(&StatusSetParams {
             message: "x".repeat(1000),
             level: StatusLevel::Success,
