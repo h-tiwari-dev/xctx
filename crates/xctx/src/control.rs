@@ -12,10 +12,11 @@ use gpui::{Context, Task, Window};
 use serde::Serialize;
 use serde_json::Value;
 use xctx_control::protocol::{
-    Ack, DraftRepoSummary, InboxItemSummary, InboxListParams, InboxListResult, InboxPostParams,
-    InboxPostResult, LayoutInfo, PaneSplitResult, PaneZoomResult, PingResult, RepoSummary,
-    SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary, SpaceWidenProposeParams,
-    SpaceWidenProposeResult, StatusSetParams,
+    Ack, AttemptDiffParams, AttemptListParams, AttemptListResult, AttemptProposeParams,
+    AttemptProposeResult, AttemptReportParams, DraftRepoSummary, InboxItemSummary, InboxListParams,
+    InboxListResult, InboxPostParams, InboxPostResult, LayoutInfo, PaneSplitResult, PaneZoomResult,
+    PingResult, RepoSummary, SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary,
+    SpaceWidenProposeParams, SpaceWidenProposeResult, StatusSetParams,
 };
 use xctx_control::{
     Call, Incoming, Responder, RpcError, Server, ServerConfig, StatusLevel, socket_path,
@@ -23,13 +24,17 @@ use xctx_control::{
 use xctx_core::{
     DraftRepo, EnvReport, MiseRunner, Redactor, RepoIndex, Space, SpaceDraft, SpaceId,
 };
-use xctx_graph::{LoopDecision, LoopStage};
+use xctx_graph::{AgentNodeId, LoopDecision, LoopStage};
 use xctx_inbox::{
     Filter, Inbox, ItemBody, Level, Notice, PlanGate, Source, SpaceWiden, welcome_notice,
 };
 use xctx_layout::PaneKind;
 use xctx_ui::StatusBanner;
 
+use crate::attempts::{
+    self, attempt_diff, attempt_list, attempt_proposal, attempt_rpc_error, diff_target,
+    record_report, round_done_notice,
+};
 use crate::lifecycle::{home_dir, repo_for_draft};
 use crate::persist::restore_layout;
 use crate::space_graph::{
@@ -67,7 +72,7 @@ pub(crate) struct PendingDraft {
 }
 
 /// A request whose answer shows stored text to an agent (`inbox.list`, `channel.list`, `contract.get`,
-/// `contract.set`, `contract.agree`) that arrived before the startup mise check learned the secret values to
+/// `contract.set`, `contract.agree`, `attempt.list`, `attempt.diff`) that arrived before the startup mise check learned the secret values to
 /// mask, answered once it has. They wait in one queue and are answered in the order they arrived, so a
 /// `contract.agree` never applies to a contract revision set after it.
 pub(crate) struct PendingMaskedRead {
@@ -514,13 +519,16 @@ impl Workspace {
             | Call::ChannelList(_)
             | Call::ContractGet(_)
             | Call::ContractSet(_)
-            | Call::ContractAgree(_)) => {
+            | Call::ContractAgree(_)
+            | Call::AttemptList(_)
+            | Call::AttemptDiff(_)) => {
                 if !self.mise_ready {
                     self.pending_masked_reads
                         .push(PendingMaskedRead { call, responder });
                     return;
                 }
-                self.answer_masked_read(call, cx)
+                self.answer_masked_read(call, responder, cx);
+                return;
             }
             Call::InboxPost(p) => to_json(self.control_inbox_post(&p, cx)),
             Call::SpaceDraft(params) => {
@@ -568,24 +576,26 @@ impl Workspace {
                 self.graph_call(&p.space, cx, |state, _, _| loop_set_autonomy(state, &p))
             }
             Call::SpaceWidenPropose(p) => to_json(self.control_widen_propose(&p, cx)),
-            // Milestone 4 Wave 3 wires attempts into the window; until then the methods answer, but refuse.
-            Call::AttemptList(_)
-            | Call::AttemptReport(_)
-            | Call::AttemptPropose(_)
-            | Call::AttemptDiff(_) => Err(RpcError::conflict(
-                "attempts are not wired into this xctx yet (Milestone 4, Wave 3)",
-            )),
+            Call::AttemptReport(p) => to_json(self.control_attempt_report(&p, cx)),
+            Call::AttemptPropose(p) => to_json(self.control_attempt_propose(&p, cx)),
         };
         responder.respond(result);
     }
 
-    /// Answer a request that shows masked stored text (see [`PendingMaskedRead`]).
-    fn answer_masked_read(
-        &mut self,
-        call: Call,
-        cx: &mut Context<Self>,
-    ) -> Result<Value, RpcError> {
+    /// Answer a request that shows masked stored text (see [`PendingMaskedRead`]). `attempt.diff` runs git, so it
+    /// is answered from the background once git is done.
+    fn answer_masked_read(&mut self, call: Call, responder: Responder, cx: &mut Context<Self>) {
+        if let Call::AttemptDiff(p) = call {
+            self.control_attempt_diff(p, responder, cx);
+            return;
+        }
+        let result = self.masked_read(call, cx);
+        responder.respond(result);
+    }
+
+    fn masked_read(&mut self, call: Call, cx: &mut Context<Self>) -> Result<Value, RpcError> {
         match call {
+            Call::AttemptList(p) => to_json(self.control_attempt_list(&p)),
             Call::InboxList(params) => to_json(self.control_inbox_list(&params)),
             Call::ChannelList(p) => self.graph_call(&p.space, cx, |state, _, redactor| {
                 channel_list(state, &p, redactor)
@@ -691,6 +701,147 @@ impl Workspace {
         })
     }
 
+    /// `attempt.list`: the space's attempts, masked.
+    fn control_attempt_list(
+        &mut self,
+        params: &AttemptListParams,
+    ) -> Result<AttemptListResult, RpcError> {
+        let id = resolve_space(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            &params.space,
+        )?;
+        let set = self.attempts.load(&id).map_err(RpcError::internal)?;
+        Ok(attempt_list(set, params.round, &self.redactor))
+    }
+
+    /// `attempt.report`: record what an attempt's agent reports. Once every attempt of its round is done, the
+    /// Inbox and the status bar say the round is ready for review.
+    fn control_attempt_report(
+        &mut self,
+        params: &AttemptReportParams,
+        cx: &mut Context<Self>,
+    ) -> Result<Ack, RpcError> {
+        let id = resolve_space(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            &params.space,
+        )?;
+        if params.summary.trim().is_empty() {
+            return Err(RpcError::invalid_params("attempt.report: summary is empty"));
+        }
+        let at = attempts::now();
+        let reported = self
+            .attempts
+            .try_change(&id, |set| record_report(set, params, at))
+            .map_err(RpcError::internal)?
+            .map_err(|e| attempt_rpc_error(&id, e))?;
+        if reported.round_finished && !reported.was_finished {
+            let notice = round_done_notice(&id, reported.round);
+            let title = notice.title.clone();
+            if let Some(inbox) = self.inbox.as_mut()
+                && let Err(e) = inbox.post(ItemBody::Notice(notice), Some(id.clone()), Source::App)
+            {
+                self.error(format!("could not post to the Inbox: {e}"), cx);
+            } else {
+                self.info(title, cx);
+            }
+        }
+        cx.notify();
+        Ok(Ack {})
+    }
+
+    /// `attempt.propose`: post a proposal to fork attempts of a writer to the Inbox, for the user to approve.
+    /// Never forks.
+    fn control_attempt_propose(
+        &mut self,
+        params: &AttemptProposeParams,
+        cx: &mut Context<Self>,
+    ) -> Result<AttemptProposeResult, RpcError> {
+        let id = resolve_space(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            &params.space,
+        )?;
+        let space = self
+            .active_space(&id)
+            .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+        let state = self.graphs.load(&space).map_err(RpcError::internal)?;
+        let proposal = attempt_proposal(&id, state.graph(), params)?;
+        let repo = state
+            .graph()
+            .node(&AgentNodeId::new(proposal.agent.clone()))
+            .and_then(|n| n.role.repo().map(str::to_owned))
+            .unwrap_or_default();
+        // Refuse now what approving would refuse, such as more live attempts than a space may have.
+        self.attempts
+            .load(&id)
+            .map_err(RpcError::internal)?
+            .plan_fork(&proposal.agent, &repo, vec![None; proposal.count as usize])
+            .map_err(|e| attempt_rpc_error(&id, e))?;
+        let title = format!(
+            "A request to fork {} of {} in {id} is waiting in the Inbox for your approval",
+            if proposal.count == 1 {
+                "1 attempt".to_owned()
+            } else {
+                format!("{} attempts", proposal.count)
+            },
+            proposal.agent
+        );
+        let Some(inbox) = self.inbox.as_mut() else {
+            return Err(self.inbox_unavailable());
+        };
+        let item = inbox
+            .post(
+                ItemBody::AttemptProposal(proposal),
+                Some(id.clone()),
+                Source::Agent,
+            )
+            .map_err(|e| RpcError::internal(format!("could not post to the Inbox: {e}")))?;
+        self.info(title, cx);
+        cx.notify();
+        Ok(AttemptProposeResult {
+            inbox_item: item.as_str().to_owned(),
+        })
+    }
+
+    /// `attempt.diff`: the attempt's changed files (and one file's diff), masked, read with git in the background
+    /// and answered once it is done.
+    fn control_attempt_diff(
+        &mut self,
+        params: AttemptDiffParams,
+        responder: Responder,
+        cx: &mut Context<Self>,
+    ) {
+        let target = resolve_space(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            &params.space,
+        )
+        .and_then(|id| {
+            let set = self.attempts.load(&id).map_err(RpcError::internal)?;
+            diff_target(&id, set, &params)
+        });
+        let worktree = match target {
+            Ok(worktree) => worktree,
+            Err(e) => {
+                responder.respond(Err(e));
+                return;
+            }
+        };
+        let redactor = self.redactor.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |_, _| {
+            let result = executor
+                .spawn(async move {
+                    to_json(attempt_diff(&worktree, params.path.as_deref(), &redactor))
+                })
+                .await;
+            responder.respond(result);
+        })
+        .detach();
+    }
+
     /// Answer the drafts that waited for the repo index.
     pub(crate) fn flush_control_drafts(&mut self, cx: &mut Context<Self>) {
         for pending in std::mem::take(&mut self.pending_control_drafts) {
@@ -708,8 +859,7 @@ impl Workspace {
             if pending.responder.is_cancelled() {
                 continue;
             }
-            let result = self.answer_masked_read(pending.call, cx);
-            pending.responder.respond(result);
+            self.answer_masked_read(pending.call, pending.responder, cx);
         }
     }
 

@@ -131,15 +131,20 @@ impl Workspace {
             .is_some_and(|dialog| dialog.space() == id)
     }
 
-    /// When a Ship or Discard dialog cannot open for space `id` now, say why and return `true`: another dialog's
-    /// job is running, or the space's own ship or discard is.
-    fn refuse_space_dialog(&mut self, id: &SpaceId, cx: &mut Context<Self>) -> bool {
+    /// When a Ship or Discard (`action`) dialog cannot open for space `id` now, say why and return `true`: another
+    /// dialog's job is running, the space's own ship or discard is, or the space has live attempts (see
+    /// [`Workspace::attempts_block_end`]).
+    fn refuse_space_dialog(&mut self, id: &SpaceId, action: &str, cx: &mut Context<Self>) -> bool {
         if let Some(job) = self.dialog.as_ref().and_then(Dialog::running_job) {
             self.info(wait_message(&job), cx);
             return true;
         }
         if self.in_flight_spaces.contains(id) {
             self.info(in_flight_message(id), cx);
+            return true;
+        }
+        if let Some(why) = self.attempts_block_end(id, action) {
+            self.error(why, cx);
             return true;
         }
         false
@@ -153,7 +158,7 @@ impl Workspace {
         else {
             return;
         };
-        if self.refuse_space_dialog(&space, cx) {
+        if self.refuse_space_dialog(&space, "ship", cx) {
             return;
         }
         let title = cx.new(|cx| {
@@ -187,7 +192,7 @@ impl Workspace {
         let Some(space) = self.active_tab().map(|tab| tab.space.id.clone()) else {
             return;
         };
-        if self.refuse_space_dialog(&space, cx) {
+        if self.refuse_space_dialog(&space, "discard", cx) {
             return;
         }
         self.dialog = Some(Dialog::Discard {
@@ -312,6 +317,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Attempts may have been forked since the dialog opened (say, from the Inbox).
+        if let Some(why) = self.attempts_block_end(&id, action) {
+            self.fail_job(&id, JobError::Failed(why), action, cx);
+            return;
+        }
         let Some(space) = self.spaces.iter().find(|s| s.id == id).cloned() else {
             self.fail_job(
                 &id,
@@ -419,6 +429,7 @@ impl Workspace {
     /// directory in the background, best effort (a leftover directory under `/tmp` harms nothing).
     fn space_ended(&mut self, id: &SpaceId, cx: &mut Context<Self>) {
         self.graphs.forget(id);
+        self.attempts.forget(id);
         let slug = id.as_str().to_owned();
         cx.background_executor()
             .spawn(async move {

@@ -333,11 +333,7 @@ impl Workspace {
                     .and_then(|i| i.get(&id))
                     .map(|i| i.kind());
                 if kind == Some(ItemKind::AttemptProposal) {
-                    // Forking from the Inbox comes with the attempt panes (Milestone 4, Wave 3).
-                    self.info(
-                        "Forking attempts is not wired into the window yet; the request stays in the Inbox",
-                        cx,
-                    );
+                    self.approve_attempt_proposal(id, window, cx);
                 } else {
                     self.approve_widen(id, window, cx);
                 }

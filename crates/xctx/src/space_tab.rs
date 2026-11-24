@@ -22,7 +22,7 @@ use crate::lifecycle::reshape_space;
 use crate::persist::{restore_layout, save_layout};
 use crate::space_graph::{scratch_dir_for, writer_panes};
 use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
-use crate::spawn::{AgentStart, pane_launch, restore_agent_starts, split_agent_start};
+use crate::spawn::{AgentStart, pane_launch_with, restore_agent_starts, split_agent_start};
 use crate::workspace::{View, Workspace, open_space_refusal, wait_message};
 
 /// A layout error of space `id` as a control error: unknown panes are not found, the rest conflicts.
@@ -52,7 +52,8 @@ pub(crate) enum PaneTerminal {
 }
 
 impl PaneTerminal {
-    fn is_alive(&self, cx: &App) -> bool {
+    /// Whether its program is still running.
+    pub(crate) fn is_alive(&self, cx: &App) -> bool {
         match self {
             PaneTerminal::Running { view, exited, .. } => {
                 exited.is_none() && view.read(cx).session().is_alive()
@@ -71,6 +72,9 @@ pub(crate) struct SpaceTab {
     pub(crate) graph_open: bool,
     /// The tab of the Shared Space panel shown in the graph panel.
     pub(crate) shared_tab: SharedTab,
+    /// The agent terminal of each live attempt, by attempt number. They are not in the layout; the attempt strip
+    /// switches to them (see [`Workspace::attempt_terminal`]).
+    pub(crate) attempt_terminals: HashMap<u32, PaneTerminal>,
 }
 
 impl SpaceTab {
@@ -82,6 +86,7 @@ impl SpaceTab {
             terminals: HashMap::new(),
             graph_open: false,
             shared_tab: SharedTab::default(),
+            attempt_terminals: HashMap::new(),
         }
     }
 }
@@ -190,6 +195,7 @@ impl Workspace {
         for (pane, start) in panes.iter().zip(&starts) {
             self.spawn_pane(id, pane, start, window, cx);
         }
+        self.start_live_attempts(id, window, cx);
         if let Some(reason) = restored.fallback {
             self.info(format!("{reason}; opened a fresh layout"), cx);
             self.persist(id, cx);
@@ -216,7 +222,9 @@ impl Workspace {
 
     /// Start the program of `pane` in the space's tab, as the agent of the space's graph it runs (see
     /// [`Workspace::pane_agent_of`]), with the space's scratch directory made if it is missing.
-    fn spawn_pane(
+    /// An agent pane bound to an agent of the graph runs that agent's named `pi` session (see
+    /// [`Workspace::pane_session_of`]).
+    pub(crate) fn spawn_pane(
         &mut self,
         id: &SpaceId,
         pane: &RolePane,
@@ -225,6 +233,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let agent = self.pane_agent_of(id, pane);
+        let session = self.pane_session_of(id, pane, start);
         let Some(tab) = self.tabs.get(id) else {
             return;
         };
@@ -232,8 +241,8 @@ impl Workspace {
             // Best effort: agents may write there with their own tools, which need the directory.
             let _ = std::fs::create_dir_all(scratch.root());
         }
-        let launch =
-            pane_launch(&tab.space, &pane.role, start, &self.search).with_agent(agent.as_ref());
+        let launch = pane_launch_with(&tab.space, &pane.role, start, &session, &self.search)
+            .with_agent(agent.as_ref());
         let program = launch.config.program.clone();
         let terminal = match TerminalView::spawn(
             launch.config,
@@ -722,7 +731,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Stop every terminal of the space and close its tab, after saving its layout. Returns the
+    /// Stop every terminal of the space (attempts' included) and close its tab, after saving its layout. Returns the
     /// live terminal sessions so a caller (such as Ship or Discard) can wait for them to exit
     /// before removing worktrees. Shows Home if the space was shown.
     pub(crate) fn close_space_tab(
@@ -739,6 +748,7 @@ impl Workspace {
             .map(|tab| {
                 tab.terminals
                     .into_values()
+                    .chain(tab.attempt_terminals.into_values())
                     .filter_map(|terminal| match terminal {
                         PaneTerminal::Running { view, .. } => {
                             Some(Arc::clone(view.read(cx).session()))

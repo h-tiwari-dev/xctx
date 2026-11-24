@@ -6214,6 +6214,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "xctx-attempt",
  "xctx-channel",
  "xctx-control",
  "xctx-core",

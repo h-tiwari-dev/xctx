@@ -154,6 +154,10 @@ pub struct AgentNode {
     /// How many turns it has taken.
     #[serde(default)]
     pub turns_used: u32,
+    /// The `pi` session id its pane runs (`pi --session-id <id>`), once xctx has named one. `None` for an agent
+    /// whose pane has not started under an xctx-chosen id yet (agents from before Milestone 4, or new ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// What an edge between two agents means.
@@ -289,6 +293,16 @@ impl AgentGraph {
     /// Record the pane an agent runs in, or `None` when its pane closed.
     pub fn bind_pane(&mut self, id: &AgentNodeId, pane_id: Option<u64>) -> Result<(), GraphError> {
         self.node_mut(id)?.pane_id = pane_id;
+        Ok(())
+    }
+
+    /// Record the `pi` session id an agent's pane runs, or `None` to forget it.
+    pub fn set_session(
+        &mut self,
+        id: &AgentNodeId,
+        session: Option<String>,
+    ) -> Result<(), GraphError> {
+        self.node_mut(id)?.session = session;
         Ok(())
     }
 
@@ -434,6 +448,7 @@ impl AgentGraph {
             state: AgentState::Idle,
             pane_id: None,
             turns_used: 0,
+            session: None,
         });
         self.edges.extend(edges);
         id

@@ -19,6 +19,7 @@ use xctx_core::Space;
 use xctx_layout::{PaneId, PaneKind, PaneRole, RolePane};
 use xctx_term::TerminalConfig;
 
+use crate::agent_session::{AgentSession, agent_args};
 use crate::space_graph::scratch_dir_for;
 
 /// The shell used when `$SHELL` is unset or empty.
@@ -343,6 +344,10 @@ pub const AGENT_ROLE_ENV: &str = "XCTX_AGENT_ROLE";
 /// Ship or Discard.
 pub const SCRATCH_DIR_ENV: &str = "XCTX_SCRATCH_DIR";
 
+/// The environment variable naming the attempt an attempt's pane works on, by its number in the space; `xctx-ctl`
+/// takes `attempt.report`'s `attempt=` from it. Empty in every other pane.
+pub const ATTEMPT_ID_ENV: &str = "XCTX_ATTEMPT_ID";
+
 /// The agent of a space's graph a pane runs as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneAgent {
@@ -379,26 +384,32 @@ pub fn pane_worktree<'a>(space: &'a Space, role: &PaneRole) -> Option<&'a Path> 
 /// The config that starts a pane of `role` in `space`: its program (`pi` for agents, `lazygit` for git panes,
 /// the login shell for shells), run in the repo's worktree with the space's `PORT`, `XCTX_SPACE` and
 /// `MISE_ENV`, the space's scratch directory as [`SCRATCH_DIR_ENV`], and `XCTX_CONTROL_SOCKET` when the control
-/// socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice. [`AGENT_ID_ENV`]
-/// and [`AGENT_ROLE_ENV`] are set empty, so the agent identity of an xctx this one runs inside never leaks into
-/// its panes; the agent a pane runs as is added with [`PaneLaunch::with_agent`].
+/// socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice. [`AGENT_ID_ENV`],
+/// [`AGENT_ROLE_ENV`] and [`ATTEMPT_ID_ENV`] are set empty, so the agent identity of an xctx this one runs inside
+/// never leaks into its panes; the agent a pane runs as is added with [`PaneLaunch::with_agent`]. The agent runs
+/// no session of xctx's naming; see [`pane_launch_with`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn pane_launch(
     space: &Space,
     role: &PaneRole,
     agent: &AgentStart,
     search: &ProgramSearch,
 ) -> PaneLaunch {
+    pane_launch_with(space, role, agent, &AgentSession::Unnamed, search)
+}
+
+/// [`pane_launch`], with an agent pane's `pi` running `session` (see [`agent_args`]).
+pub fn pane_launch_with(
+    space: &Space,
+    role: &PaneRole,
+    agent: &AgentStart,
+    session: &AgentSession,
+    search: &ProgramSearch,
+) -> PaneLaunch {
     let (program, args, notice) = match role.kind {
         PaneKind::Shell => (None, Vec::new(), None),
         PaneKind::Agent => match search.find(AGENT_PROGRAM) {
-            Some(pi) => {
-                let args = match agent {
-                    AgentStart::Task(task) => vec!["--".to_owned(), task.clone()],
-                    AgentStart::Continue => vec!["--continue".to_owned()],
-                    AgentStart::Fresh => Vec::new(),
-                };
-                (Some(pi), args, None)
-            }
+            Some(pi) => (Some(pi), agent_args(agent, session), None),
             None => (
                 None,
                 Vec::new(),
@@ -431,7 +442,10 @@ pub fn pane_launch(
     for (key, value) in space.env() {
         config = config.env(key, value);
     }
-    config = config.env(AGENT_ID_ENV, "").env(AGENT_ROLE_ENV, "");
+    config = config
+        .env(AGENT_ID_ENV, "")
+        .env(AGENT_ROLE_ENV, "")
+        .env(ATTEMPT_ID_ENV, "");
     if let Ok(scratch) = scratch_dir_for(space.id.as_str()) {
         config = config.env(SCRATCH_DIR_ENV, scratch.root().to_string_lossy());
     }
@@ -443,6 +457,54 @@ pub fn pane_launch(
     }
     config = config.env("PATH", search.pane_path(program.as_deref()));
     PaneLaunch { config, notice }
+}
+
+/// What an attempt's agent pane runs: which attempt, where, as which agent and in which session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptPane {
+    /// The attempt's number, exported as [`ATTEMPT_ID_ENV`].
+    pub number: u32,
+    /// The space repo it is a copy of.
+    pub repo: String,
+    /// Its worktree, where `pi` runs.
+    pub worktree: PathBuf,
+    /// Its own `PORT`.
+    pub port: u16,
+    /// The writer it was forked from, exported as [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`].
+    pub agent: PaneAgent,
+    /// Its `pi` session: a fork of the writer's the first time, its own afterwards.
+    pub session: AgentSession,
+    /// What it was told to try, sent as the first message when its session is forked.
+    pub instruction: Option<String>,
+    /// Its scratch directory, exported as [`SCRATCH_DIR_ENV`]; the space's when `None`.
+    pub scratch: Option<PathBuf>,
+}
+
+/// The config that starts an attempt's agent: as [`pane_launch_with`] for an agent in the attempt's repo, but run
+/// in the attempt's worktree with its own `PORT`, scratch directory and [`ATTEMPT_ID_ENV`], as the writer it was
+/// forked from. Its instruction is the first message only when the session is being forked.
+pub fn attempt_launch(space: &Space, attempt: &AttemptPane, search: &ProgramSearch) -> PaneLaunch {
+    let role = PaneRole {
+        kind: PaneKind::Agent,
+        repo: attempt.repo.clone(),
+    };
+    let start = match (&attempt.session, &attempt.instruction) {
+        (AgentSession::Fork { .. }, Some(instruction)) => AgentStart::Task(instruction.clone()),
+        _ => AgentStart::Fresh,
+    };
+    let mut launch = pane_launch_with(space, &role, &start, &attempt.session, search)
+        .with_agent(Some(&attempt.agent));
+    launch.config = launch
+        .config
+        .cwd(&attempt.worktree)
+        .env("PORT", attempt.port.to_string())
+        .env(ATTEMPT_ID_ENV, attempt.number.to_string());
+    if let Some(scratch) = &attempt.scratch {
+        launch.config = launch
+            .config
+            .env(SCRATCH_DIR_ENV, scratch.to_string_lossy());
+    }
+    launch
 }
 
 #[cfg(test)]
@@ -890,6 +952,78 @@ mod tests {
             search.pane_path(Some(Path::new("/Users/me/.pi/agent/bin/pi"))),
             "/usr/bin:/opt/homebrew/bin:/Users/me/.pi/agent/bin:/Users/me/.local/bin:/usr/local/bin"
         );
+    }
+
+    #[test]
+    fn agents_open_their_named_session_and_attempts_fork_in_their_worktree() -> TestResult {
+        let root = tempfile::tempdir()?;
+        executable(&root.path().join("bin/pi"))?;
+        let space = space(root.path());
+        let mut search = search(root.path());
+        search.control = Some(ControlEnv {
+            socket: root.path().join("control.sock"),
+            ctl_dir: None,
+        });
+        let named = pane_launch_with(
+            &space,
+            &role(PaneKind::Agent, "api"),
+            &AgentStart::Task("fix it".into()),
+            &AgentSession::Open("xctx-fix-retry-writer-api".into()),
+            &search,
+        );
+        assert_eq!(
+            named.config.args,
+            ["--session-id", "xctx-fix-retry-writer-api", "--", "fix it"]
+        );
+        assert_eq!(env(&named, ATTEMPT_ID_ENV), Some(""));
+
+        let worktree = root.path().join("api-worktrees/fix-retry--attempt-2");
+        let mut attempt = AttemptPane {
+            number: 2,
+            repo: "api".into(),
+            worktree: worktree.clone(),
+            port: 4012,
+            agent: PaneAgent {
+                id: "writer-api".into(),
+                role: "writer".into(),
+            },
+            session: AgentSession::Fork {
+                source: "xctx-fix-retry-writer-api".into(),
+                id: "xctx-fix-retry-writer-api-attempt-2".into(),
+            },
+            instruction: Some("use a token bucket".into()),
+            scratch: Some(root.path().join("scratch/attempts/2")),
+        };
+        let launch = attempt_launch(&space, &attempt, &search);
+        assert_eq!(
+            launch.config.args,
+            [
+                "--fork",
+                "xctx-fix-retry-writer-api",
+                "--session-id",
+                "xctx-fix-retry-writer-api-attempt-2",
+                "--",
+                "use a token bucket"
+            ]
+        );
+        assert_eq!(launch.config.cwd.as_deref(), Some(worktree.as_path()));
+        assert_eq!(env(&launch, "PORT"), Some("4012"));
+        assert_eq!(env(&launch, ATTEMPT_ID_ENV), Some("2"));
+        assert_eq!(env(&launch, AGENT_ID_ENV), Some("writer-api"));
+        assert_eq!(env(&launch, "XCTX_SPACE"), Some("fix-retry"));
+        assert_eq!(env(&launch, "MISE_ENV"), Some("fix-retry"));
+        assert!(env(&launch, xctx_control::CONTROL_SOCKET_ENV).is_some());
+        let scratch = root.path().join("scratch/attempts/2");
+        assert_eq!(env(&launch, SCRATCH_DIR_ENV), scratch.to_str());
+
+        // Reopened, it opens its own session and is not told its instruction again.
+        attempt.session = AgentSession::Open("xctx-fix-retry-writer-api-attempt-2".into());
+        let reopened = attempt_launch(&space, &attempt, &search);
+        assert_eq!(
+            reopened.config.args,
+            ["--session-id", "xctx-fix-retry-writer-api-attempt-2"]
+        );
+        Ok(())
     }
 
     #[test]
