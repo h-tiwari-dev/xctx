@@ -1,0 +1,54 @@
+crates/xctx/src/inbox_view.rs
+  s_bd9142b0cb5a62::t_d1b4c5a36c54ff 108-114,127-128,226-230,233-251,434-435,477,718
+  s_bd9142b0cb5a62::t_c5a7bf8e51adcf 231-232
+  s_bd9142b0cb5a62::t_593e5e14089cc7 317-322,794-822,836,871,875-879
+crates/xctx/src/graph_panel.rs
+  s_bd9142b0cb5a62::t_85c2883270af53 220
+  s_bd9142b0cb5a62::t_9e82731de0d6d1 13,152-154,182-216,296,331,339
+crates/xctx/src/workspace.rs
+  s_bd9142b0cb5a62::t_d6fd8de226010a 561
+crates/xctx-ui/src/agent_graph.rs
+  s_bd9142b0cb5a62::t_c365ed68e1856c 89-90,135,240
+crates/xctx/src/control.rs
+  s_bd9142b0cb5a62::t_e38b4fa9ce734d 70-72,358-359,516,589-591,844-846,915
+  s_bd9142b0cb5a62::t_d6fd8de226010a 364-379,865,1221-1240
+  s_bd9142b0cb5a62::t_c5a7bf8e51adcf 883-884
+  s_bd9142b0cb5a62::t_e859907dd11cd2 1241-1242
+crates/xctx/src/space_graph.rs
+  s_bd9142b0cb5a62::t_c5a7bf8e51adcf 1221-1222
+  s_bd9142b0cb5a62::t_55d765f04e98a1 9,20,26-27,178-195,197,360-388,603-605,609-612,621-638,705-719,1144-1220,1223-1243
+  s_bd9142b0cb5a62::t_729d17946ff3bd 1244
+crates/xctx-ui/tests/m3_render.rs
+  s_bd9142b0cb5a62::t_7b2591d7e897ff 394,398-399
+  s_bd9142b0cb5a62::t_85c2883270af53 120-121,123-124,370-393,395-397,400-414
+  s_bd9142b0cb5a62::t_4d376e706f026f 415
+crates/xctx/src/space_tab.rs
+  s_bd9142b0cb5a62::t_3823c96da16a5d 23,25,144-145,182-191,231,432-433,468
+crates/xctx-ui/src/loop_bar.rs
+  s_bd9142b0cb5a62::t_dea78b373f9fd6 4-7,338,340,343,368-376,397-413
+crates/xctx-ui/src/shared_space.rs
+  s_bd9142b0cb5a62::t_b64fb129f02f1d 234-236,245,248-249,293-294,311,318-319,413-415
+crates/xctx/src/spawn.rs
+  s_bd9142b0cb5a62::t_8d0005fc1a7be7 628-631,634-638,641-712,912-913,916,925-927
+  s_bd9142b0cb5a62::t_9457af1fdcec7a 5-6
+  s_bd9142b0cb5a62::t_2699dfd4c68cf9 8
+  s_bd9142b0cb5a62::t_1a42ed2df3a1d1 19,22-23,266-269,274,276-278,290-324,342-343,356-357,382-384,434-435
+crates/xctx-ui/src/inbox.rs
+  s_bd9142b0cb5a62::t_103f8728455cbd 120-121,138,160-165,239,410-415,417
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "b3c3b761db47d47fb6ad61712a395893788c46e4",
+  "prompts": {},
+  "sessions": {
+    "s_bd9142b0cb5a62": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a20dba-7b5d-72df-8b65-b0f80d7abf61",
+        "model": "claude-opus-5.5"
+      },
+      "human_author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
