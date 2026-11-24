@@ -9,7 +9,7 @@ use gpui::{
     Styled, Subscription, Task, Window, div, prelude::*,
 };
 use xctx_core::{Redactor, RepoIndex, Space, SpaceId, Store};
-use xctx_inbox::Inbox;
+use xctx_inbox::{Inbox, ItemId};
 use xctx_layout::{FocusDirection, SplitAxis};
 use xctx_term_view::{TerminalFont, TerminalTheme};
 use xctx_ui::{
@@ -19,6 +19,7 @@ use xctx_ui::{
 use crate::control::{Control, PendingDraft};
 use crate::dialogs::Dialog;
 use crate::home::HomeDraft;
+use crate::inbox_view::EnvPrompt;
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight, ResizeUp,
@@ -26,6 +27,7 @@ use crate::keymap::{
     space_key_hints,
 };
 use crate::lifecycle::scan_index;
+use crate::parent_agent::ParentAgent;
 use crate::space_layout::layout_shape;
 use crate::space_tab::SpaceTab;
 use crate::spawn::ProgramSearch;
@@ -93,6 +95,18 @@ pub(crate) struct Workspace {
     pub(crate) inbox_error: Option<String>,
     /// The secret values (from mise) masked in what agents and the Inbox see.
     pub(crate) redactor: Redactor,
+    /// The Inbox entry whose detail is shown.
+    pub(crate) inbox_expanded: Option<SharedString>,
+    /// The Plan Gate open for review on Home.
+    pub(crate) plan_review: Option<ItemId>,
+    /// Whether the reviewed plan is launching.
+    pub(crate) plan_launching: bool,
+    /// Where a repo is typed to add it to the reviewed plan.
+    pub(crate) plan_repo_input: Entity<PromptInput>,
+    /// The Set value input for a missing mise variable.
+    pub(crate) env_prompt: Option<EnvPrompt>,
+    /// The Parent Agent on Home.
+    pub(crate) parent: ParentAgent,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -118,6 +132,9 @@ impl Workspace {
             cx.new(|cx| PromptInput::new(cx).placeholder("A folder with your repos, e.g. ~/code"));
         let repo_input =
             cx.new(|cx| PromptInput::new(cx).placeholder("Path to another repo to add"));
+        let plan_repo_input = cx.new(|cx| {
+            PromptInput::new(cx).placeholder("Add a repo to the plan: an indexed name or a path")
+        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &task_prompt,
@@ -142,6 +159,15 @@ impl Workspace {
                 |this, _, event: &PromptEvent, _, cx| {
                     if let PromptEvent::Submit(path) = event {
                         this.add_repo_path(path.clone(), cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &plan_repo_input,
+                window,
+                |this, _, event: &PromptEvent, _, cx| {
+                    if let PromptEvent::Submit(input) = event {
+                        this.add_plan_repo(input.clone(), cx);
                     }
                 },
             ),
@@ -189,6 +215,12 @@ impl Workspace {
             inbox,
             inbox_error,
             redactor: Redactor::default(),
+            inbox_expanded: None,
+            plan_review: None,
+            plan_launching: false,
+            plan_repo_input,
+            env_prompt: None,
+            parent: ParentAgent::default(),
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -199,6 +231,7 @@ impl Workspace {
         });
         // Before any pane starts, so every pane gets the socket.
         workspace.start_control(window, cx);
+        workspace.start_parent_agent(window, cx);
         if let Some(e) = workspace.inbox_error.clone() {
             workspace.error(e, cx);
         }
@@ -465,7 +498,12 @@ impl Workspace {
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> StatusBar {
         let entity = cx.entity().downgrade();
+        let show_inbox = cx.entity().downgrade();
         let mut bar = StatusBar::new()
+            .inbox(self.inbox_pending())
+            .on_inbox(move |window, cx| {
+                let _ = show_inbox.update(cx, |this, cx| this.show_home(window, cx));
+            })
             .banner(self.banner.clone())
             .on_dismiss_banner(move |_, cx| {
                 let _ = entity.update(cx, |this, cx| this.dismiss_banner(cx));

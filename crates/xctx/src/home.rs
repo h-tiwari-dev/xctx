@@ -7,7 +7,9 @@ use gpui::{
     div, prelude::*,
 };
 use xctx_core::{DraftRepo, Space, SpaceDraft};
-use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, Theme, Tone, shape_label};
+use xctx_ui::{
+    Badge, Button, ButtonSize, ButtonVariant, ParentAgentDrawer, Theme, Tone, shape_label,
+};
 
 use crate::lifecycle::{
     ADDED_BY_HAND, addable_repos, folder_to_index, home_dir, launch_space, repo_for_draft,
@@ -176,8 +178,32 @@ impl Workspace {
             self.error("add at least one repo to the draft before launching", cx);
             return;
         }
+        self.start_launch(
+            draft,
+            window,
+            cx,
+            move |this, _, cx| {
+                if this.draft.clear_if_current(draft_id) {
+                    this.task_prompt.update(cx, |prompt, cx| prompt.clear(cx));
+                }
+            },
+            |_, _| {},
+        );
+    }
+
+    /// Launch `draft` in the background, then open and show its space. `launched` runs once the space exists,
+    /// before its tab opens; `failed` runs when it could not be launched (the error is shown). Returns false,
+    /// with the reason shown, when the store is busy.
+    pub(crate) fn start_launch(
+        &mut self,
+        draft: SpaceDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        launched: impl FnOnce(&mut Self, &xctx_core::Space, &mut Context<Self>) + 'static,
+        failed: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) -> bool {
         let Some(mut store) = self.take_store(&format!("launching {}", draft.title), cx) else {
-            return;
+            return false;
         };
         let executor = cx.background_executor().clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -190,32 +216,34 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.return_store(store, cx);
                 match result {
-                    Ok(launched) => {
-                        let id = launched.space.id.clone();
-                        let port = launched.space.port;
-                        if this.draft.clear_if_current(draft_id) {
-                            this.task_prompt.update(cx, |prompt, cx| prompt.clear(cx));
-                        }
+                    Ok(launched_space) => {
+                        let id = launched_space.space.id.clone();
+                        let port = launched_space.space.port;
+                        launched(this, &launched_space.space, cx);
                         this.refresh_spaces();
-                        this.check_mise(vec![launched.space.clone()], cx);
+                        this.check_mise(vec![launched_space.space.clone()], cx);
                         this.open_launched_space(
-                            launched.space,
-                            launched.layout,
-                            launched.panes,
+                            launched_space.space,
+                            launched_space.layout,
+                            launched_space.panes,
                             window,
                             cx,
                         );
                         this.show_space(&id, window, cx);
-                        match launched.warning {
+                        match launched_space.warning {
                             Some(warning) => this.error(warning, cx),
                             None => this.info(format!("launched {id} on PORT {port}"), cx),
                         }
                     }
-                    Err(e) => this.error(e, cx),
+                    Err(e) => {
+                        failed(this, cx);
+                        this.error(e, cx);
+                    }
                 }
             });
         })
         .detach();
+        true
     }
 
     /// Home's content.
@@ -248,6 +276,7 @@ impl Workspace {
                             .child("Enter drafts a space from your indexed repos. Nothing is created until you launch it."),
                     ),
             );
+        column = column.child(self.render_parent_agent(cx));
         if let Some(error) = &self.store_error {
             column = column.child(notice(error.clone(), theme.danger, &theme));
         }
@@ -264,6 +293,7 @@ impl Workspace {
             ));
         }
         column = column
+            .child(self.render_inbox(cx))
             .child(self.render_spaces(cx))
             .child(self.render_roots(cx));
         div()
@@ -274,6 +304,23 @@ impl Workspace {
             .justify_center()
             .child(column)
             .into_any_element()
+    }
+
+    fn render_parent_agent(&self, cx: &mut Context<Self>) -> ParentAgentDrawer {
+        let toggle = cx.entity().downgrade();
+        let restart = toggle.clone();
+        let mut drawer = ParentAgentDrawer::new(self.parent.status.clone())
+            .open(self.parent.open)
+            .on_toggle(move |_, cx| {
+                let _ = toggle.update(cx, |this, cx| this.toggle_parent_agent(cx));
+            })
+            .on_restart(move |window, cx| {
+                let _ = restart.update(cx, |this, cx| this.start_parent_agent(window, cx));
+            });
+        if let Some(view) = &self.parent.view {
+            drawer = drawer.body(view.clone());
+        }
+        drawer
     }
 
     fn render_draft(&self, draft: &SpaceDraft, cx: &mut Context<Self>) -> Div {
