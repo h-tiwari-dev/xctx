@@ -6,7 +6,8 @@
 //! - a new agent (a launch, a new lane) gets `xctx-<slug>-<agent>` and records it;
 //! - an agent from before Milestone 4 that is being resumed has no id: the newest session pi keeps for its
 //!   worktree is forked into the named one (`pi --fork <file> --session-id <id>`), so it keeps its conversation and
-//!   gets an id from then on. When no such session is found, it keeps `pi --continue` and records nothing;
+//!   gets an id from then on. When no such session is found, it starts the named session as a new one and records it,
+//!   so it can be forked;
 //! - an attempt forks its writer's session into its own worktree (`pi --fork <source> --session-id <attempt>`)
 //!   the first time it starts, and opens its own session afterwards;
 //! - after an adoption, the writer's id becomes `xctx-<slug>-<agent>-adopted-<n>`, forked from the winning
@@ -211,7 +212,7 @@ pub fn adopted_session_id(slug: &str, agent: &str, number: u32) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentSession {
     /// No xctx id: what [`AgentStart`] alone says (`--continue`, a task, or nothing). For panes that run no agent
-    /// of the graph, and agents from before Milestone 4 with no session to carry over.
+    /// of the graph.
     Unnamed,
     /// Open session `id`, or create it: `pi --session-id <id>`.
     Open(String),
@@ -274,7 +275,9 @@ pub fn pane_session(
                 source: file.to_string_lossy().into_owned(),
                 id,
             },
-            None => AgentSession::Unnamed,
+            // Nothing to carry over: the agent has never had a session, so it starts a named one now. Leaving it
+            // unnamed would keep it from ever being forked.
+            None => AgentSession::Open(id),
         },
     }
 }
@@ -386,9 +389,10 @@ mod tests {
                 id: "xctx-s-writer-api".into()
             }
         );
-        let kept = pane_session("s", "writer-api", None, &AgentStart::Continue, || None);
-        assert_eq!(kept, AgentSession::Unnamed);
-        assert_eq!(kept.named_id(), None);
+        // An agent with no session anywhere starts a named one, so it can be forked.
+        let fresh = pane_session("s", "writer-api", None, &AgentStart::Continue, || None);
+        assert_eq!(fresh, AgentSession::Open("xctx-s-writer-api".into()));
+        assert_eq!(fresh.named_id(), Some("xctx-s-writer-api"));
         assert_eq!(
             adopted_session_id("s", "writer-api", 3),
             "xctx-s-writer-api-adopted-3"
