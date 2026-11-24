@@ -17,7 +17,9 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
 
 **Milestone 3 (complete):** multi-agent graphs with an orchestrator, one writer per repo and read-only helpers, a shared contract and channel, write → test → probe → review loops with autonomy levels, and space widening. See [`docs/m3.md`](docs/m3.md).
 
-**Next: Milestone 4**, branching agents and competing attempts, planned in [`docs/m4.md`](docs/m4.md).
+**Milestone 4 (complete):** git-branch a writer agent into competing attempts, each with its own worktree, `PORT` and forked `pi` session. Compare them on a review sheet (⌘⇧R), adopt the winner and discard the rest. Fork with ⌘⇧F. See [`docs/m4.md`](docs/m4.md).
+
+**Next: Milestone 5**, plugins and connectors as live panes; see [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Prerequisites
 

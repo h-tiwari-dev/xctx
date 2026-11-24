@@ -38,14 +38,14 @@ See [`docs/m3.md`](m3.md).
 - **Agent Graph View**: live GPUI view to inspect the graph, pause/resume agents, add/remove lanes, talk directly to a
   specific agent, or split/merge spaces.
 
-### Milestone 4 — Branching agents & competing attempts (next)
+### Milestone 4 — Branching agents & competing attempts (complete)
 See [`docs/m4.md`](m4.md).
 - **Git-branch an entire agent** (hidden worktree + `pi --fork` session tree + scratch state) to run competing
   attempts (Solutions 1, 2, 3) in parallel.
 - **Outcome comparison & review sheet**: compare repros, tests, and diffs side by side, discard dead ends, or merge the
   winner.
 
-### Milestone 5 — Plugins & connectors as live panes + agent tools
+### Milestone 5 — Plugins & connectors as live panes + agent tools (next)
 - **Plugin manifest contract**: every plugin provides a live GPUI pane, agent tools over the harness, and events that
   trigger or stop loops.
 - **First-party plugins**: Browser pane, API client (Postman-style replay), Logs & read-only DB pane (write-gated),
