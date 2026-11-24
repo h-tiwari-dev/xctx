@@ -1,9 +1,10 @@
 //! The socket server: binds the control socket, reads requests, checks them, and hands each one to the app.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +17,7 @@ use serde_json::Value;
 
 use crate::error::{ControlError, Result, io_error};
 use crate::path::check_socket_path;
+use crate::peer::peer_is_same_user;
 use crate::protocol::{
     Call, Capability, ErrorCode, MAX_LINE_BYTES, PingResult, RequestEnvelope, Response, RpcError,
 };
@@ -31,6 +33,11 @@ pub struct ServerConfig {
     /// What connections may do. Calls to a method outside this set get [`ErrorCode::Forbidden`].
     pub capabilities: BTreeSet<Capability>,
     /// How long a connection waits for the app to answer a request before replying [`ErrorCode::Timeout`].
+    ///
+    /// The timeout does not withdraw the request from the app: the [`Incoming`] may still be queued and run
+    /// later. Once the timeout passes, its [`Responder::is_cancelled`] is `true`, so a handler should check it
+    /// before doing work the client has stopped waiting for, mutating calls above all (a client that retries a
+    /// timed-out `pane.split` must not get two splits).
     pub reply_timeout: Duration,
 }
 
@@ -73,9 +80,17 @@ impl Incoming {
 #[derive(Debug)]
 pub struct Responder {
     tx: mpsc::SyncSender<Result<Value, RpcError>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Responder {
+    /// Whether the connection has stopped waiting because [`ServerConfig::reply_timeout`] passed and the client
+    /// was told the request timed out. A handler should then skip the work rather than carry out a stale request
+    /// the client may retry; answering anyway is harmless but goes nowhere.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
     /// Answer with `result`. Does nothing when the client has gone away or the request timed out.
     pub fn respond(self, result: Result<Value, RpcError>) {
         // The receiver is gone only when the connection stopped waiting; there is no one left to tell.
@@ -110,6 +125,9 @@ pub struct Server {
     identity: Option<(u64, u64)>,
     shared: Arc<Shared>,
     accept: Option<JoinHandle<()>>,
+    /// The open `<socket>.lock` holding the exclusive `flock` that makes this the only server on `path`. A field
+    /// is dropped after `Drop::drop` runs, so the lock is released only once the socket file is removed.
+    _lock: File,
 }
 
 impl std::fmt::Debug for Server {
@@ -126,6 +144,12 @@ impl Server {
     /// connections from other users are also refused by peer id. A stale socket file left by a crashed window is
     /// replaced. Fails with [`ControlError::AlreadyRunning`] when a live server answers on `path`, and with
     /// [`ControlError::SocketPathTooLong`] when the path does not fit in a socket address.
+    ///
+    /// The server holds an exclusive lock on a sibling `<socket>.lock` file (for example `control.sock.lock`)
+    /// from before it looks at the socket until it is dropped. When another server holds that lock, `bind`
+    /// fails with [`ControlError::AlreadyRunning`] without touching the socket, so two windows starting at once
+    /// cannot delete each other's socket. The lock file is left in place: removing it could let a third
+    /// process lock a fresh file while another still holds the old one.
     pub fn bind(
         path: impl Into<PathBuf>,
         config: ServerConfig,
@@ -136,6 +160,7 @@ impl Server {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(io_error(parent))?;
         }
+        let lock = lock_socket(&path)?;
         clear_stale_socket(&path)?;
         let listener = UnixListener::bind(&path).map_err(io_error(&path))?;
         listener.set_nonblocking(true).map_err(io_error(&path))?;
@@ -161,6 +186,7 @@ impl Server {
             identity,
             shared,
             accept: Some(accept),
+            _lock: lock,
         })
     }
 
@@ -193,6 +219,38 @@ impl Drop for Server {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+/// The lock file that guards the socket at `path`: the same path with `.lock` appended.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Open the socket's lock file and take an exclusive `flock` on it without waiting. The lock lasts as long as
+/// the returned file is open. Fails with [`ControlError::AlreadyRunning`] when another server holds it.
+fn lock_socket(path: &Path) -> Result<File> {
+    use std::os::fd::AsRawFd;
+    let lock_path = lock_path(path);
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(io_error(&lock_path))?;
+    // SAFETY: the fd belongs to `file`, which stays open for the duration of the call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::WouldBlock {
+            return Err(ControlError::AlreadyRunning(path.to_path_buf()));
+        }
+        return Err(io_error(&lock_path)(e));
+    }
+    Ok(file)
 }
 
 /// Remove a socket file nothing answers on. Leave a live one alone and refuse to touch anything that is not a
@@ -258,55 +316,26 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
         if let (Ok(clone), Ok(mut connections)) = (stream.try_clone(), shared.connections.lock()) {
             connections.insert(id, clone);
         }
-        let shared = Arc::clone(shared);
+        let connection_shared = Arc::clone(shared);
         let spawned = thread::Builder::new()
             .name(format!("xctx-control-{id}"))
             .spawn(move || {
-                serve_connection(stream, &shared);
-                if let Ok(mut connections) = shared.connections.lock() {
+                serve_connection(stream, &connection_shared);
+                if let Ok(mut connections) = connection_shared.connections.lock() {
                     connections.remove(&id);
                 }
             });
         if spawned.is_err() {
+            // The closure, and the stream in it, is gone; close the copy kept for shutdown too, so the fd is
+            // not leaked and the client sees end of stream instead of waiting for its timeout.
+            if let Ok(mut connections) = shared.connections.lock()
+                && let Some(clone) = connections.remove(&id)
+            {
+                let _ = clone.shutdown(std::net::Shutdown::Both);
+            }
             thread::sleep(Duration::from_millis(50));
         }
     }
-}
-
-/// Whether the process on the other end runs as the same user as this one.
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-fn peer_is_same_user(stream: &UnixStream) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: the fd is a connected Unix socket owned by `stream` for the duration of the call, and both out
-    // pointers point at live locals of the right type.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    Ok(uid == me)
-}
-
-/// Whether the process on the other end runs as the same user as this one. Without `getpeereid` the socket's
-/// owner-only mode is the only check.
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd"
-)))]
-fn peer_is_same_user(_stream: &UnixStream) -> io::Result<bool> {
-    Ok(true)
 }
 
 /// Read one line of at most [`MAX_LINE_BYTES`]. `Ok(None)` at end of stream; an error for a longer line.
@@ -394,20 +423,27 @@ fn dispatch(call: Call, shared: &Shared) -> Result<Value, RpcError> {
             .map_err(|e| RpcError::internal(e.to_string()));
     }
     let (tx, rx) = mpsc::sync_channel(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
     (shared.handler)(Incoming {
         call,
-        responder: Responder { tx },
+        responder: Responder {
+            tx,
+            cancelled: Arc::clone(&cancelled),
+        },
     });
     let timeout = shared.config.reply_timeout;
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(RpcError::new(
-            ErrorCode::Timeout,
-            format!(
-                "xctx did not answer {method} within {}s",
-                timeout.as_secs_f32()
-            ),
-        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            cancelled.store(true, Ordering::Release);
+            Err(RpcError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "xctx did not answer {method} within {}s; it may still carry it out later",
+                    timeout.as_secs_f32()
+                ),
+            ))
+        }
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(RpcError::internal(format!(
             "xctx dropped the {method} request without answering"
         ))),

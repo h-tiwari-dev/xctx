@@ -119,17 +119,19 @@ pub fn parse_args(
 }
 
 fn parse_param(arg: &str) -> Result<(String, Value), UsageError> {
-    if let Some((key, json)) = arg.split_once(":=") {
-        check_key(key, arg)?;
-        let value = serde_json::from_str(json)
-            .map_err(|e| UsageError(format!("{key}:= is not JSON: {e}")))?;
-        return Ok((key.to_owned(), value));
-    }
-    let Some((key, raw)) = arg.split_once('=') else {
+    // Split on the first `=` so a string value may itself contain `=` or `:=`.
+    let Some((lhs, raw)) = arg.split_once('=') else {
         return Err(UsageError(format!(
             "expected key=value or key:=<json>, got {arg:?}"
         )));
     };
+    if let Some(key) = lhs.strip_suffix(':') {
+        check_key(key, arg)?;
+        let value = serde_json::from_str(raw)
+            .map_err(|e| UsageError(format!("{key}:= is not JSON: {e}")))?;
+        return Ok((key.to_owned(), value));
+    }
+    let key = lhs;
     check_key(key, arg)?;
     let value = if INTEGER_KEYS.contains(&key) {
         let n: u64 = raw
@@ -179,7 +181,8 @@ pub fn help() -> String {
         "\nenvironment:\n  \
          {CONTROL_SOCKET_ENV:<20} the socket (else control.sock in the xctx data directory)\n  \
          {SPACE_ENV:<20} the default space=, set in every pane of a space\n\n\
-         The result is printed as JSON. Exit status: 0 ok, 1 the window refused, 2 bad arguments, 3 no window.\n\
+         The result is printed as JSON. Exit status: 0 ok, 1 the window refused or the call failed, \
+         2 bad arguments, 3 no window.\n\
          Nothing here approves or launches: space.draft posts a Plan Gate the user approves in the window.\n"
     );
     out
@@ -188,7 +191,10 @@ pub fn help() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{InboxListParams, PaneParams, PaneSplitParams, SpaceDraftParams};
+    use crate::StatusLevel;
+    use crate::protocol::{
+        InboxListParams, PaneParams, PaneSplitParams, SpaceDraftParams, StatusSetParams,
+    };
     use xctx_layout::{PaneId, SplitAxis};
 
     fn args(s: &str) -> Vec<String> {
@@ -257,6 +263,41 @@ mod tests {
                 all: true
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn values_split_on_the_first_equals_sign() -> Result<(), UsageError> {
+        assert_eq!(
+            call("status.set message=ratio:=1", None)?,
+            Call::StatusSet(StatusSetParams {
+                message: "ratio:=1".into(),
+                level: StatusLevel::default(),
+                space: None,
+            })
+        );
+        let with_space = vec!["space.draft".to_owned(), "task=set x:=y".to_owned()];
+        let Command::Call { call: draft, .. } = parse_args(with_space, None)? else {
+            return Err(UsageError("space.draft is not a call".into()));
+        };
+        assert_eq!(
+            draft,
+            Call::SpaceDraft(SpaceDraftParams {
+                task: "set x:=y".into(),
+                repos: None,
+                rationale: None,
+            })
+        );
+        assert_eq!(
+            call(r#"space.draft task=t repos:=["a","b"]"#, None)?,
+            Call::SpaceDraft(SpaceDraftParams {
+                task: "t".into(),
+                repos: Some(vec!["a".into(), "b".into()]),
+                rationale: None,
+            })
+        );
+        assert!(call("space.draft task=t repos:=[", None).is_err());
+        assert!(call("space.draft :=1 task=t", None).is_err());
         Ok(())
     }
 

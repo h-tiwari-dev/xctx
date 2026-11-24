@@ -136,6 +136,7 @@ fn an_unanswered_request_times_out_and_a_dropped_one_fails() -> TestResult {
         move |incoming: Incoming| {
             let (call, responder) = incoming.into_parts();
             if call == Call::SpaceList {
+                assert!(!responder.is_cancelled(), "cancelled before the timeout");
                 if let Ok(mut parked) = parked.lock() {
                     parked.push(responder);
                 }
@@ -158,9 +159,11 @@ fn an_unanswered_request_times_out_and_a_dropped_one_fails() -> TestResult {
         matches!(&dropped, Err(ControlError::Rpc(e)) if e.kind() == Some(ErrorCode::InternalError)),
         "{dropped:?}"
     );
-    // Answering after the timeout is harmless.
+    // The parked request knows the client stopped waiting; answering after the timeout is harmless.
     if let Ok(mut parked) = parked.lock() {
+        assert_eq!(parked.len(), 1);
         for responder in parked.drain(..) {
+            assert!(responder.is_cancelled());
             responder.ok(&json!({}));
         }
     }
@@ -282,11 +285,70 @@ fn stopping_a_server_whose_socket_was_replaced_leaves_the_new_one_alone() -> Tes
     let (_dir, path) = temp()?;
     let old = serve(&path)?;
     std::fs::remove_file(&path)?;
-    let _new = serve(&path)?;
+    // Something that does not take the lock, such as an older xctx, binds the path.
+    let _new = UnixListener::bind(&path)?;
     let started = std::time::Instant::now();
     drop(old);
     assert!(started.elapsed() < Duration::from_secs(2), "shutdown hung");
     assert!(path.exists());
+    assert!(UnixStream::connect(&path).is_ok());
+    Ok(())
+}
+
+#[test]
+fn two_servers_binding_at_once_leave_one_running_and_refuse_the_other() -> TestResult {
+    for _ in 0..20 {
+        let (_dir, path) = temp()?;
+        // A stale socket both will want to clear.
+        drop(UnixListener::bind(&path)?);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    serve(&path)
+                })
+            })
+            .collect();
+        let mut results = Vec::new();
+        for racer in racers {
+            results.push(racer.join().map_err(|_| "bind thread panicked")?);
+        }
+        let running: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
+        assert_eq!(running.len(), 1, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, Err(ControlError::AlreadyRunning(_)))),
+            "{results:?}"
+        );
+        assert!(
+            Client::connect(&path)?.ping().is_ok(),
+            "the winner's socket is still there"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_held_lock_refuses_to_bind_without_touching_the_socket() -> TestResult {
+    let (_dir, path) = temp()?;
+    let holder = serve(&path)?;
+    assert!(path.with_file_name("control.sock.lock").exists());
+    // The holder's socket is gone and a stale one sits in its place; a second server must leave it alone.
+    std::fs::remove_file(&path)?;
+    drop(UnixListener::bind(&path)?);
+    let before = std::fs::symlink_metadata(&path)?;
+    assert!(matches!(serve(&path), Err(ControlError::AlreadyRunning(_))));
+    let after = std::fs::symlink_metadata(&path)?;
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&before),
+        std::os::unix::fs::MetadataExt::ino(&after)
+    );
+    drop(holder);
+    let _next = serve(&path)?;
     assert!(Client::connect(&path)?.ping().is_ok());
     Ok(())
 }
@@ -373,5 +435,61 @@ fn xctx_ctl_says_when_no_window_is_running() -> TestResult {
         .output()?;
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8(out.stderr)?.contains("not running"));
+    Ok(())
+}
+
+/// A fake window that answers every request line with `reply`, for as many connections as come.
+fn fake_window(path: &Path, reply: &'static str) -> std::io::Result<()> {
+    let listener = UnixListener::bind(path)?;
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let Ok(read_half) = stream.try_clone() else {
+                return;
+            };
+            let mut writer = stream;
+            for line in BufReader::new(read_half).lines() {
+                if line.is_err() || writeln!(writer, "{reply}").is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[test]
+fn a_null_id_is_accepted_only_on_an_error() -> TestResult {
+    let (_dir, path) = temp()?;
+    fake_window(&path, r#"{"jsonrpc":"2.0","id":null,"result":{}}"#)?;
+    let result = Client::connect(&path)?.call(&Call::SpaceList);
+    assert!(
+        matches!(&result, Err(ControlError::Protocol(_))),
+        "{result:?}"
+    );
+
+    let (_dir, path) = temp()?;
+    fake_window(
+        &path,
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad line"}}"#,
+    )?;
+    let result = Client::connect(&path)?.call(&Call::SpaceList);
+    assert!(
+        matches!(&result, Err(ControlError::Rpc(e)) if e.kind() == Some(ErrorCode::ParseError)),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn xctx_ctl_exits_1_when_the_window_answers_nonsense() -> TestResult {
+    let (_dir, path) = temp()?;
+    fake_window(&path, "not json")?;
+    let out = Command::new(env!("CARGO_BIN_EXE_xctx-ctl"))
+        .arg("ping")
+        .env("XCTX_CONTROL_SOCKET", &path)
+        .output()?;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stderr)?.contains("protocol error"));
     Ok(())
 }

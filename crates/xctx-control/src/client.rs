@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 
 use crate::error::{ControlError, Result, io_error};
 use crate::path::{check_socket_path, socket_path};
-use crate::protocol::{Call, JSONRPC_VERSION, PingResult, RequestEnvelope, Response};
+use crate::peer::peer_is_same_user;
+use crate::protocol::{Call, JSONRPC_VERSION, Outcome, PingResult, RequestEnvelope, Response};
 
 /// How long a call waits for its answer by default: a little longer than the server's own reply timeout, so the
 /// server's timeout error arrives first.
@@ -26,7 +27,9 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to the socket at `path`. Fails with [`ControlError::NotRunning`] when nothing listens there.
+    /// Connect to the socket at `path`. Fails with [`ControlError::NotRunning`] when nothing listens there, and
+    /// with [`ControlError::Protocol`] when the process listening runs as another user, so requests are never
+    /// sent to a socket someone else planted.
     pub fn connect(path: impl Into<PathBuf>) -> Result<Client> {
         let path = path.into();
         check_socket_path(&path)?;
@@ -36,6 +39,13 @@ impl Client {
             }
             _ => io_error(&path)(e),
         })?;
+        if !peer_is_same_user(&stream).map_err(io_error(&path))? {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(ControlError::Protocol(format!(
+                "{} is served by another user; refusing to use it",
+                path.display()
+            )));
+        }
         stream
             .set_read_timeout(Some(DEFAULT_CALL_TIMEOUT))
             .map_err(io_error(&path))?;
@@ -101,8 +111,10 @@ impl Client {
             )));
         }
         if response.id != json!(id) {
-            // A null id means the server could not read the request; its error says why.
-            if !response.id.is_null() {
+            // A null id is allowed only on an error: the server could not read the request, and says why.
+            let unreadable_request =
+                response.id.is_null() && matches!(response.outcome, Outcome::Error(_));
+            if !unreadable_request {
                 return Err(ControlError::Protocol(format!(
                     "response for id {} to request {id}",
                     response.id

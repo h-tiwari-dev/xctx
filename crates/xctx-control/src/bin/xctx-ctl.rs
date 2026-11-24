@@ -56,9 +56,13 @@ fn main() -> ExitCode {
             eprintln!("xctx-ctl: {}: {}", call.method(), e.message);
             ExitCode::from(1)
         }
-        Err(e) => {
+        Err(e @ (ControlError::NotRunning(_) | ControlError::NoSocketPath(_))) => {
             eprintln!("xctx-ctl: {e}");
             ExitCode::from(3)
+        }
+        Err(e) => {
+            eprintln!("xctx-ctl: {e}");
+            ExitCode::from(1)
         }
     }
 }

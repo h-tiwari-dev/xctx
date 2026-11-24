@@ -17,6 +17,7 @@ pub mod cli;
 mod client;
 mod error;
 mod path;
+mod peer;
 pub mod protocol;
 mod server;
 
