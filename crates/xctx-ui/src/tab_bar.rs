@@ -77,18 +77,21 @@ type ShapeHandler = Rc<dyn Fn(Shape, &mut Window, &mut App)>;
 /// The top bar. The app passes what to show and wires the callbacks; the bar keeps no state.
 ///
 /// The shape selector, Ship and Discard appear only when [`TabBar::active_shape`] is set, which the app does
-/// while a space is shown.
+/// while a space is shown. The Graph toggle (test selector `tab-graph`) appears next to the shape selector when
+/// a space is shown and [`TabBar::on_graph`] is set.
 #[derive(IntoElement)]
 pub struct TabBar {
     home_active: bool,
     tabs: Vec<TabItem>,
     active_shape: Option<Shape>,
+    graph_open: bool,
     leading_inset: Pixels,
     on_home: Option<Handler>,
     on_select: Option<SelectHandler>,
     on_shape: Option<ShapeHandler>,
     on_ship: Option<Handler>,
     on_discard: Option<Handler>,
+    on_graph: Option<Handler>,
 }
 
 impl Default for TabBar {
@@ -104,12 +107,14 @@ impl TabBar {
             home_active: false,
             tabs: Vec::new(),
             active_shape: None,
+            graph_open: false,
             leading_inset: Theme::SPACE_2,
             on_home: None,
             on_select: None,
             on_shape: None,
             on_ship: None,
             on_discard: None,
+            on_graph: None,
         }
     }
 
@@ -128,6 +133,12 @@ impl TabBar {
     /// The shape of the space being shown, or `None` on Home. Shows the shape selector, Ship and Discard.
     pub fn active_shape(mut self, shape: Option<Shape>) -> Self {
         self.active_shape = shape;
+        self
+    }
+
+    /// Show the Graph toggle as on, while the Agent Graph and Shared Space panel are open.
+    pub fn graph_open(mut self, open: bool) -> Self {
+        self.graph_open = open;
         self
     }
 
@@ -167,6 +178,12 @@ impl TabBar {
     /// Called when Discard is clicked.
     pub fn on_discard(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_discard = Some(Rc::new(handler));
+        self
+    }
+
+    /// Offer the Graph toggle while a space is shown, calling `handler` when it is clicked.
+    pub fn on_graph(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_graph = Some(Rc::new(handler));
         self
     }
 }
@@ -250,6 +267,22 @@ impl RenderOnce for TabBar {
                 }
                 pill
             });
+            let graph = self.on_graph.map(|handler| {
+                div()
+                    .flex()
+                    .items_center()
+                    .p(Theme::SPACE_0_5)
+                    .rounded(Theme::RADIUS_FULL)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .child(
+                        Pill::new("tab-graph", "Graph")
+                            .selected(self.graph_open)
+                            .selector("tab-graph")
+                            .on_click(move |_, window, cx| handler(window, cx)),
+                    )
+            });
             let mut discard = Button::new("tab-discard", "Discard").variant(ButtonVariant::Danger);
             if let Some(handler) = self.on_discard {
                 discard = discard.on_click(move |_, window, cx| handler(window, cx));
@@ -275,6 +308,7 @@ impl RenderOnce for TabBar {
                         .bg(theme.surface)
                         .children(pills),
                 )
+                .children(graph)
                 .child(div().w(px(1.0)).h(px(16.0)).bg(theme.divider))
                 .child(discard)
                 .child(ship)
@@ -337,7 +371,12 @@ mod tests {
         let bar = TabBar::new();
         assert!(bar.active_shape.is_none());
         assert!(!bar.home_active);
-        let bar = bar.home_active(true).active_shape(Some(Shape::Debug));
+        assert!(bar.on_graph.is_none() && !bar.graph_open);
+        let bar = bar
+            .home_active(true)
+            .active_shape(Some(Shape::Debug))
+            .graph_open(true);
         assert_eq!(bar.active_shape, Some(Shape::Debug));
+        assert!(bar.graph_open);
     }
 }
