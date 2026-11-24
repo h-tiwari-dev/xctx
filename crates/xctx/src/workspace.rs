@@ -16,6 +16,8 @@ use xctx_ui::{
     BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme,
 };
 
+use crate::agent_session::SessionStorage;
+use crate::attempts::SpaceAttempts;
 use crate::control::{Control, PendingDraft, PendingMaskedRead};
 use crate::dialogs::Dialog;
 use crate::home::HomeDraft;
@@ -99,8 +101,17 @@ pub(crate) struct Workspace {
     pub(crate) pending_masked_reads: Vec<PendingMaskedRead>,
     /// Each space's agent graph, loop and shared space, loaded when first needed.
     pub(crate) graphs: SpaceGraphs,
-    /// The space widening requests being approved now, so none is approved twice.
+    /// The space widening and attempt proposal requests being approved now, so none is approved twice (or turned
+    /// down while it runs).
     pub(crate) widen_approvals: HashSet<ItemId>,
+    /// Each space's competing attempts, loaded when first needed.
+    pub(crate) attempts: SpaceAttempts,
+    /// Spaces whose fork, adopt or discard of attempts is running: one at a time per space, and no Ship or
+    /// Discard of the space meanwhile.
+    pub(crate) attempt_jobs: HashSet<SpaceId>,
+    /// Where pi keeps its sessions, for finding an agent's session from before named sessions and whether a forked
+    /// session has started; `None` when neither `PI_CODING_AGENT_SESSION_DIR` nor `HOME` is set.
+    pub(crate) sessions: Option<SessionStorage>,
     /// The Inbox; `None` when it could not be opened.
     pub(crate) inbox: Option<Inbox>,
     /// Why the Inbox could not be opened.
@@ -231,8 +242,11 @@ impl Workspace {
             pending_control_drafts: Vec::new(),
             mise_ready: false,
             pending_masked_reads: Vec::new(),
-            graphs: SpaceGraphs::new(data_dir),
+            graphs: SpaceGraphs::new(data_dir.clone()),
             widen_approvals: HashSet::new(),
+            attempts: SpaceAttempts::new(data_dir),
+            attempt_jobs: HashSet::new(),
+            sessions: SessionStorage::from_env(),
             inbox,
             inbox_error,
             redactor: Redactor::default(),
@@ -362,13 +376,17 @@ impl Workspace {
     /// When a background job holds the store, say so and return `true`: quitting or closing the window now would
     /// stop it partway through its worktree or push operations.
     pub(crate) fn refuse_while_busy(&mut self, cx: &mut Context<Self>) -> bool {
-        match self.busy.clone() {
-            Some(busy) => {
-                self.info(wait_message(&busy), cx);
-                true
-            }
-            None => false,
+        if let Some(busy) = self.busy.clone() {
+            self.info(wait_message(&busy), cx);
+            return true;
         }
+        // An adopt or discard of attempts does not take the store, but stopping it would leave a merge or a
+        // worktree half done.
+        if let Some(id) = self.attempt_jobs.iter().next().cloned() {
+            self.info(wait_message(&format!("the attempt job of {id}")), cx);
+            return true;
+        }
+        false
     }
 
     /// Index the store's folders again, in the background.

@@ -368,3 +368,102 @@ fn an_approved_widen_request_adds_a_worktree_and_a_writer() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn attempts_fork_report_diff_and_go_without_a_trace() -> TestResult {
+    use xctx_control::protocol::{AttemptDiffParams, AttemptReportParams, ReproStatus};
+    use xctx_core::Redactor;
+
+    use crate::attempts::{
+        SpaceAttempts, allocate_attempt_ports, attempt_diff, attempt_list, diff_target,
+        live_attempts_refusal, record_report,
+    };
+
+    let fixture = Fixture::new()?;
+    let mut store = fixture.store()?;
+    let mut draft = xctx_core::SpaceDraft::new("make payments checkout retry safe");
+    draft.add_repo(repo_for_draft(&fixture.payments.to_string_lossy(), None)?);
+    let space = launch_space(&mut store, draft)?.space;
+    let worktree = space.repos[0].worktree.clone();
+    fs::write(worktree.join("wip.txt"), "uncommitted work\n")?;
+
+    // Plan, allocate ports outside the space's, fork, record.
+    let mut attempts = SpaceAttempts::new(Some(fixture.data_dir()));
+    let plan = attempts.load(&space.id)?.plan_fork(
+        "writer-payments",
+        "payments",
+        vec![Some("use a token bucket".into()), None],
+    )?;
+    let taken: Vec<u16> = store.port_allocations().into_keys().collect();
+    let ports = allocate_attempt_ports(plan.numbers.len(), taken)?;
+    assert!(!ports.contains(&space.port));
+    let pairs: Vec<(u32, u16)> = plan.numbers.iter().copied().zip(ports).collect();
+    let made = xctx_core::fork_attempts(&space, "payments", &pairs)?;
+    attempts.change(&space.id, |set| {
+        set.record_fork(&plan, made.clone(), "xctx-s-writer-payments", 1)
+            .map(|_| ())
+    })?;
+    assert!(made[0].worktree.join("wip.txt").is_file());
+    assert!(live_attempts_refusal(&space.id, attempts.load(&space.id)?, "ship").is_some());
+
+    // Attempt 1 works and reports; its diff is masked.
+    fs::write(made[0].worktree.join("wip.txt"), "token tok-999999\n")?;
+    let set = attempts.load(&space.id)?;
+    let params = AttemptDiffParams {
+        space: space.id.as_str().to_owned(),
+        attempt: 1,
+        path: Some("wip.txt".into()),
+    };
+    let target = diff_target(&space.id, set, &params)?;
+    let redactor = Redactor::new([("T".to_owned(), "tok-999999".to_owned())]);
+    let diff = attempt_diff(&target, params.path.as_deref(), &redactor)?;
+    assert_eq!(
+        diff.files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>(),
+        ["wip.txt"]
+    );
+    let text = diff.diff.unwrap_or_default();
+    assert!(
+        text.contains("[REDACTED:T]") && !text.contains("tok-999999"),
+        "{text}"
+    );
+    let report = |attempt| AttemptReportParams {
+        space: space.id.as_str().to_owned(),
+        attempt,
+        summary: "swapped the limiter".into(),
+        tests_passed: Some(3),
+        tests_failed: None,
+        test_command: None,
+        repro: ReproStatus::Fixed,
+        gave_up: false,
+    };
+    let first = attempts.change(&space.id, |set| record_report(set, &report(1), 2))?;
+    assert!(!first.round_finished);
+    let second = attempts.change(&space.id, |set| record_report(set, &report(2), 3))?;
+    assert!(second.round_finished);
+    let listed = attempt_list(attempts.load(&space.id)?, Some(1), &redactor);
+    assert_eq!(listed.attempts.len(), 2);
+
+    // Adopt 1 (the space did not change since the fork), discard 2: nothing of either is left.
+    let adopted = xctx_core::adopt_attempt(&space, &made[0])?;
+    assert!(adopted.fast_forward);
+    assert_eq!(
+        fs::read_to_string(worktree.join("wip.txt"))?,
+        "token tok-999999\n"
+    );
+    attempts.change(&space.id, |set| set.mark_adopted(1, 4).map(|_| ()))?;
+    for attempt in &made {
+        xctx_core::discard_attempt(space.id.as_str(), attempt)?;
+        assert!(!attempt.worktree.exists());
+    }
+    attempts.change(&space.id, |set| set.mark_discarded(2, 5).map(|_| ()))?;
+    assert_eq!(
+        live_attempts_refusal(&space.id, attempts.load(&space.id)?, "ship"),
+        None
+    );
+    let mut reread = SpaceAttempts::new(Some(fixture.data_dir()));
+    assert_eq!(reread.live_ports([&space.id]), Vec::<u16>::new());
+    Ok(())
+}
