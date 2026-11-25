@@ -1,0 +1,60 @@
+README.md
+  h_5a0a1d6be5b4d2 10,12,30-31,82-83
+crates/xctx-graph/src/graph.rs
+  h_5a0a1d6be5b4d2 161-163
+crates/xctx-graph/src/store.rs
+  h_5a0a1d6be5b4d2 33
+crates/xctx-plugin/src/builtin/runners/omp.toml
+  h_5a0a1d6be5b4d2 1-12
+crates/xctx-plugin/src/builtin/runners/pi.toml
+  h_5a0a1d6be5b4d2 1-2
+crates/xctx-plugin/src/runner.rs
+  h_5a0a1d6be5b4d2 21-23,39,43,869-906,1084,1089,1132
+crates/xctx-term/src/session.rs
+  h_5a0a1d6be5b4d2 196-201
+crates/xctx-term/tests/session.rs
+  h_5a0a1d6be5b4d2 95-96,228
+crates/xctx-ui/src/parent_agent.rs
+  h_5a0a1d6be5b4d2 1-3,9,53,55,57-58,72,82,88,113-134,169,171
+crates/xctx-ui/src/plan_gate.rs
+  h_5a0a1d6be5b4d2 1-2,44,48,109,238
+crates/xctx-ui/tests/m2_render.rs
+  h_5a0a1d6be5b4d2 286,295,307-308,315,322
+crates/xctx/src/agent_session.rs
+  h_5a0a1d6be5b4d2 239-242
+crates/xctx/src/attempt_jobs.rs
+  h_5a0a1d6be5b4d2 478
+crates/xctx/src/control.rs
+  h_5a0a1d6be5b4d2 1221-1222,1240-1243,1245-1248,1250
+crates/xctx/src/dialogs.rs
+  h_5a0a1d6be5b4d2 233,418
+crates/xctx/src/home.rs
+  h_5a0a1d6be5b4d2 1-2,4,7-8,10,15,142-144,146-148,170-172,192
+crates/xctx/src/inbox_view.rs
+  h_5a0a1d6be5b4d2 372-381,383,423,661-703
+crates/xctx/src/keymap.rs
+  h_5a0a1d6be5b4d2 51
+crates/xctx/src/lifecycle_tests.rs
+  h_5a0a1d6be5b4d2 81-83,141,165
+crates/xctx/src/parent_agent.rs
+  h_5a0a1d6be5b4d2 1,5-6,17-21,24,27,31,43-45,64-67,86-88,90,92-93,96,110,177-180,214,217,222,226-228,237
+crates/xctx/src/plugin_jobs.rs
+  h_5a0a1d6be5b4d2 429,1045-1046,1075,1095-1099,1134-1136,1141,1158-1160,1421-1434
+crates/xctx/src/space_tab.rs
+  h_5a0a1d6be5b4d2 21,51-53,105,108-117,325,340-430,436,449-462,464-469
+crates/xctx/src/spawn.rs
+  h_5a0a1d6be5b4d2 1-3,19,28,402-408,419-420,431-434,438-439,507-509,526,552,558-566,683-686,721,823,825-826,836,840,846,855,869,871-872,881,965,995,1006,1010,1190-1192,1199-1201,1204-1205,1207,1213,1216-1221,1240,1265,1276,1311-1315
+crates/xctx/src/workspace.rs
+  h_5a0a1d6be5b4d2 302,470,474-481,748-752
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "a28f724b02462339d16a766ca626eba8fdf27af0",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
