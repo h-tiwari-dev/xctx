@@ -33,60 +33,62 @@ use gpui::{
     App, AppContext, Bounds, Menu, MenuItem, SystemMenuType, TitlebarOptions, WindowBounds,
     WindowOptions, px, size,
 };
-use xctx_ui::Theme;
+use xctx_ui::{Theme, UiAssets};
 
 use crate::keymap::{Quit, bind_keys};
 use crate::workspace::Workspace;
 
 fn main() {
-    gpui_platform::application().run(|cx: &mut App| {
-        cx.set_global(Theme::dark());
-        bind_keys(cx);
-        // The workspace handles Quit itself when its window is active; this covers the rest.
-        cx.on_action(|_: &Quit, cx| {
-            let busy = cx
-                .windows()
-                .into_iter()
-                .filter_map(|window| window.downcast::<Workspace>())
-                .any(|window| {
-                    window
-                        .update(cx, |workspace, _, cx| workspace.refuse_while_busy(cx))
-                        .unwrap_or(false)
-                });
-            if !busy {
-                cx.quit();
-            }
-        });
-        cx.set_menus(vec![Menu::new(xctx_core::APP_NAME).items([
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
-            MenuItem::separator(),
-            MenuItem::action("Quit xctx", Quit),
-        ])]);
-        cx.on_window_closed(|cx, _window_id| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+    gpui_platform::application()
+        .with_assets(UiAssets)
+        .run(|cx: &mut App| {
+            cx.set_global(Theme::dark());
+            bind_keys(cx);
+            // The workspace handles Quit itself when its window is active; this covers the rest.
+            cx.on_action(|_: &Quit, cx| {
+                let busy = cx
+                    .windows()
+                    .into_iter()
+                    .filter_map(|window| window.downcast::<Workspace>())
+                    .any(|window| {
+                        window
+                            .update(cx, |workspace, _, cx| workspace.refuse_while_busy(cx))
+                            .unwrap_or(false)
+                    });
+                if !busy {
+                    cx.quit();
+                }
+            });
+            cx.set_menus(vec![Menu::new(xctx_core::APP_NAME).items([
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Quit xctx", Quit),
+            ])]);
+            cx.on_window_closed(|cx, _window_id| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
 
-        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(xctx_core::APP_NAME.into()),
+            let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+            let opened = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(xctx_core::APP_NAME.into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| Workspace::new(window, cx)),
-        );
-        if let Err(e) = opened {
-            eprintln!("xctx: could not open the main window: {e}");
-            cx.quit();
-            return;
-        }
+                },
+                |window, cx| cx.new(|cx| Workspace::new(window, cx)),
+            );
+            if let Err(e) = opened {
+                eprintln!("xctx: could not open the main window: {e}");
+                cx.quit();
+                return;
+            }
 
-        cx.activate(true);
-    });
+            cx.activate(true);
+        });
 }

@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use gpui::{
     Animation, AnimationExt, AnyElement, App, ElementId, FocusHandle, KeyDownEvent, MouseButton,
-    Pixels, SharedString, Window, black, deferred, div, prelude::*, px,
+    Pixels, SharedString, Window, deferred, div, prelude::*, px,
 };
 
 use crate::motion::{
@@ -210,18 +210,16 @@ impl RenderOnce for Overlay {
         let reduced = MotionSettings::is_reduced(cx);
         let placement = self.placement;
 
-        // Post-merge with `m6-theme`, swap this colour to `theme.scrim` and the surface
-        // background/border to `theme.overlay` / `theme.border_strong`.
-        let scrim_color = black().alpha(0.50);
+        let scrim_color = theme.scrim;
 
         let mut surface = div()
             .id((self.id.clone(), "surface"))
             .relative()
             .flex()
             .flex_col()
-            .bg(theme.elevated)
+            .bg(theme.overlay)
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.border_strong)
             .text_color(theme.text)
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, |_, _, cx| {

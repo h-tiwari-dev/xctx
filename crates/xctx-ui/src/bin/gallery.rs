@@ -52,6 +52,7 @@ struct GalleryView {
     toasts: Entity<ToastStack>,
     frame_overlay: Entity<FrameOverlay>,
     last_event: SharedString,
+    light_theme: bool,
 }
 
 impl GalleryView {
@@ -90,6 +91,7 @@ impl GalleryView {
             toasts,
             frame_overlay,
             last_event: "Ready — try ⌘⇧. to toggle FrameOverlay".into(),
+            light_theme: false,
         }
     }
 
@@ -309,7 +311,7 @@ impl Render for GalleryView {
             .px(Theme::SPACE_4)
             .py(Theme::SPACE_3)
             .border_b_1()
-            .border_color(theme.divider)
+            .border_color(theme.border_subtle)
             .bg(theme.surface)
             .child(
                 div()
@@ -335,6 +337,31 @@ impl Render for GalleryView {
                     .flex()
                     .items_center()
                     .gap(Theme::SPACE_2)
+                    .child(
+                        Pill::new(
+                            "toggle-theme",
+                            if self.light_theme {
+                                "Theme: Light"
+                            } else {
+                                "Theme: Dark"
+                            },
+                        )
+                        .selected(self.light_theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.light_theme = !this.light_theme;
+                            cx.set_global(if this.light_theme {
+                                Theme::light()
+                            } else {
+                                Theme::dark()
+                            });
+                            this.last_event = if this.light_theme {
+                                "Switched gallery to Light theme".into()
+                            } else {
+                                "Switched gallery to Dark theme".into()
+                            };
+                            cx.notify();
+                        })),
+                    )
                     .child(
                         Pill::new(
                             "toggle-reduced-motion",
@@ -393,7 +420,7 @@ impl Render for GalleryView {
                 .rounded(Theme::RADIUS_MD)
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.elevated)
+                .bg(theme.raised)
                 .child(Icon::new(icon_name).size(IconSize::Md).color(theme.text))
                 .child(
                     div()
@@ -679,7 +706,7 @@ impl Render for GalleryView {
             .h(Theme::STATUS_BAR_HEIGHT)
             .px(Theme::SPACE_3)
             .border_t_1()
-            .border_color(theme.divider)
+            .border_color(theme.border_subtle)
             .bg(theme.surface)
             .text_size(Theme::TEXT_XS)
             .text_color(theme.text_muted)
@@ -710,7 +737,7 @@ impl Render for GalleryView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme.bg)
+            .bg(theme.chrome)
             .text_color(theme.text)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleFrameOverlay, _, cx| {

@@ -370,7 +370,7 @@ impl Render for FrameOverlay {
             .rounded(Theme::RADIUS_SM)
             .border_1()
             .border_color(tone_colors.border)
-            .bg(theme.elevated)
+            .bg(theme.overlay)
             .text_size(Theme::TEXT_XS)
             .font_family("Menlo")
             .child(

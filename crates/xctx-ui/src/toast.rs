@@ -423,7 +423,7 @@ impl Render for ToastStack {
                         .size(px(20.0))
                         .rounded(Theme::RADIUS_SM)
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.surface_hover))
+                        .hover(|s| s.bg(theme.raised))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.dismiss(id, cx);
@@ -461,7 +461,6 @@ impl Render for ToastStack {
                         )
                     });
 
-                // Post-merge with `m6-theme`, swap `theme.elevated` for `theme.overlay`.
                 let card = div()
                     .id(SharedString::from(format!("toast-card-{}", id.0)))
                     .debug_selector(move || format!("toast-card-{}", id.0))
@@ -471,7 +470,7 @@ impl Render for ToastStack {
                     .rounded(Theme::RADIUS_MD)
                     .border_1()
                     .border_color(tone_colors.border)
-                    .bg(theme.elevated)
+                    .bg(theme.overlay)
                     .overflow_hidden()
                     .child(div().w(px(3.0)).flex_none().bg(accent_bar))
                     .child(
