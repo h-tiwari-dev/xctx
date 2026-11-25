@@ -1,0 +1,20 @@
+crates/xctx-core/src/mise.rs
+  h_5a0a1d6be5b4d2 5,12,26-27,29-48,50-59,68-71,240-249,251-253
+crates/xctx-core/tests/mise.rs
+  h_5a0a1d6be5b4d2 26-32
+crates/xctx-core/tests/mise_env.rs
+  h_5a0a1d6be5b4d2 199-202
+mise.toml
+  h_5a0a1d6be5b4d2 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "081d7190775d1d94f2617a7fc4aae6c1da1b72e9",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
