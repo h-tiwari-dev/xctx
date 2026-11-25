@@ -19,6 +19,8 @@ pub enum InboxKind {
     SpaceWiden,
     /// A request to fork competing attempts of a writer.
     AttemptProposal,
+    /// A plugin action waiting for approval: a write tool call, a mount, or trusting a repo plugin.
+    PluginGate,
     /// A required mise variable that is not set.
     MissingEnvVar,
     /// Something an agent or the app wants the user to see.
@@ -32,6 +34,7 @@ impl InboxKind {
             Self::PlanGate => "PLAN",
             Self::SpaceWiden => "WIDEN",
             Self::AttemptProposal => "FORK",
+            Self::PluginGate => "PLUGIN",
             Self::MissingEnvVar => "ENV",
             Self::Notice => "NOTE",
         }
@@ -41,7 +44,7 @@ impl InboxKind {
     pub fn tone(self) -> Tone {
         match self {
             Self::PlanGate => Tone::Accent,
-            Self::SpaceWiden | Self::AttemptProposal => Tone::Warning,
+            Self::SpaceWiden | Self::AttemptProposal | Self::PluginGate => Tone::Warning,
             Self::MissingEnvVar => Tone::Danger,
             Self::Notice => Tone::Neutral,
         }
@@ -51,7 +54,7 @@ impl InboxKind {
     pub fn actions(self) -> &'static [InboxAction] {
         match self {
             Self::PlanGate => &[InboxAction::Review],
-            Self::SpaceWiden | Self::AttemptProposal => {
+            Self::SpaceWiden | Self::AttemptProposal | Self::PluginGate => {
                 &[InboxAction::Reject, InboxAction::Approve]
             }
             Self::MissingEnvVar => &[InboxAction::Dismiss, InboxAction::Resolve],

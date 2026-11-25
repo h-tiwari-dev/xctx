@@ -19,7 +19,7 @@ use xctx_control::protocol::{
     SpaceWidenProposeParams, SpaceWidenProposeResult, StatusSetParams,
 };
 use xctx_control::{
-    Call, Incoming, Responder, RpcError, Server, ServerConfig, StatusLevel, socket_path,
+    Call, Incoming, Method, Responder, RpcError, Server, ServerConfig, StatusLevel, socket_path,
 };
 use xctx_core::{
     DraftRepo, EnvReport, MiseRunner, Redactor, RepoIndex, Space, SpaceDraft, SpaceId,
@@ -388,6 +388,13 @@ struct MiseFindings {
     checks: Vec<(MiseCheck, xctx_core::Result<EnvReport>)>,
 }
 
+/// The refusal every plugin method gets until plugins are wired into the app (Milestone 5, Wave 3).
+fn plugins_not_wired(method: Method) -> RpcError {
+    RpcError::conflict(format!(
+        "{method}: plugins are not wired into this xctx yet (Milestone 5, Wave 3)"
+    ))
+}
+
 // -------------------------------------------------------------------------------------------------------------
 // The workspace side
 
@@ -478,6 +485,12 @@ impl Workspace {
                         this.open_layout(id)
                     }),
                 )
+            }
+            // A plugin pane needs a plugin; only plugin.mount starts one (Milestone 5, Wave 3).
+            Call::PaneSplit(p) if p.kind == Some(PaneKind::Plugin) => {
+                Err(RpcError::invalid_params(
+                    "pane.split: a plugin pane is started with plugin.mount, not pane.split",
+                ))
             }
             Call::PaneSplit(p) => {
                 to_json(
@@ -582,6 +595,14 @@ impl Workspace {
             Call::SpaceWidenPropose(p) => to_json(self.control_widen_propose(&p, cx)),
             Call::AttemptReport(p) => to_json(self.control_attempt_report(&p, cx)),
             Call::AttemptPropose(p) => to_json(self.control_attempt_propose(&p, cx)),
+            // The plugin registry, tool runner and plugin panes come in Milestone 5, Wave 3. Until then every
+            // plugin method is refused, so an agent learns plugins are not available rather than guessing.
+            call @ (Call::PluginList(_)
+            | Call::PluginTools(_)
+            | Call::PluginMount(_)
+            | Call::PluginUnmount(_)
+            | Call::PluginCall(_)
+            | Call::PluginEmit(_)) => Err(plugins_not_wired(call.method())),
         };
         responder.respond(result);
     }
@@ -1133,6 +1154,19 @@ mod tests {
     use xctx_control::ErrorCode;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn plugin_methods_are_refused_until_wave_3() {
+        for method in Method::ALL
+            .into_iter()
+            .filter(|m| m.name().starts_with("plugin."))
+        {
+            let error = plugins_not_wired(method);
+            assert_eq!(error.kind(), Some(ErrorCode::Conflict), "{method}");
+            assert!(error.message.starts_with(method.name()), "{method}");
+            assert!(error.message.contains("not wired"), "{method}");
+        }
+    }
 
     fn space(slug: &str) -> Space {
         Space {

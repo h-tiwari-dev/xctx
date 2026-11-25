@@ -5,8 +5,9 @@
 //! ```
 //!
 //! `key=value` passes a string, except that `pane`, `since_id`, `limit`, `max_iterations`, `max_turns` and
-//! `version` are numbers, `all`, `checks_passed` and `production` booleans, and `repos` a comma-separated list.
-//! `key:=<json>` passes any JSON value. Methods about a space take `space` from `$XCTX_SPACE` when it is not
+//! `version` are numbers, `all`, `checks_passed` and `production` booleans, `repos` a comma-separated list, and
+//! `args` (of `plugin.call`) a JSON object. `key:=<json>` passes any JSON value, so `args:='{"path":"/health"}'`
+//! works too. Methods about a space take `space` from `$XCTX_SPACE` when it is not
 //! given, so an agent in a space's pane can say `xctx-ctl pane.split axis=vertical`. Likewise `channel.post`
 //! takes `from`, `contract.set` `author` and `contract.agree` `agent` from `$XCTX_AGENT_ID`, and `attempt.report`
 //! takes `attempt` from `$XCTX_ATTEMPT_ID` and `token` from `$XCTX_ATTEMPT_TOKEN`.
@@ -52,6 +53,8 @@ const INTEGER_KEYS: &[&str] = &[
 const BOOL_KEYS: &[&str] = &["all", "checks_passed", "production", "gave_up"];
 /// Parameters that are comma-separated lists when given as `key=value`.
 const LIST_KEYS: &[&str] = &["repos"];
+/// Parameters that are JSON objects even when given as `key=value`.
+const OBJECT_KEYS: &[&str] = &["args"];
 
 /// What the command line asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -239,6 +242,18 @@ fn parse_param(arg: &str) -> Result<(String, Value), UsageError> {
             "false" | "no" | "0" => Value::Bool(false),
             _ => return Err(UsageError(format!("{key} must be true or false"))),
         }
+    } else if OBJECT_KEYS.contains(&key) {
+        let value: Value = serde_json::from_str(raw).map_err(|e| {
+            UsageError(format!(
+                "{key} must be a JSON object such as {key}='{{\"name\":\"value\"}}': {e}"
+            ))
+        })?;
+        if !value.is_object() {
+            return Err(UsageError(format!(
+                "{key} must be a JSON object such as {key}='{{\"name\":\"value\"}}'"
+            )));
+        }
+        value
     } else if LIST_KEYS.contains(&key) {
         Value::Array(
             raw.split(',')
@@ -296,9 +311,10 @@ pub fn help() -> String {
          {ATTEMPT_TOKEN_ENV:<20} the default token= of attempt.report, set in every attempt's panes\n\n\
          The result is printed as JSON. Exit status: 0 ok, 1 the window refused or the call failed, \
          2 bad arguments, 3 no window.\n\
-         Nothing here approves, launches, widens, forks or adopts: space.draft posts a Plan Gate, \
-         space.widen_propose a space widening and attempt.propose an attempt proposal, which the user \
-         approves in the window.\n"
+         Nothing here approves, launches, widens, forks, adopts or runs a plugin write: space.draft posts a \
+         Plan Gate, space.widen_propose a space widening, attempt.propose an attempt proposal, and \
+         plugin.mount (connectors with writes, untrusted repo plugins) and plugin.call (write tools) a plugin \
+         gate, which the user approves in the window.\n"
     );
     out
 }
@@ -718,6 +734,117 @@ mod tests {
         );
         assert!(call_by("channel.post kind=finding body=done", Some("")).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn plugin_methods_parse_with_json_args_and_the_default_space() -> Result<(), UsageError> {
+        use crate::protocol::{
+            PluginCallParams, PluginEmitParams, PluginListParams, PluginMountParams,
+            PluginToolsParams, PluginUnmountParams,
+        };
+        let here = Some("here");
+        assert_eq!(
+            call("plugin.list", here)?,
+            Call::PluginList(PluginListParams {
+                space: Some("here".into())
+            })
+        );
+        assert_eq!(
+            call("plugin.list", None)?,
+            Call::PluginList(PluginListParams::default())
+        );
+        assert_eq!(
+            call("plugin.tools plugin=http", here)?,
+            Call::PluginTools(PluginToolsParams {
+                plugin: "http".into(),
+                space: Some("here".into()),
+            })
+        );
+        assert_eq!(
+            call("plugin.mount plugin=logs repo=api", here)?,
+            Call::PluginMount(PluginMountParams {
+                space: "here".into(),
+                plugin: "logs".into(),
+                repo: Some("api".into()),
+            })
+        );
+        assert_eq!(
+            call("plugin.unmount pane=4", here)?,
+            Call::PluginUnmount(PluginUnmountParams {
+                space: "here".into(),
+                plugin: None,
+                pane: Some(PaneId(4)),
+            })
+        );
+        let expected_args = || {
+            let mut args = Map::new();
+            args.insert("path".into(), Value::String("/health".into()));
+            args.insert("retries".into(), Value::from(2));
+            args
+        };
+        let expected = Call::PluginCall(PluginCallParams {
+            space: "here".into(),
+            plugin: "http".into(),
+            tool: "http.send".into(),
+            args: expected_args(),
+        });
+        assert_eq!(
+            call(
+                r#"plugin.call plugin=http tool=http.send args:={"path":"/health","retries":2}"#,
+                here
+            )?,
+            expected
+        );
+        assert_eq!(
+            call(
+                r#"plugin.call plugin=http tool=http.send args={"path":"/health","retries":2}"#,
+                here
+            )?,
+            expected,
+            "args= is JSON too"
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    "plugin.emit",
+                    "plugin=logs",
+                    "event=logs.error",
+                    "detail=5 errors in 10s",
+                ]
+                .map(str::to_owned),
+                here,
+                None,
+            )?,
+            Command::Call {
+                socket: None,
+                compact: false,
+                call: Call::PluginEmit(PluginEmitParams {
+                    space: "here".into(),
+                    plugin: "logs".into(),
+                    event: "logs.error".into(),
+                    detail: Some(Value::String("5 errors in 10s".into())),
+                }),
+            }
+        );
+        for bad in [
+            "plugin.call plugin=http tool=t args=path=/x",
+            "plugin.call plugin=http tool=t args=[1]",
+            "plugin.call plugin=http tool=t args:=[1]",
+            "plugin.unmount",
+            "plugin.unmount plugin=http pane=2",
+            "plugin.mount",
+        ] {
+            assert!(parse_args(args(bad), here, None).is_err(), "{bad}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn help_says_plugin_writes_wait_in_the_inbox() {
+        let text = help();
+        assert!(text.contains("plugin.call"));
+        assert!(text.contains("plugin gate"));
+        assert!(text.contains("args:="));
     }
 
     #[test]

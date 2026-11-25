@@ -418,6 +418,9 @@ pub fn pane_launch_with(
 ) -> PaneLaunch {
     let (program, args, notice) = match role.kind {
         PaneKind::Shell => (None, Vec::new(), None),
+        // Plugin panes get their renderer or command in Milestone 5, Wave 3; until then one opens a shell in
+        // its repo, so a layout saved with one still starts.
+        PaneKind::Plugin => (None, Vec::new(), None),
         PaneKind::Agent => match search.find(AGENT_PROGRAM) {
             Some(pi) => (Some(pi), agent_args(agent, session), None),
             None => (
@@ -498,10 +501,7 @@ pub struct AttemptPane {
 /// in the attempt's worktree with its own `PORT`, scratch directory, [`ATTEMPT_ID_ENV`] and [`ATTEMPT_TOKEN_ENV`],
 /// as its own agent. Its instruction is the first message only when the session is being forked.
 pub fn attempt_launch(space: &Space, attempt: &AttemptPane, search: &ProgramSearch) -> PaneLaunch {
-    let role = PaneRole {
-        kind: PaneKind::Agent,
-        repo: attempt.repo.clone(),
-    };
+    let role = PaneRole::new(PaneKind::Agent, attempt.repo.clone());
     let start = match (&attempt.session, &attempt.instruction) {
         (AgentSession::Fork { .. }, Some(instruction)) => AgentStart::Task(instruction.clone()),
         _ => AgentStart::Fresh,
@@ -557,10 +557,7 @@ mod tests {
     }
 
     fn role(kind: PaneKind, repo: &str) -> PaneRole {
-        PaneRole {
-            kind,
-            repo: repo.to_owned(),
-        }
+        PaneRole::new(kind, repo)
     }
 
     fn executable(path: &Path) -> TestResult {
@@ -787,6 +784,20 @@ mod tests {
             assert_eq!(env(&launch, AGENT_ROLE_ENV), Some(""), "{kind:?}");
             assert_eq!(env(&launch, ATTEMPT_TOKEN_ENV), Some(""), "{kind:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_plugin_pane_opens_a_shell_in_its_repo_until_plugins_are_wired() -> TestResult {
+        let root = tempfile::tempdir()?;
+        executable(&root.path().join("bin/lazygit"))?;
+        let space = space(root.path());
+        let role = PaneRole::for_plugin("http", "api");
+        let launch = pane_launch(&space, &role, &AgentStart::Fresh, &search(root.path()));
+        assert_eq!(launch.config.program, "/bin/fish");
+        assert_eq!(launch.config.args, ["-l"]);
+        assert!(launch.notice.is_none());
+        assert_space_env(&launch, &space.repos[0].worktree);
         Ok(())
     }
 

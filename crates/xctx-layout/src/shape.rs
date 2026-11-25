@@ -30,6 +30,9 @@ pub enum PaneKind {
     Shell,
     /// A git tool such as `lazygit`.
     Git,
+    /// A mounted plugin's pane; [`PaneRole::plugin`] names the plugin. Reshaping never drops one: only
+    /// unmounting the plugin closes it.
+    Plugin,
 }
 
 /// What a pane is for: its kind and the repo it works in.
@@ -39,6 +42,30 @@ pub struct PaneRole {
     pub kind: PaneKind,
     /// The name of the space's repo the pane works in.
     pub repo: String,
+    /// The plugin a [`PaneKind::Plugin`] pane shows, by its manifest name. `None` for every other kind. Absent
+    /// from the JSON when `None`, so layouts saved before plugins existed load and save unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+}
+
+impl PaneRole {
+    /// A role of `kind` in `repo` that shows no plugin.
+    pub fn new(kind: PaneKind, repo: impl Into<String>) -> PaneRole {
+        PaneRole {
+            kind,
+            repo: repo.into(),
+            plugin: None,
+        }
+    }
+
+    /// The role of plugin `plugin`'s pane, working in `repo`.
+    pub fn for_plugin(plugin: impl Into<String>, repo: impl Into<String>) -> PaneRole {
+        PaneRole {
+            kind: PaneKind::Plugin,
+            repo: repo.into(),
+            plugin: Some(plugin.into()),
+        }
+    }
 }
 
 /// A pane and its role.
@@ -59,7 +86,7 @@ pub struct Reshape {
     pub panes: Vec<RolePane>,
     /// Panes in `tree` that were not in the space before; the app starts their sessions.
     pub added: Vec<RolePane>,
-    /// Panes of the space that the shape has no place for; the app closes them. Never an agent.
+    /// Panes of the space that the shape has no place for; the app closes them. Never an agent or a plugin pane.
     pub removed: Vec<RolePane>,
 }
 
@@ -67,6 +94,8 @@ pub struct Reshape {
 const DEV_AGENT_SHARE: f32 = 0.68;
 const DEBUG_AGENT_SHARE: f32 = 0.5;
 const REVIEW_GIT_SHARE: f32 = 0.65;
+/// The share of the width the per-repo groups keep when plugin panes sit in a column on the right.
+const PLUGIN_COLUMN_BASE_SHARE: f32 = 0.65;
 
 /// Lay a space out in `shape`.
 ///
@@ -74,10 +103,15 @@ const REVIEW_GIT_SHARE: f32 = 0.65;
 /// has now with its role: empty when launching. Panes of `current` are reused where the shape has a place for
 /// their role, so running sessions survive; every agent in `current` is kept, including ones whose repo is not
 /// in `repos` (they go after the per-repo agents). A repo with no agent or no auxiliary pane gets a new pane with
-/// an id from `next_pane_id`. Focus stays on `focused` if it is still in the layout, else goes to the first agent.
+/// an id from `next_pane_id`. Focus stays on `focused` if it is still in the layout, else goes to the first agent
+/// (or the first plugin pane when there is no agent).
+///
+/// Every [`PaneKind::Plugin`] pane of `current` is kept too, with its role unchanged, whatever its repo. Plugin
+/// panes go after the per-repo groups: in a column on the right of the whole layout (about a third of the width),
+/// stacked in the order of `current`, so they sit in the same place in every shape and come last in leaf order.
 ///
 /// Fails with [`LayoutError::DuplicatePane`] if `current` repeats an id or `next_pane_id` returns one already in
-/// use, and with [`LayoutError::NoPanes`] if there are no repos and no agents.
+/// use, and with [`LayoutError::NoPanes`] if there are no repos, no agents and no plugin panes.
 pub fn reshape(
     shape: Shape,
     repos: &[String],
@@ -115,6 +149,7 @@ pub fn reshape(
             None => aux.push(pool.add(aux_kind, repo)?),
         }
     }
+    let plugins = pool.claim_plugins();
 
     let (outer_axis, line_axis, agents_first, first_share) = match shape {
         Shape::Dev => (
@@ -145,13 +180,29 @@ pub fn reshape(
     } else {
         (aux_line, agent_line)
     };
-    let root = match (first, second) {
-        (Some(first), Some(second)) => PaneNode::Split {
+    let base = match (first, second) {
+        (Some(first), Some(second)) => {
+            let id = SplitId(next_split);
+            next_split += 1;
+            Some(PaneNode::Split {
+                id,
+                axis: outer_axis,
+                ratio: first_share,
+                first: Box::new(first),
+                second: Box::new(second),
+            })
+        }
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    };
+    let plugin_column = line(&ids(&plugins), SplitAxis::Vertical, &mut next_split);
+    let root = match (base, plugin_column) {
+        (Some(base), Some(column)) => PaneNode::Split {
             id: SplitId(next_split),
-            axis: outer_axis,
-            ratio: first_share,
-            first: Box::new(first),
-            second: Box::new(second),
+            axis: SplitAxis::Horizontal,
+            ratio: PLUGIN_COLUMN_BASE_SHARE,
+            first: Box::new(base),
+            second: Box::new(column),
         },
         (Some(only), None) | (None, Some(only)) => only,
         (None, None) => return Err(LayoutError::NoPanes),
@@ -160,11 +211,13 @@ pub fn reshape(
     let mut roles: HashMap<PaneId, RolePane> = agents
         .iter()
         .chain(aux.iter())
+        .chain(plugins.iter())
         .map(|p| (p.id, p.clone()))
         .collect();
     let focus = focused
         .filter(|f| roles.contains_key(f))
         .or_else(|| agents.first().map(|a| a.id))
+        .or_else(|| plugins.first().map(|p| p.id))
         .ok_or(LayoutError::NoPanes)?;
     let tree = PaneTree::from_parts(root, focus, None)?;
     let panes = tree
@@ -248,6 +301,10 @@ impl<'a, F: FnMut() -> PaneId> PanePool<'a, F> {
         self.claim_where(|p| p.role.kind == PaneKind::Agent)
     }
 
+    fn claim_plugins(&mut self) -> Vec<RolePane> {
+        self.claim_where(|p| p.role.kind == PaneKind::Plugin)
+    }
+
     fn claim_where(&mut self, wanted: impl Fn(&RolePane) -> bool) -> Vec<RolePane> {
         self.unclaimed
             .iter_mut()
@@ -263,10 +320,7 @@ impl<'a, F: FnMut() -> PaneId> PanePool<'a, F> {
         }
         let pane = RolePane {
             id,
-            role: PaneRole {
-                kind,
-                repo: repo.to_owned(),
-            },
+            role: PaneRole::new(kind, repo),
         };
         self.added.push(pane.clone());
         Ok(pane)
@@ -291,10 +345,14 @@ mod tests {
     fn role_pane(id: u64, kind: PaneKind, repo: &str) -> RolePane {
         RolePane {
             id: PaneId(id),
-            role: PaneRole {
-                kind,
-                repo: repo.to_owned(),
-            },
+            role: PaneRole::new(kind, repo),
+        }
+    }
+
+    fn plugin_pane(id: u64, plugin: &str, repo: &str) -> RolePane {
+        RolePane {
+            id: PaneId(id),
+            role: PaneRole::for_plugin(plugin, repo),
         }
     }
 
@@ -564,6 +622,103 @@ mod tests {
             let width = layout.pane(agent).map(|r| r.width).unwrap_or_default();
             assert!((width - 10.0).abs() < 1e-3, "{agent:?} is {width} wide");
         }
+    }
+
+    #[test]
+    fn every_shape_keeps_plugin_panes_and_their_names() {
+        let dev = reshape(Shape::Dev, &repos(&["api", "web"]), &[], None, ids_from(1)).unwrap();
+        let mut current = dev.panes.clone();
+        current.push(plugin_pane(5, "http", "api"));
+        current.push(plugin_pane(6, "logs", "gone-repo"));
+        let mut panes = current;
+        let mut next = 100;
+        for shape in [Shape::Debug, Shape::Review, Shape::Dev, Shape::Review] {
+            let shaped = reshape(
+                shape,
+                &repos(&["api", "web"]),
+                &panes,
+                Some(PaneId(6)),
+                ids_from(next),
+            )
+            .unwrap();
+            next += 10;
+            let plugins: Vec<&RolePane> = shaped
+                .panes
+                .iter()
+                .filter(|p| p.role.kind == PaneKind::Plugin)
+                .collect();
+            assert_eq!(
+                plugins,
+                vec![
+                    &plugin_pane(5, "http", "api"),
+                    &plugin_pane(6, "logs", "gone-repo")
+                ],
+                "{shape:?}"
+            );
+            assert!(
+                shaped
+                    .removed
+                    .iter()
+                    .all(|p| p.role.kind != PaneKind::Plugin),
+                "{shape:?}"
+            );
+            assert!(shaped.added.iter().all(|p| p.role.plugin.is_none()));
+            assert_eq!(shaped.tree.focused(), PaneId(6));
+            // Plugin panes come last in leaf order, in a column on the right.
+            let leaves = shaped.tree.panes();
+            assert_eq!(leaves[leaves.len() - 2..], [PaneId(5), PaneId(6)]);
+            let http = rect(&shaped, PaneId(5));
+            let logs = rect(&shaped, PaneId(6));
+            assert!((http.x - 65.0).abs() < 1e-3, "{shape:?}: {http:?}");
+            assert!((http.width - 35.0).abs() < 1e-3);
+            assert!((logs.y - http.bottom()).abs() < 1e-3);
+            // No new pane reuses a plugin pane's id, and every id is distinct.
+            let mut ids = leaves.clone();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), leaves.len());
+            panes = shaped.panes;
+        }
+    }
+
+    #[test]
+    fn plugin_ids_are_not_reused_for_new_panes() {
+        let current = vec![
+            role_pane(1, PaneKind::Agent, "api"),
+            plugin_pane(2, "http", "api"),
+        ];
+        // The id allocator hands out the plugin's id: reshape refuses instead of reusing it.
+        assert_eq!(
+            reshape(Shape::Dev, &repos(&["api"]), &current, None, ids_from(2)),
+            Err(LayoutError::DuplicatePane(PaneId(2)))
+        );
+        let shaped = reshape(Shape::Dev, &repos(&["api"]), &current, None, ids_from(3)).unwrap();
+        assert_eq!(shaped.added, vec![role_pane(3, PaneKind::Shell, "api")]);
+        assert!(shaped.tree.contains(PaneId(2)));
+    }
+
+    #[test]
+    fn a_space_of_only_plugin_panes_still_lays_out() {
+        let current = vec![plugin_pane(4, "logs", "api"), plugin_pane(7, "sql", "api")];
+        let shaped = reshape(Shape::Debug, &[], &current, None, ids_from(10)).unwrap();
+        assert_eq!(shaped.tree.panes(), vec![PaneId(4), PaneId(7)]);
+        assert_eq!(shaped.tree.focused(), PaneId(4));
+        assert!(shaped.added.is_empty() && shaped.removed.is_empty());
+    }
+
+    #[test]
+    fn roles_saved_before_plugins_load_and_save_unchanged() {
+        let old = serde_json::json!({ "id": 3, "role": { "kind": "shell", "repo": "api" } });
+        let pane: RolePane = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(pane, role_pane(3, PaneKind::Shell, "api"));
+        assert_eq!(serde_json::to_value(&pane).unwrap(), old);
+        let plugin = plugin_pane(9, "http", "web");
+        let value = serde_json::to_value(&plugin).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "id": 9, "role": { "kind": "plugin", "repo": "web", "plugin": "http" } })
+        );
+        assert_eq!(serde_json::from_value::<RolePane>(value).unwrap(), plugin);
     }
 
     #[test]

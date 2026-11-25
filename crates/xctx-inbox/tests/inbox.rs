@@ -507,3 +507,119 @@ fn an_attempt_proposal_is_a_gate_with_a_bounded_count() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn a_plugin_gate_is_a_gate_that_must_say_what_it_allows() -> TestResult {
+    use xctx_inbox::{PluginGate, PluginGateKind};
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    let gate = |plugin: &str, kind| {
+        ItemBody::PluginGate(PluginGate {
+            space: SpaceId::new("rate-limit"),
+            plugin: plugin.into(),
+            kind,
+            rationale: Some("the agent wants to fix the fixture row".into()),
+        })
+    };
+    let space = || Some(SpaceId::new("rate-limit"));
+    let write = inbox.post(
+        gate(
+            "sql",
+            PluginGateKind::WriteCall {
+                tool: "sql.write".into(),
+                args: "query=UPDATE users SET plan = 'pro' WHERE id = 7".into(),
+            },
+        ),
+        space(),
+        Source::Agent,
+    )?;
+    let item = inbox.get(&write).ok_or("posted")?;
+    assert_eq!(item.kind(), ItemKind::PluginGate);
+    assert_eq!(item.kind().name(), "plugin_gate");
+    assert!(item.kind().is_gate());
+    assert_eq!(item.title(), "Run sql.write (sql) in rate-limit");
+    assert!(item.detail().contains("Arguments: query=UPDATE users"));
+    assert!(
+        item.detail()
+            .starts_with("the agent wants to fix the fixture row")
+    );
+    assert!(matches!(
+        inbox.dismiss(&write),
+        Err(InboxError::WrongKind { .. })
+    ));
+    assert!(matches!(
+        inbox.resolve(&write),
+        Err(InboxError::WrongKind { .. })
+    ));
+    assert_eq!(inbox.approve(&write)?.state, ItemState::Approved);
+    assert!(matches!(
+        inbox.approve(&write),
+        Err(InboxError::NotPending { .. })
+    ));
+
+    let mount = inbox.post(
+        gate(
+            "jira",
+            PluginGateKind::Mount {
+                reason: "it can comment on issues".into(),
+            },
+        ),
+        space(),
+        Source::Agent,
+    )?;
+    let item = inbox.get(&mount).ok_or("posted")?;
+    assert_eq!(item.title(), "Mount jira in rate-limit");
+    assert!(item.detail().contains("it can comment on issues"));
+    assert_eq!(
+        inbox.reject(&mount, Some("not today".into()))?.state,
+        ItemState::Rejected
+    );
+
+    let trust = inbox.post(
+        gate(
+            "fixtures",
+            PluginGateKind::TrustRepoPlugin { repo: "api".into() },
+        ),
+        space(),
+        Source::App,
+    )?;
+    assert_eq!(
+        inbox.get(&trust).ok_or("posted")?.title(),
+        "Trust api's plugin fixtures in rate-limit"
+    );
+    assert_eq!(inbox.approve(&trust)?.state, ItemState::Approved);
+
+    for bad in [
+        gate(" ", PluginGateKind::Mount { reason: "x".into() }),
+        gate(
+            "sql",
+            PluginGateKind::WriteCall {
+                tool: "".into(),
+                args: "".into(),
+            },
+        ),
+        gate(
+            "fixtures",
+            PluginGateKind::TrustRepoPlugin { repo: "".into() },
+        ),
+    ] {
+        let id = inbox.post(bad, space(), Source::Agent)?;
+        assert!(matches!(
+            inbox.approve(&id),
+            Err(InboxError::IncompletePluginGate { .. })
+        ));
+        assert!(inbox.get(&id).ok_or("kept")?.is_pending());
+        assert_eq!(inbox.reject(&id, None)?.state, ItemState::Rejected);
+    }
+
+    // It survives a reopen, tagged on disk.
+    let reopened = Inbox::open(dir.path())?;
+    assert_eq!(reopened.get(&write), inbox.get(&write));
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(dir.path().join(INBOX_FILE))?)?;
+    let first = &raw["items"][0]["body"];
+    assert_eq!(first["kind"], "plugin_gate");
+    assert_eq!(first["plugin"], "sql");
+    assert_eq!(first["request"]["type"], "write_call");
+    assert_eq!(first["request"]["tool"], "sql.write");
+    Ok(())
+}

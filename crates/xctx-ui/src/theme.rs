@@ -59,12 +59,14 @@ pub enum Tone {
 }
 
 impl Tone {
-    /// The tone of a pane's role badge: agents use the accent, shells success, git panes warning.
+    /// The tone of a pane's role badge: agents use the accent, shells success, git panes warning, plugin panes
+    /// neutral.
     pub fn for_pane_kind(kind: PaneKind) -> Self {
         match kind {
             PaneKind::Agent => Self::Accent,
             PaneKind::Shell => Self::Success,
             PaneKind::Git => Self::Warning,
+            PaneKind::Plugin => Self::Neutral,
         }
     }
 }

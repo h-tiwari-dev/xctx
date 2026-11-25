@@ -95,12 +95,17 @@ pub fn env_value_error(name: &str, value: &str) -> Option<String> {
         .then(|| format!("{name} needs a value; type it, or press Esc to cancel"))
 }
 
+/// What approving a plugin gate says until plugins are wired into the app (Milestone 5, Wave 3).
+pub(crate) const PLUGIN_GATE_NOT_WIRED: &str =
+    "plugins are not wired into this xctx yet (Milestone 5, Wave 3); the plugin gate stays pending";
+
 /// The panel's kind for an Inbox item kind.
 pub fn entry_kind(kind: ItemKind) -> InboxKind {
     match kind {
         ItemKind::PlanGate => InboxKind::PlanGate,
         ItemKind::SpaceWiden => InboxKind::SpaceWiden,
         ItemKind::AttemptProposal => InboxKind::AttemptProposal,
+        ItemKind::PluginGate => InboxKind::PluginGate,
         ItemKind::MissingEnvVar => InboxKind::MissingEnvVar,
         ItemKind::Notice => InboxKind::Notice,
     }
@@ -334,6 +339,10 @@ impl Workspace {
                     .map(|i| i.kind());
                 if kind == Some(ItemKind::AttemptProposal) {
                     self.approve_attempt_proposal(id, window, cx);
+                } else if kind == Some(ItemKind::PluginGate) {
+                    // Carrying out a plugin gate (run the write, mount, trust) comes in Milestone 5, Wave 3.
+                    // Until then it stays pending, so approving later still does what was asked.
+                    self.info(PLUGIN_GATE_NOT_WIRED, cx);
                 } else {
                     self.approve_widen(id, window, cx);
                 }
