@@ -7,7 +7,7 @@
 //! secrets = ["API_TOKEN"]
 //!
 //! [pane]
-//! kind = "http"                         # terminal | http | logs | sql | web
+//! kind = "http"                         # terminal | http | logs | sql | web | files
 //! base_url = "http://localhost:{PORT}"
 //!
 //! [scope]
@@ -109,10 +109,13 @@ pub enum PaneSpec {
         /// The page opened when mounting, such as `http://localhost:{PORT}`.
         url: Option<String>,
     },
+    /// The read-only file explorer of the mounted repo's worktree. It has no settings: it always shows the
+    /// worktree, and never reads outside it.
+    Files,
 }
 
 impl PaneSpec {
-    /// The pane kind's name as written in a manifest: `terminal`, `http`, `logs`, `sql` or `web`.
+    /// The pane kind's name as written in a manifest: `terminal`, `http`, `logs`, `sql`, `web` or `files`.
     pub fn kind(&self) -> &'static str {
         match self {
             PaneSpec::Terminal { .. } => "terminal",
@@ -120,6 +123,7 @@ impl PaneSpec {
             PaneSpec::Logs { .. } => "logs",
             PaneSpec::Sql { .. } => "sql",
             PaneSpec::Web { .. } => "web",
+            PaneSpec::Files => "files",
         }
     }
 }
@@ -464,6 +468,8 @@ enum RawPane {
     Web {
         url: Option<String>,
     },
+    // A struct variant, so `deny_unknown_fields` refuses settings it does not take.
+    Files {},
 }
 
 #[derive(Deserialize)]
@@ -609,6 +615,7 @@ impl RawManifest {
                 }
                 PaneSpec::Web { url }
             }
+            RawPane::Files {} => PaneSpec::Files,
         };
 
         let mut tools: Vec<ToolSpec> = Vec::with_capacity(self.tools.len());
@@ -894,6 +901,18 @@ kind = "terminal"
             "name = \"a\"\nversion = \"1\"\n[pane]\nkind = \"web\"\nurls = \"x\"\n";
         assert!(matches!(
             Manifest::parse(unknown_pane_field, "t"),
+            Err(PluginError::Syntax { .. })
+        ));
+    }
+
+    #[test]
+    fn a_files_pane_takes_no_settings() {
+        let files = "name = \"a\"\nversion = \"1\"\n[pane]\nkind = \"files\"\n";
+        let m = Manifest::parse(files, "t").expect("parses");
+        assert_eq!(m.pane, PaneSpec::Files);
+        assert_eq!(m.pane.kind(), "files");
+        assert!(matches!(
+            Manifest::parse(&format!("{files}root = \"/\"\n"), "t"),
             Err(PluginError::Syntax { .. })
         ));
     }

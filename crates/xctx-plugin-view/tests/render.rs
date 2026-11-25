@@ -1,6 +1,6 @@
 //! The plugin panes in GPUI's headless test window: every control clicked through its selector, what they must
 //! not do while busy or unavailable (each against a positive control in the same window), the caps on long
-//! content and the error lines.
+//! content and the error lines. The files pane's tree rows report the folder or file clicked.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -10,9 +10,11 @@ use gpui::{
     Window, div, prelude::*,
 };
 use xctx_plugin_view::{
-    BrowserPaneView, BrowserStatus, BrowserView, ConsoleRow, HttpDiffView, HttpPaneView,
+    BrowserPaneView, BrowserStatus, BrowserView, ConsoleRow, FILES_ROW_LIMIT, FileMark, FileRow,
+    FileRowKind, FilesPaneView, FilesPreview, FilesView, HttpDiffView, HttpPaneView,
     HttpResponseView, HttpRow, HttpView, LOG_LINE_LIMIT, LogLevel, LogLine, LogsPaneView, LogsView,
-    NetworkErrorRow, SQL_COL_LIMIT, SQL_ROW_LIMIT, Screenshot, SqlPaneView, SqlResultView, SqlView,
+    NetworkErrorRow, PreviewBody, SQL_COL_LIMIT, SQL_ROW_LIMIT, Screenshot, SqlPaneView,
+    SqlResultView, SqlView,
 };
 use xctx_ui::Theme;
 
@@ -598,3 +600,155 @@ const TINY_PNG: &[u8] = &[
     0x02, 0x00, 0x01, 0xe5, 0x27, 0xde, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
     0x42, 0x60, 0x82,
 ];
+
+// ---------------------------------------------------------------------------------------------------------------
+// Files
+
+fn row(path: &str, depth: usize, kind: FileRowKind) -> FileRow {
+    FileRow {
+        path: path.to_owned().into(),
+        name: path.rsplit('/').next().unwrap_or(path).to_owned().into(),
+        depth,
+        kind,
+    }
+}
+
+fn files_view() -> FilesView {
+    FilesView {
+        root: "/code/api-worktrees/fix-retry".into(),
+        rows: vec![
+            row(
+                "src",
+                0,
+                FileRowKind::Folder {
+                    open: true,
+                    changed: true,
+                    heavy: false,
+                },
+            ),
+            row(
+                "src/main.rs",
+                1,
+                FileRowKind::File {
+                    mark: Some(FileMark::Modified),
+                },
+            ),
+            row(
+                "node_modules",
+                0,
+                FileRowKind::Folder {
+                    open: false,
+                    changed: false,
+                    heavy: true,
+                },
+            ),
+            row("README.md", 0, FileRowKind::File { mark: None }),
+        ],
+        changed_only: false,
+        busy: false,
+        status_error: None,
+        preview: FilesPreview::default(),
+    }
+}
+
+fn build_files(view: FilesView, log: Log) -> AnyElement {
+    let (folder, file, refresh, changed, diff) =
+        (log.clone(), log.clone(), log.clone(), log.clone(), log);
+    FilesPaneView::new(view)
+        .on_folder(move |path, _, _| push(&folder, format!("folder {path}")))
+        .on_file(move |path, _, _| push(&file, format!("file {path}")))
+        .on_refresh(move |_, _| push(&refresh, "refresh"))
+        .on_changed_only(move |on, _, _| push(&changed, format!("changed {on}")))
+        .on_diff(move |on, _, _| push(&diff, format!("diff {on}")))
+        .into_any_element()
+}
+
+#[gpui::test]
+fn the_files_pane_draws_the_tree_and_reports_clicks(cx: &mut TestAppContext) {
+    let (events, _host, cx) = host(cx, files_view(), build_files);
+    for selector in [
+        "files-tree",
+        "files-row-0",
+        "files-row-1",
+        "files-row-2",
+        "files-row-3",
+        "files-preview",
+        "files-preview-empty",
+    ] {
+        assert!(drawn(cx, selector), "{selector} is drawn");
+    }
+    assert!(!drawn(cx, "files-diff"), "no file is chosen, so no Diff");
+    for selector in [
+        "files-row-0",
+        "files-row-1",
+        "files-row-2",
+        "files-row-3",
+        "files-refresh",
+        "files-changed-only",
+    ] {
+        assert!(click(cx, selector), "{selector} is drawn");
+    }
+    assert_eq!(
+        *events.borrow(),
+        [
+            "folder src",
+            "file src/main.rs",
+            "folder node_modules",
+            "file README.md",
+            "refresh",
+            "changed true",
+        ]
+    );
+}
+
+#[gpui::test]
+fn the_files_pane_previews_text_diffs_and_binaries(cx: &mut TestAppContext) {
+    let (events, host, cx) = host(cx, files_view(), build_files);
+    update(cx, &host, |view| {
+        view.preview = FilesPreview {
+            path: "src/main.rs".into(),
+            size: Some(42),
+            body: PreviewBody::Lines(vec!["fn main() {}".into()]),
+            diff: false,
+            can_diff: true,
+            cut: Some("Cut: showing the first 2000 lines".into()),
+        };
+    });
+    for selector in ["files-preview-path", "files-cut", "files-diff"] {
+        assert!(drawn(cx, selector), "{selector} is drawn");
+    }
+    assert!(!drawn(cx, "files-preview-empty"));
+    assert!(click(cx, "files-diff"));
+    assert_eq!(*events.borrow(), ["diff true"]);
+
+    update(cx, &host, |view| {
+        view.preview = FilesPreview {
+            path: "logo.png".into(),
+            size: Some(4096),
+            body: PreviewBody::Binary,
+            ..FilesPreview::default()
+        };
+        view.status_error = Some("git: not a git repository".into());
+    });
+    assert!(drawn(cx, "files-binary"));
+    assert!(drawn(cx, "files-status-error"));
+    assert!(!drawn(cx, "files-diff"), "an unchanged file has no diff");
+    assert!(!drawn(cx, "files-cut"));
+}
+
+#[gpui::test]
+fn the_files_pane_caps_its_rows_and_says_when_nothing_changed(cx: &mut TestAppContext) {
+    let (_events, host, cx) = host(cx, files_view(), build_files);
+    assert!(!drawn(cx, "files-rows-more"));
+    update(cx, &host, |view| {
+        view.rows = (0..FILES_ROW_LIMIT + 5)
+            .map(|i| row(&format!("f{i}"), 0, FileRowKind::File { mark: None }))
+            .collect();
+    });
+    assert!(drawn(cx, "files-rows-more"));
+    update(cx, &host, |view| {
+        view.rows.clear();
+        view.changed_only = true;
+    });
+    assert!(drawn(cx, "files-no-changes"));
+}

@@ -1,6 +1,7 @@
 //! Plugins end to end without a window, in temporary folders: a user plugin whose tool is a shell script, the API
 //! client against a local test server, a sqlite database read directly and written only once approved, repo
-//! plugin trust, mounts across a restart, and events reaching the loop, the shared space and the Inbox.
+//! plugin trust, mounts across a restart, events reaching the loop, the shared space and the Inbox, and the files
+//! pane's listing, git status, previews and refusal of anything outside the worktree.
 //!
 //! Nothing here touches the network, the user's plugins, or Chrome.
 
@@ -23,7 +24,11 @@ use xctx_layout::PaneId;
 use xctx_plugin::LoopAction;
 
 use crate::plugin_host::{
-    LoopEffect, Mount, MountCheck, MountSettings, PaneEffect, PluginHost, Prepared,
+    FILES_ENTRY_CAP, FILES_PREVIEW_BYTES, FILES_PREVIEW_LINES, FileTree, FolderEntry,
+    FolderListing, GitChange, GitStatus, LoopEffect, Mount, MountCheck, MountSettings, PaneEffect,
+    PluginHost, Prepared, PreviewText, TreeRow, TreeRowKind, cap_entries, cap_text, file_diff,
+    git_status, is_binary, list_folder, parse_porcelain_z, read_preview, resolve_inside,
+    sort_entries,
 };
 use crate::space_graph::SpaceGraphState;
 
@@ -1235,5 +1240,359 @@ fn a_write_too_long_to_show_in_the_inbox_is_refused() -> TestResult {
         matches!(&refused, Err(e) if e.kind() == Some(ErrorCode::InvalidParams) && e.message.contains("smaller call")),
         "{refused:?}"
     );
+    Ok(())
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// The files pane
+
+fn entry(name: &str, is_dir: bool) -> FolderEntry {
+    FolderEntry {
+        name: name.into(),
+        is_dir,
+    }
+}
+
+fn names(rows: &[TreeRow]) -> Vec<String> {
+    rows.iter()
+        .map(|r| match &r.kind {
+            TreeRowKind::More(n) => format!("{}+{n}", r.path),
+            TreeRowKind::Loading => format!("{}…", r.path),
+            TreeRowKind::Refused(_) => format!("{}!", r.path),
+            _ => r.path.clone(),
+        })
+        .collect()
+}
+
+/// Run git in `dir` with a fixed identity, so a commit works without the user's config.
+fn git_in(dir: &Path, args: &[&str]) -> TestResult {
+    let status = Command::new("git")
+        .args(["-c", "user.name=xctx", "-c", "user.email=xctx@example.com"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(format!("git {args:?} failed").into());
+    }
+    Ok(())
+}
+
+#[test]
+fn porcelain_z_output_parses_renames_spaces_and_untracked_folders() {
+    let text = "M  src/a.rs\0R  new name.rs\0old name.rs\0?? dir with space/\0 D gone file.txt\0!! ignored.log\0AA both.rs\0A  added.rs\0 M\0";
+    assert_eq!(
+        parse_porcelain_z(text),
+        [
+            ("src/a.rs".to_owned(), GitChange::Modified),
+            ("new name.rs".to_owned(), GitChange::Renamed),
+            ("dir with space/".to_owned(), GitChange::Untracked),
+            ("gone file.txt".to_owned(), GitChange::Deleted),
+            ("both.rs".to_owned(), GitChange::Conflicted),
+            ("added.rs".to_owned(), GitChange::Added),
+        ]
+    );
+    assert!(parse_porcelain_z("").is_empty());
+}
+
+#[test]
+fn folders_are_marked_when_something_under_them_changed() {
+    let status = GitStatus::new(
+        parse_porcelain_z(
+            "M  app/src/lib.rs\0?? app/new dir/\0 D app/old/gone.rs\0M  other/x.rs\0",
+        ),
+        "app/",
+    );
+    assert_eq!(status.of("src/lib.rs"), Some(GitChange::Modified));
+    assert_eq!(
+        status.of("new dir/deep/file.txt"),
+        Some(GitChange::Untracked),
+        "an untracked folder covers what is in it"
+    );
+    assert_eq!(status.of("src/main.rs"), None);
+    assert_eq!(
+        status.of("x.rs"),
+        None,
+        "paths outside the worktree are dropped"
+    );
+    assert!(status.changed_under(""));
+    assert!(status.changed_under("src"));
+    assert!(status.changed_under("new dir"));
+    assert!(status.changed_under("new dir/deep"));
+    assert!(status.changed_under("old"));
+    assert!(!status.changed_under("sr"), "a name prefix is not a folder");
+    assert!(!status.changed_under("docs"));
+    assert_eq!(status.deleted_in(""), [("old".to_owned(), true)]);
+    assert_eq!(status.deleted_in("old"), [("gone.rs".to_owned(), false)]);
+    assert!(!GitStatus::default().changed_under(""));
+}
+
+#[test]
+fn entries_sort_folders_first_ignoring_case_and_are_capped() {
+    let mut entries = vec![
+        entry("b.rs", false),
+        entry("Zed", true),
+        entry("A.md", false),
+        entry("apple", true),
+        entry("a.md", false),
+    ];
+    sort_entries(&mut entries);
+    let order: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(order, ["apple", "Zed", "A.md", "a.md", "b.rs"]);
+
+    let many = (0..FILES_ENTRY_CAP + 7)
+        .map(|i| entry(&format!("f{i:04}"), false))
+        .collect();
+    let listing = cap_entries(many, FILES_ENTRY_CAP);
+    assert_eq!(listing.entries.len(), FILES_ENTRY_CAP);
+    assert_eq!(listing.more, 7);
+    assert_eq!(listing.entries[0].name, "f0000");
+    assert_eq!(
+        cap_entries(vec![entry("x", false)], FILES_ENTRY_CAP).more,
+        0
+    );
+}
+
+#[test]
+fn nothing_outside_the_worktree_is_listed_or_read() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("worktree");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(root.join("src"))?;
+    fs::create_dir_all(root.join(".git"))?;
+    fs::create_dir_all(&outside)?;
+    fs::write(outside.join("secret.txt"), "not yours")?;
+    fs::write(root.join("src/lib.rs"), "pub fn x() {}\n")?;
+    std::os::unix::fs::symlink(&outside, root.join("escape"))?;
+    std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("leak.txt"))?;
+    std::os::unix::fs::symlink(root.join("src"), root.join("inside"))?;
+
+    let top = list_folder(&root, "")?;
+    let listed: Vec<(&str, bool)> = top
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.is_dir))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("escape", true),
+            ("inside", true),
+            ("src", true),
+            ("leak.txt", false)
+        ],
+        ".git is hidden"
+    );
+    let refused = |r: Result<FolderListing, String>| r.is_err_and(|e| e.contains("refused"));
+    assert!(refused(list_folder(&root, "escape")));
+    assert!(refused(list_folder(&root, "../outside")));
+    assert!(refused(list_folder(&root, "/etc")));
+    assert_eq!(
+        list_folder(&root, "inside")?.entries,
+        [entry("lib.rs", false)]
+    );
+    assert_eq!(
+        list_folder(&root, "deleted")?,
+        FolderListing::default(),
+        "a folder gone from disk lists nothing"
+    );
+    let redactor = Redactor::default();
+    let leak = read_preview(&root, "leak.txt", &redactor);
+    assert!(
+        leak.as_ref()
+            .is_err_and(|e| e.contains("outside the worktree")),
+        "{leak:?}"
+    );
+    assert!(read_preview(&root, "escape/secret.txt", &redactor).is_err());
+    assert!(read_preview(&root, "src/../../outside/secret.txt", &redactor).is_err());
+    assert!(resolve_inside(&root, "inside/lib.rs").is_ok());
+    assert!(resolve_inside(Path::new(""), "").is_err());
+    Ok(())
+}
+
+#[test]
+fn binaries_are_detected_and_text_is_capped_and_masked() -> TestResult {
+    assert!(is_binary(b"PNG\0\x01\x02"));
+    assert!(!is_binary("plain text, ünïcode".as_bytes()));
+    let late_nul = [vec![b'a'; 9000], vec![0]].concat();
+    assert!(!is_binary(&late_nul), "only the first 8000 bytes count");
+
+    let many: String = (0..FILES_PREVIEW_LINES + 3)
+        .map(|i| format!("line {i}\n"))
+        .collect();
+    let (text, cut) = cap_text(many.as_bytes(), true, FILES_PREVIEW_LINES);
+    assert!(cut);
+    assert_eq!(text.lines().count(), FILES_PREVIEW_LINES);
+    let (text, cut) = cap_text(b"one\ntwo\nthr", false, FILES_PREVIEW_LINES);
+    assert_eq!(
+        (text.as_str(), cut),
+        ("one\ntwo\n", true),
+        "a partial last line is dropped"
+    );
+    assert_eq!(cap_text(b"a\nb", true, 10), ("a\nb".to_owned(), false));
+
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("env.txt"),
+        "TOKEN=sk-live-0123456789abcdef\n",
+    )?;
+    fs::write(dir.path().join("logo.png"), b"\x89PNG\r\n\x1a\n\0\0\0")?;
+    fs::write(
+        dir.path().join("big.txt"),
+        "x".repeat(FILES_PREVIEW_BYTES + 10),
+    )?;
+    let redactor = Redactor::new([(
+        "API_TOKEN".to_owned(),
+        "sk-live-0123456789abcdef".to_owned(),
+    )]);
+    let env = read_preview(dir.path(), "env.txt", &redactor)?;
+    match &env.body {
+        PreviewText::Text { text, cut } => {
+            assert!(!text.contains("sk-live"), "{text}");
+            assert!(!cut);
+        }
+        PreviewText::Binary => return Err("env.txt is text".into()),
+    }
+    assert_eq!(
+        read_preview(dir.path(), "logo.png", &redactor)?.body,
+        PreviewText::Binary
+    );
+    let big = read_preview(dir.path(), "big.txt", &redactor)?;
+    assert_eq!(big.size, (FILES_PREVIEW_BYTES + 10) as u64);
+    assert!(matches!(big.body, PreviewText::Text { cut: true, .. }));
+    Ok(())
+}
+
+#[test]
+fn the_tree_reads_folders_only_when_opened_and_filters_to_changes() {
+    let mut tree = FileTree::new(PathBuf::from("/w"));
+    assert_eq!(
+        tree.refresh(),
+        [""],
+        "only the worktree itself is read first"
+    );
+    assert_eq!(names(&tree.rows(false)), ["…"]);
+    tree.set_listing(
+        "",
+        Ok(cap_entries(
+            vec![
+                entry("src", true),
+                entry("node_modules", true),
+                entry("README.md", false),
+            ],
+            FILES_ENTRY_CAP,
+        )),
+    );
+    tree.set_status(Ok(GitStatus::new(
+        parse_porcelain_z(" M src/lib.rs\0 D old/gone.rs\0"),
+        "",
+    )));
+    assert_eq!(
+        names(&tree.rows(false)),
+        ["node_modules", "old", "src", "README.md"],
+        "a deleted folder shows from the status"
+    );
+    assert!(matches!(
+        tree.rows(false)[0].kind,
+        TreeRowKind::Folder {
+            open: false,
+            changed: false,
+            heavy: true
+        }
+    ));
+    assert!(tree.toggle("src"), "opening a folder reads it");
+    assert_eq!(names(&tree.rows(false))[3], "src…");
+    tree.set_listing(
+        "src",
+        Ok(FolderListing {
+            entries: vec![entry("lib.rs", false), entry("main.rs", false)],
+            more: 3,
+        }),
+    );
+    assert_eq!(
+        names(&tree.rows(false)),
+        [
+            "node_modules",
+            "old",
+            "src",
+            "src/lib.rs",
+            "src/main.rs",
+            "src+3",
+            "README.md"
+        ]
+    );
+    assert_eq!(tree.change_of("src/lib.rs"), Some(GitChange::Modified));
+    assert_eq!(
+        names(&tree.rows(true)),
+        ["old", "src", "src/lib.rs", "src+3"],
+        "changed only"
+    );
+    assert!(!tree.toggle("src"), "closing reads nothing");
+    assert!(!tree.toggle("src"), "reopening uses what was read");
+    tree.toggle("src");
+    assert_eq!(tree.refresh(), [""], "refresh reads the open folders only");
+    assert!(
+        tree.toggle("src"),
+        "a refresh drops closed folders, so they are read again"
+    );
+    tree.set_listing(
+        "",
+        Ok(cap_entries(vec![entry("src", true)], FILES_ENTRY_CAP)),
+    );
+    tree.set_listing("src", Err("refused: src leads outside the worktree".into()));
+    assert!(!tree.is_reading());
+    assert_eq!(names(&tree.rows(false)), ["old", "src", "src!"]);
+}
+
+#[test]
+fn git_status_and_diffs_come_from_the_worktree() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git_in(root, &["init", "-q"])?;
+    fs::write(root.join("kept.txt"), "one\n")?;
+    fs::write(root.join("old name.txt"), "moved\n")?;
+    fs::write(root.join("gone.txt"), "bye\n")?;
+    git_in(root, &["add", "."])?;
+    git_in(root, &["commit", "-q", "-m", "first"])?;
+    fs::write(root.join("kept.txt"), "one\ntwo\n")?;
+    git_in(root, &["mv", "old name.txt", "new name.txt"])?;
+    fs::remove_file(root.join("gone.txt"))?;
+    fs::create_dir_all(root.join("fresh dir"))?;
+    fs::write(root.join("fresh dir/a.txt"), "new\n")?;
+
+    let status = git_status(root)?;
+    assert_eq!(status.of("kept.txt"), Some(GitChange::Modified));
+    assert_eq!(status.of("new name.txt"), Some(GitChange::Renamed));
+    assert_eq!(status.of("gone.txt"), Some(GitChange::Deleted));
+    assert_eq!(status.of("fresh dir/a.txt"), Some(GitChange::Untracked));
+    assert!(status.changed_under("fresh dir"));
+
+    let redactor = Redactor::default();
+    let text = |d: PreviewText| match d {
+        PreviewText::Text { text, .. } => text,
+        PreviewText::Binary => String::new(),
+    };
+    let kept = text(file_diff(root, "kept.txt", GitChange::Modified, &redactor)?);
+    assert!(kept.contains("+two"), "{kept}");
+    let gone = text(file_diff(root, "gone.txt", GitChange::Deleted, &redactor)?);
+    assert!(gone.contains("-bye"), "{gone}");
+    let fresh = text(file_diff(
+        root,
+        "fresh dir/a.txt",
+        GitChange::Untracked,
+        &redactor,
+    )?);
+    assert!(fresh.contains("+new"), "{fresh}");
+    assert!(file_diff(root, "../x", GitChange::Modified, &redactor).is_err());
+
+    let plain = tempfile::tempdir()?;
+    assert!(git_status(plain.path()).is_err(), "not a git repository");
     Ok(())
 }

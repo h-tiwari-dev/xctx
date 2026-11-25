@@ -1,4 +1,4 @@
-//! The plugin panes in the window: the API client, logs, database and browser panes drawn with
+//! The plugin panes in the window: the API client, logs, database, browser and files panes drawn with
 //! `xctx-plugin-view`, each with its own inputs and selections.
 //!
 //! Each non-terminal plugin pane of an open space gets a [`PaneUi`] (its prompt inputs, what is selected, its
@@ -6,7 +6,9 @@
 //! drawn and dropped when the pane closes, is unmounted, or its space's tab closes ([`pane_state_changes`]).
 //! The views are rebuilt from the pane data only when it changed ([`PluginPanes::changed`], bumped by every
 //! plugin job and the logs ticker) or once a second, so drawing a frame reads no plugin folders. The mapping
-//! from the workspace's pane data to the view types is plain functions, tested below.
+//! from the workspace's pane data to the view types is plain functions, tested below. A files pane keeps its own
+//! data instead: the folders it read and the git status, read on the background executor when it is first drawn,
+//! when a folder opens and on Refresh, with its view rebuilt as each read lands.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -19,15 +21,20 @@ use xctx_core::SpaceId;
 use xctx_http::{Exchange, ExchangeDiff, HeaderChange, Outcome, Request};
 use xctx_layout::{PaneId, PaneKind};
 use xctx_plugin_view::{
-    BrowserPaneView, BrowserStatus, BrowserView, ConsoleRow, HttpDiffView, HttpPaneView,
-    HttpResponseView, HttpRow, HttpView, LOG_LINE_CHARS, LOG_LINE_LIMIT, LogLevel, LogLine,
-    LogsPaneView, LogsView, NetworkErrorRow, SQL_ROW_LIMIT, Screenshot, SqlPaneView, SqlResultView,
-    SqlView, detect_level, level_passes,
+    BrowserPaneView, BrowserStatus, BrowserView, ConsoleRow, FileMark, FileRow, FileRowKind,
+    FilesPaneView, FilesPreview, FilesView, HttpDiffView, HttpPaneView, HttpResponseView, HttpRow,
+    HttpView, LOG_LINE_CHARS, LOG_LINE_LIMIT, LogLevel, LogLine, LogsPaneView, LogsView,
+    NetworkErrorRow, PreviewBody, SQL_ROW_LIMIT, Screenshot, SqlPaneView, SqlResultView, SqlView,
+    detect_level, level_passes,
 };
 use xctx_ui::{PromptEvent, PromptInput, Theme, cut_line};
 
 use crate::plugin_backend::{BrowserPhase, BrowserSnapshot, TailStatus};
-use crate::plugin_host::{HttpPaneData, LogsPaneData, SqlPaneData};
+use crate::plugin_host::{
+    FILES_PREVIEW_BYTES, FILES_PREVIEW_LINES, FilePreview, FileTree, GitChange, HttpPaneData,
+    LogsPaneData, PreviewText, SqlPaneData, TreeRow, TreeRowKind, file_diff, git_status,
+    list_folder, read_preview,
+};
 use crate::workspace::Workspace;
 
 /// A plugin pane of an open space.
@@ -53,17 +60,20 @@ pub(crate) enum RendererKind {
     Sql,
     /// The browser.
     Web,
+    /// The worktree's file explorer.
+    Files,
 }
 
 impl RendererKind {
-    /// The renderer of the manifest pane kind `kind` (`http`, `logs`, `sql` or `web`); `None` for `terminal`
-    /// and anything else.
+    /// The renderer of the manifest pane kind `kind` (`http`, `logs`, `sql`, `web` or `files`); `None` for
+    /// `terminal` and anything else.
     pub(crate) fn from_name(kind: &str) -> Option<RendererKind> {
         match kind {
             "http" => Some(RendererKind::Http),
             "logs" => Some(RendererKind::Logs),
             "sql" => Some(RendererKind::Sql),
             "web" => Some(RendererKind::Web),
+            "files" => Some(RendererKind::Files),
             _ => None,
         }
     }
@@ -339,6 +349,119 @@ pub(crate) fn browser_view(snapshot: &BrowserSnapshot) -> BrowserView {
     }
 }
 
+/// What a files pane says of a deleted file it cannot read.
+pub const FILES_DELETED: &str = "Deleted in the worktree. Turn on Diff to see what it held.";
+
+/// A file's git change as the files pane draws it.
+pub(crate) fn file_mark(change: GitChange) -> FileMark {
+    match change {
+        GitChange::Modified => FileMark::Modified,
+        GitChange::Added => FileMark::Added,
+        GitChange::Deleted => FileMark::Deleted,
+        GitChange::Renamed => FileMark::Renamed,
+        GitChange::Untracked => FileMark::Untracked,
+        GitChange::Conflicted => FileMark::Conflicted,
+    }
+}
+
+/// A tree row as the files pane draws it.
+pub(crate) fn file_row(row: TreeRow) -> FileRow {
+    FileRow {
+        path: row.path.into(),
+        name: row.name.into(),
+        depth: row.depth,
+        kind: match row.kind {
+            TreeRowKind::Folder {
+                open,
+                changed,
+                heavy,
+            } => FileRowKind::Folder {
+                open,
+                changed,
+                heavy,
+            },
+            TreeRowKind::File(change) => FileRowKind::File {
+                mark: change.map(file_mark),
+            },
+            TreeRowKind::More(n) => FileRowKind::More(n),
+            TreeRowKind::Loading => FileRowKind::Loading,
+            TreeRowKind::Refused(why) => FileRowKind::Refused(why.into()),
+        },
+    }
+}
+
+/// The preview of a file's (or a diff's) text, and the note saying why it is cut when it is.
+fn text_body(text: &PreviewText) -> (PreviewBody, Option<SharedString>) {
+    match text {
+        PreviewText::Binary => (PreviewBody::Binary, None),
+        PreviewText::Text { text, cut } => {
+            let lines: Vec<SharedString> = text.lines().map(|l| l.to_owned().into()).collect();
+            let note = cut.then(|| {
+                if lines.len() >= FILES_PREVIEW_LINES {
+                    format!("Cut: showing the first {FILES_PREVIEW_LINES} lines").into()
+                } else {
+                    format!("Cut: showing the first {} KiB", FILES_PREVIEW_BYTES / 1024).into()
+                }
+            });
+            (PreviewBody::Lines(lines), note)
+        }
+    }
+}
+
+/// The files view of `ui`: the tree's rows (only changed paths when "Changed only" is on) and the selected file's
+/// text, or its diff when Diff is on and it has a change. Everything in it was masked when it was read.
+pub(crate) fn files_view(ui: &FilesUi) -> FilesView {
+    let change = ui.selected.as_deref().and_then(|p| ui.tree.change_of(p));
+    let preview = match &ui.selected {
+        None => FilesPreview::default(),
+        Some(path) => {
+            let diff = ui.diff && change.is_some();
+            let (body, cut) = if diff {
+                match &ui.diff_text {
+                    None => (PreviewBody::Loading, None),
+                    Some(Err(why)) => (PreviewBody::Message(why.clone().into()), None),
+                    Some(Ok(text)) => text_body(text),
+                }
+            } else {
+                match &ui.preview {
+                    None => (PreviewBody::Loading, None),
+                    Some(Err(_)) if change == Some(GitChange::Deleted) => {
+                        (PreviewBody::Message(FILES_DELETED.into()), None)
+                    }
+                    Some(Err(why)) => (PreviewBody::Message(why.clone().into()), None),
+                    Some(Ok(file)) => text_body(&file.body),
+                }
+            };
+            FilesPreview {
+                path: path.clone().into(),
+                size: match &ui.preview {
+                    Some(Ok(file)) => Some(file.size),
+                    _ => None,
+                },
+                body,
+                diff,
+                can_diff: change.is_some(),
+                cut,
+            }
+        }
+    };
+    let loading_file = ui.selected.is_some()
+        && (ui.preview.is_none() || (ui.diff && change.is_some() && ui.diff_text.is_none()));
+    FilesView {
+        root: ui.root_shown.clone(),
+        rows: ui
+            .tree
+            .rows(ui.changed_only)
+            .into_iter()
+            .map(file_row)
+            .collect(),
+        changed_only: ui.changed_only,
+        busy: ui.tree.is_reading() || ui.status_reading || loading_file,
+        status_error: ui.tree.status_error().map(|e| e.to_owned().into()),
+        preview,
+    }
+}
+
 // -------------------------------------------------------------------------------------------------------------
 // Per-pane state
 
@@ -379,12 +502,60 @@ pub(crate) struct WebUi {
     shot_generation: u64,
 }
 
+/// The files pane's own state: what it read of its worktree, and the selected file.
+pub(crate) struct FilesUi {
+    tree: FileTree,
+    /// The worktree as the header draws it, masked.
+    root_shown: SharedString,
+    changed_only: bool,
+    diff: bool,
+    /// The selected file's path relative to the worktree.
+    selected: Option<String>,
+    /// The selected file once read: its size and text, or why it cannot be shown (masked).
+    preview: Option<Result<FilePreview, String>>,
+    /// The selected file's diff once read, when Diff is on.
+    diff_text: Option<Result<PreviewText, String>>,
+    /// True while the selected file's diff is read.
+    diff_reading: bool,
+    /// True while git status runs.
+    status_reading: bool,
+    /// Counts file selections and refreshes: a file read that lands after a newer one started is dropped.
+    generation: u64,
+    view: FilesView,
+}
+
+impl FilesUi {
+    fn new(root: std::path::PathBuf, root_shown: String) -> FilesUi {
+        let mut ui = FilesUi {
+            tree: FileTree::new(root),
+            root_shown: root_shown.into(),
+            changed_only: false,
+            diff: false,
+            selected: None,
+            preview: None,
+            diff_text: None,
+            diff_reading: false,
+            status_reading: false,
+            generation: 0,
+            view: FilesView::default(),
+        };
+        ui.rebuild();
+        ui
+    }
+
+    fn rebuild(&mut self) {
+        let view = files_view(self);
+        self.view = view;
+    }
+}
+
 /// What a plugin pane holds, by renderer.
 pub(crate) enum PaneState {
     Http(HttpUi),
     Logs(LogsUi),
     Sql(SqlUi),
     Web(WebUi),
+    Files(FilesUi),
     /// The pane has no mount, or its plugin is not usable: why, drawn in its place.
     Missing(String),
 }
@@ -405,6 +576,7 @@ impl PaneUi {
             PaneState::Logs(ui) => Some(&ui.filter),
             PaneState::Sql(ui) => Some(&ui.query),
             PaneState::Web(ui) => Some(&ui.url),
+            PaneState::Files(_) => None,
             PaneState::Missing(_) => None,
         }
     }
@@ -496,7 +668,12 @@ impl Workspace {
         }
         for key in create {
             let ui = self.new_pane_ui(&key, window, cx);
-            self.plugin_panes.panes.insert(key, ui);
+            let files = matches!(ui.state, PaneState::Files(_));
+            self.plugin_panes.panes.insert(key.clone(), ui);
+            if files {
+                // The first read: the worktree's own entries and the git status.
+                self.files_refresh(&key, cx);
+            }
         }
     }
 
@@ -588,6 +765,16 @@ impl Workspace {
                     shot_generation: 0,
                 })
             }
+            RendererKind::Files => {
+                let Some(root) = settings.files_root.clone() else {
+                    return missing("this files pane has no worktree to show".to_owned());
+                };
+                let shown = self
+                    .redactor
+                    .redact(&root.display().to_string())
+                    .into_owned();
+                PaneState::Files(FilesUi::new(root, shown))
+            }
         };
         let subscriptions = inputs
             .iter()
@@ -645,7 +832,8 @@ impl Workspace {
                 Some(PaneState::Logs(_)) => RendererKind::Logs,
                 Some(PaneState::Sql(_)) => RendererKind::Sql,
                 Some(PaneState::Web(_)) => RendererKind::Web,
-                Some(PaneState::Missing(_)) | None => continue,
+                // A files pane keeps its own data and rebuilds its view as each read lands.
+                Some(PaneState::Files(_) | PaneState::Missing(_)) | None => continue,
             };
             let version = match kind {
                 RendererKind::Logs => base_version.wrapping_add(logs_version.wrapping_mul(1 << 32)),
@@ -777,6 +965,184 @@ impl Workspace {
         self.browser_open(&key.0, &url, cx);
     }
 
+    fn files_ui(&mut self, key: &PaneKey) -> Option<&mut FilesUi> {
+        match self.pane_state_mut(key) {
+            Some(PaneState::Files(ui)) => Some(ui),
+            _ => None,
+        }
+    }
+
+    /// Run `work` on the background executor, then `land` with its result on the UI thread if files pane `key`
+    /// is still there: its view is rebuilt, a diff that is now wanted is read, and the window redraws.
+    fn files_job<T: Send + 'static>(
+        &mut self,
+        key: &PaneKey,
+        work: impl FnOnce() -> T + Send + 'static,
+        land: impl FnOnce(&mut FilesUi, T) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let key = key.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor.spawn(async move { work() }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ui) = this.files_ui(&key) {
+                    land(ui, result);
+                    ui.rebuild();
+                    this.files_read_diff(&key, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Read files pane `key`'s open folders, its git status and its selected file again.
+    fn files_refresh(&mut self, key: &PaneKey, cx: &mut Context<Self>) {
+        let redactor = self.redactor.clone();
+        let Some(ui) = self.files_ui(key) else {
+            return;
+        };
+        let folders = ui.tree.refresh();
+        let root = ui.tree.root().to_path_buf();
+        ui.status_reading = true;
+        ui.rebuild();
+        for rel in folders {
+            self.files_read_folder(key, rel, cx);
+        }
+        self.files_job(
+            key,
+            move || git_status(&root).map_err(|e| redactor.redact(&e).into_owned()),
+            |ui, status| {
+                ui.status_reading = false;
+                ui.tree.set_status(status);
+            },
+            cx,
+        );
+        self.files_read_selected(key, cx);
+    }
+
+    /// List folder `rel` of files pane `key` in the background.
+    fn files_read_folder(&mut self, key: &PaneKey, rel: String, cx: &mut Context<Self>) {
+        let redactor = self.redactor.clone();
+        let Some(ui) = self.files_ui(key) else {
+            return;
+        };
+        let root = ui.tree.root().to_path_buf();
+        let at = rel.clone();
+        self.files_job(
+            key,
+            move || list_folder(&root, &at).map_err(|e| redactor.redact(&e).into_owned()),
+            move |ui, listing| ui.tree.set_listing(&rel, listing),
+            cx,
+        );
+    }
+
+    /// Read files pane `key`'s selected file again (and its diff when Diff is on), dropping what it showed.
+    fn files_read_selected(&mut self, key: &PaneKey, cx: &mut Context<Self>) {
+        let redactor = self.redactor.clone();
+        let Some(ui) = self.files_ui(key) else {
+            return;
+        };
+        let Some(path) = ui.selected.clone() else {
+            return;
+        };
+        ui.generation = ui.generation.wrapping_add(1);
+        let generation = ui.generation;
+        ui.preview = None;
+        ui.diff_text = None;
+        ui.diff_reading = false;
+        let root = ui.tree.root().to_path_buf();
+        ui.rebuild();
+        self.files_job(
+            key,
+            move || {
+                read_preview(&root, &path, &redactor).map_err(|e| redactor.redact(&e).into_owned())
+            },
+            move |ui, preview| {
+                if ui.generation == generation {
+                    ui.preview = Some(preview);
+                }
+            },
+            cx,
+        );
+        self.files_read_diff(key, cx);
+    }
+
+    /// Read the diff of files pane `key`'s selected file when Diff is on, the file has a change, and its diff is
+    /// neither read nor being read.
+    fn files_read_diff(&mut self, key: &PaneKey, cx: &mut Context<Self>) {
+        let redactor = self.redactor.clone();
+        let Some(ui) = self.files_ui(key) else {
+            return;
+        };
+        let Some(path) = ui.selected.clone() else {
+            return;
+        };
+        let Some(change) = ui.tree.change_of(&path) else {
+            return;
+        };
+        if !ui.diff || ui.diff_text.is_some() || ui.diff_reading {
+            return;
+        }
+        ui.diff_reading = true;
+        let generation = ui.generation;
+        let root = ui.tree.root().to_path_buf();
+        ui.rebuild();
+        self.files_job(
+            key,
+            move || {
+                file_diff(&root, &path, change, &redactor)
+                    .map_err(|e| redactor.redact(&e).into_owned())
+            },
+            move |ui, diff| {
+                if ui.generation == generation {
+                    ui.diff_reading = false;
+                    ui.diff_text = Some(diff);
+                }
+            },
+            cx,
+        );
+    }
+
+    /// A folder row of files pane `key` was clicked: open it (reading it the first time) or close it.
+    fn files_toggle(&mut self, key: &PaneKey, path: &str, cx: &mut Context<Self>) {
+        let Some(ui) = self.files_ui(key) else {
+            return;
+        };
+        let read = ui.tree.toggle(path);
+        ui.rebuild();
+        if read {
+            self.files_read_folder(key, path.to_owned(), cx);
+        }
+        cx.notify();
+    }
+
+    /// A file row of files pane `key` was clicked: show it.
+    fn files_select(&mut self, key: &PaneKey, path: &str, cx: &mut Context<Self>) {
+        let Some(ui) = self.files_ui(key) else {
+            return;
+        };
+        ui.selected = Some(path.to_owned());
+        self.files_read_selected(key, cx);
+        cx.notify();
+    }
+
+    /// Change files pane `key`'s toggles, reading the selected file's diff if it is now wanted.
+    fn files_set(
+        &mut self,
+        key: &PaneKey,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut FilesUi),
+    ) {
+        if let Some(ui) = self.files_ui(key) {
+            change(ui);
+            ui.rebuild();
+        }
+        self.files_read_diff(key, cx);
+        cx.notify();
+    }
+
     /// Plugin pane `pane` of `tab`'s space drawn by its renderer, if it has state (see
     /// [`Workspace::sync_plugin_panes`]).
     pub(crate) fn render_plugin_pane(
@@ -793,6 +1159,7 @@ impl Workspace {
             PaneState::Logs(ui) => render_logs(ui, &ws, &key).into_any_element(),
             PaneState::Sql(ui) => render_sql(ui, &ws, &key).into_any_element(),
             PaneState::Web(ui) => render_web(ui, &ws, &key).into_any_element(),
+            PaneState::Files(ui) => render_files(ui, &ws, &key).into_any_element(),
             PaneState::Missing(why) => {
                 let theme = Theme::of(cx);
                 div()
@@ -956,6 +1323,36 @@ fn render_web(ui: &WebUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> BrowserP
         .on_reload(on_ws(ws, key, |this, key, _, cx| {
             this.browser_reload(&key.0, cx)
         }))
+}
+
+fn render_files(ui: &FilesUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> FilesPaneView {
+    let (w, k) = (ws.clone(), key.clone());
+    let folder = move |path: SharedString, _: &mut Window, cx: &mut App| {
+        let _ = w.update(cx, |this, cx| this.files_toggle(&k, &path, cx));
+    };
+    let (w, k) = (ws.clone(), key.clone());
+    let file = move |path: SharedString, _: &mut Window, cx: &mut App| {
+        let _ = w.update(cx, |this, cx| this.files_select(&k, &path, cx));
+    };
+    let (w, k) = (ws.clone(), key.clone());
+    let changed_only = move |on: bool, _: &mut Window, cx: &mut App| {
+        let _ = w.update(cx, |this, cx| {
+            this.files_set(&k, cx, |ui| ui.changed_only = on)
+        });
+    };
+    let (w, k) = (ws.clone(), key.clone());
+    let diff = move |on: bool, _: &mut Window, cx: &mut App| {
+        let _ = w.update(cx, |this, cx| this.files_set(&k, cx, |ui| ui.diff = on));
+    };
+    FilesPaneView::new(ui.view.clone())
+        .on_folder(folder)
+        .on_file(file)
+        .on_refresh(on_ws(ws, key, |this, key, _, cx| {
+            this.files_refresh(key, cx);
+            cx.notify();
+        }))
+        .on_changed_only(changed_only)
+        .on_diff(diff)
 }
 
 #[cfg(test)]
@@ -1270,5 +1667,91 @@ mod tests {
         assert!(!view_is_stale(Some((3, now)), 3, now));
         assert!(view_is_stale(Some((3, now)), 4, now));
         assert!(view_is_stale(Some((3, now)), 3, now + VIEW_MAX_AGE));
+    }
+
+    #[test]
+    fn the_files_view_shows_the_tree_and_the_selected_files_text_or_diff() {
+        use crate::plugin_host::{FolderEntry, FolderListing, GitStatus, parse_porcelain_z};
+        let mut ui = FilesUi::new("/w".into(), "/w".into());
+        ui.tree.refresh();
+        ui.tree.set_listing(
+            "",
+            Ok(FolderListing {
+                entries: vec![
+                    FolderEntry {
+                        name: "a.rs".into(),
+                        is_dir: false,
+                    },
+                    FolderEntry {
+                        name: "b.rs".into(),
+                        is_dir: false,
+                    },
+                ],
+                more: 0,
+            }),
+        );
+        ui.tree.set_status(Ok(GitStatus::new(
+            parse_porcelain_z(" M a.rs\0 D c.rs\0"),
+            "",
+        )));
+        let view = files_view(&ui);
+        assert_eq!(view.root.as_ref(), "/w");
+        let rows: Vec<(&str, &FileRowKind)> = view
+            .rows
+            .iter()
+            .map(|r| (r.path.as_ref(), &r.kind))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "a.rs",
+                    &FileRowKind::File {
+                        mark: Some(FileMark::Modified)
+                    }
+                ),
+                ("b.rs", &FileRowKind::File { mark: None }),
+                (
+                    "c.rs",
+                    &FileRowKind::File {
+                        mark: Some(FileMark::Deleted)
+                    }
+                ),
+            ]
+        );
+        assert_eq!(view.preview, FilesPreview::default());
+        assert!(!view.busy, "the root and the git status landed");
+
+        ui.selected = Some("a.rs".into());
+        ui.preview = Some(Ok(FilePreview {
+            size: 12,
+            body: PreviewText::Text {
+                text: "one\ntwo\n".into(),
+                cut: true,
+            },
+        }));
+        let view = files_view(&ui);
+        assert_eq!(view.preview.size, Some(12));
+        assert!(view.preview.can_diff && !view.preview.diff);
+        assert_eq!(
+            view.preview.body,
+            PreviewBody::Lines(vec!["one".into(), "two".into()])
+        );
+        assert!(view.preview.cut.is_some_and(|c| c.contains("KiB")));
+
+        ui.diff = true;
+        assert_eq!(files_view(&ui).preview.body, PreviewBody::Loading);
+        ui.diff_text = Some(Ok(PreviewText::Binary));
+        let view = files_view(&ui);
+        assert!(view.preview.diff);
+        assert_eq!(view.preview.body, PreviewBody::Binary);
+
+        ui.diff = false;
+        ui.selected = Some("c.rs".into());
+        ui.preview = Some(Err("cannot open c.rs: not found".into()));
+        assert_eq!(
+            files_view(&ui).preview.body,
+            PreviewBody::Message(FILES_DELETED.into())
+        );
     }
 }

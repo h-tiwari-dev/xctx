@@ -671,6 +671,8 @@ pub struct PaneSettings {
     pub logs_file: Option<String>,
     /// A terminal pane's command, filled; `None` runs the user's shell.
     pub terminal: Option<Vec<String>>,
+    /// A files pane's worktree: the mounted repo's, never the user's main checkout.
+    pub files_root: Option<PathBuf>,
 }
 
 /// Resolve `mount`'s pane settings for `manifest` in `ctx`. A setting that cannot be filled (an unknown
@@ -719,6 +721,7 @@ pub fn pane_settings(
                 _ => pane_argv(&manifest.pane, ctx).map_err(|e| e.to_string())?,
             };
         }
+        PaneSpec::Files => out.files_root = Some(ctx.worktree.clone()),
     }
     Ok(out)
 }
@@ -1714,7 +1717,8 @@ pub struct MountedPlugin {
     pub plugin: String,
     /// The repo it works in.
     pub repo: String,
-    /// Its pane kind: `terminal`, `http`, `logs`, `sql` or `web` (empty when the plugin is no longer known).
+    /// Its pane kind: `terminal`, `http`, `logs`, `sql`, `web` or `files` (empty when the plugin is no longer
+    /// known).
     pub kind: &'static str,
     /// What was chosen when mounting.
     pub settings: MountSettings,
@@ -1818,6 +1822,670 @@ pub enum Prepared {
     Gate(PluginGate, PendingWrite),
     /// Run it now.
     Run(Box<CallJob>),
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// The files pane
+//
+// A read-only explorer of a repo's worktree. Paths are relative to the worktree with `/` separators (`""` is the
+// worktree itself), and every read is resolved inside it first ([`resolve_inside`]). Folders are read only when
+// opened, git runs with `--no-optional-locks` so it never takes the index lock from the agents working there,
+// and everything here blocks: the app runs it on the background executor.
+
+/// The most entries a files pane lists of one folder; a "… N more" row counts the rest.
+pub const FILES_ENTRY_CAP: usize = 500;
+
+/// The most lines of a file, or of its diff, a files pane shows.
+pub const FILES_PREVIEW_LINES: usize = 2000;
+
+/// The most bytes of a file, or of its diff, a files pane reads to show.
+pub const FILES_PREVIEW_BYTES: usize = 256 * 1024;
+
+/// The entries a files pane never lists, in any folder.
+pub const FILES_HIDDEN: &[&str] = &[".git"];
+
+/// Folders that usually hold dependencies or build output: listed (drawn muted) and, like every folder, read
+/// only when opened.
+pub const FILES_HEAVY: &[&str] = &["node_modules", "target", "dist", ".next", "build"];
+
+/// How many leading bytes tell a binary file: git's own rule, a NUL among the first 8000.
+const BINARY_SNIFF: usize = 8000;
+
+/// A path's change in the worktree, from `git status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GitChange {
+    /// Changed (`M`, or a type change).
+    Modified,
+    /// New in the index (`A`), or copied (`C`).
+    Added,
+    /// Deleted, in the index or the worktree (`D`).
+    Deleted,
+    /// Renamed (`R`).
+    Renamed,
+    /// Not tracked (`??`).
+    Untracked,
+    /// Unmerged (`U`, `AA`, `DD`).
+    Conflicted,
+}
+
+impl GitChange {
+    /// The change a porcelain v1 `XY` code stands for; `None` for one that is no change (`!!`, ignored).
+    pub fn from_code(x: char, y: char) -> Option<GitChange> {
+        match (x, y) {
+            ('?', '?') => Some(GitChange::Untracked),
+            ('!', '!') | (' ', ' ') => None,
+            ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D') => Some(GitChange::Conflicted),
+            ('R', _) | (_, 'R') => Some(GitChange::Renamed),
+            ('D', _) | (_, 'D') => Some(GitChange::Deleted),
+            ('A' | 'C', _) | (_, 'A' | 'C') => Some(GitChange::Added),
+            _ => Some(GitChange::Modified),
+        }
+    }
+}
+
+/// The changed paths of `git status --porcelain=v1 -z` output, in its order. A rename or copy is reported under
+/// its new path (the old path that follows it is skipped); an untracked folder is one entry ending in `/`.
+pub fn parse_porcelain_z(text: &str) -> Vec<(String, GitChange)> {
+    let mut out = Vec::new();
+    let mut fields = text.split('\0');
+    while let Some(entry) = fields.next() {
+        let mut chars = entry.chars();
+        let (Some(x), Some(y), Some(' ')) = (chars.next(), chars.next(), chars.next()) else {
+            continue;
+        };
+        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+            fields.next();
+        }
+        let path = chars.as_str();
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(change) = GitChange::from_code(x, y) {
+            out.push((path.to_owned(), change));
+        }
+    }
+    out
+}
+
+/// The folder `path` is in (`""` for the worktree's own entries).
+fn parent_of(path: &str) -> &str {
+    path.rfind('/').map_or("", |i| &path[..i])
+}
+
+/// `name` in folder `dir`.
+fn join_rel(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// A worktree's changes, by path relative to the worktree. An untracked folder is one entry ending in `/` that
+/// covers everything under it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitStatus {
+    changes: BTreeMap<String, GitChange>,
+}
+
+impl GitStatus {
+    /// The status of `entries` ([`parse_porcelain_z`]), whose paths are relative to the repository's top folder,
+    /// for a worktree at `prefix` under it (`git rev-parse --show-prefix`: empty, or ending in `/`). Paths outside
+    /// the prefix are dropped.
+    pub fn new(entries: Vec<(String, GitChange)>, prefix: &str) -> GitStatus {
+        let changes = entries
+            .into_iter()
+            .filter_map(|(path, change)| {
+                let rel = path.strip_prefix(prefix)?;
+                (!rel.is_empty()).then(|| (rel.to_owned(), change))
+            })
+            .collect();
+        GitStatus { changes }
+    }
+
+    /// The change of file `path`: its own, or that of the untracked folder it is in.
+    pub fn of(&self, path: &str) -> Option<GitChange> {
+        if let Some(change) = self.changes.get(path) {
+            return Some(*change);
+        }
+        let mut end = path.len();
+        while let Some(i) = path[..end].rfind('/') {
+            if let Some(change) = self.changes.get(&path[..=i]) {
+                return Some(*change);
+            }
+            end = i;
+        }
+        None
+    }
+
+    /// Whether anything at or under folder `dir` changed (anything at all for `""`).
+    pub fn changed_under(&self, dir: &str) -> bool {
+        if dir.is_empty() {
+            return !self.changes.is_empty();
+        }
+        let prefix = format!("{dir}/");
+        let below = self
+            .changes
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(path, _)| path.starts_with(&prefix));
+        below || self.of(&prefix).is_some()
+    }
+
+    /// The entries of folder `dir` that only git knows of, as `(name, is_folder)`: deleted files gone from disk,
+    /// and the folders they were in.
+    pub fn deleted_in(&self, dir: &str) -> Vec<(String, bool)> {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for (path, change) in &self.changes {
+            if *change != GitChange::Deleted {
+                continue;
+            }
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let entry = match rest.split_once('/') {
+                Some((folder, _)) => (folder.to_owned(), true),
+                None => (rest.to_owned(), false),
+            };
+            if !out.contains(&entry) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+}
+
+/// One entry of a folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderEntry {
+    /// Its file name.
+    pub name: String,
+    /// Whether it opens as a folder (a symlink to a folder does).
+    pub is_dir: bool,
+}
+
+/// A folder's entries as the tree lists them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FolderListing {
+    /// The first [`FILES_ENTRY_CAP`] entries, sorted ([`sort_entries`]).
+    pub entries: Vec<FolderEntry>,
+    /// How many more there are.
+    pub more: usize,
+}
+
+/// Sort folder entries as the tree shows them: folders first, then by name ignoring case (ties by the exact name,
+/// so the order is stable).
+pub fn sort_entries(entries: &mut [FolderEntry]) {
+    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase(), e.name.clone()));
+}
+
+/// `entries` sorted ([`sort_entries`]) and cut to the first `cap`, counting the rest.
+pub fn cap_entries(mut entries: Vec<FolderEntry>, cap: usize) -> FolderListing {
+    sort_entries(&mut entries);
+    let more = entries.len().saturating_sub(cap);
+    entries.truncate(cap);
+    FolderListing { entries, more }
+}
+
+/// `rel` as a reason shows it: `the worktree` for `""`.
+fn shown_rel(rel: &str) -> &str {
+    if rel.is_empty() { "the worktree" } else { rel }
+}
+
+/// Refuse a relative path that is absolute or steps out with `..`.
+fn check_rel(rel: &str) -> Result<(), String> {
+    let plain = Path::new(rel)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if plain {
+        Ok(())
+    } else {
+        Err(format!("refused: {rel} is not a path inside the worktree"))
+    }
+}
+
+/// The canonical path of `rel` in worktree `root`, symlinks followed. Refused when `rel` is absolute or has `..`,
+/// or when the canonical path is outside the canonical worktree (a symlink pointing out of it).
+pub fn resolve_inside(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    if root.as_os_str().is_empty() {
+        return Err("this pane has no worktree: the space has no repo".to_owned());
+    }
+    check_rel(rel)?;
+    let top = std::fs::canonicalize(root)
+        .map_err(|e| format!("cannot open the worktree {}: {e}", root.display()))?;
+    let path = std::fs::canonicalize(top.join(rel))
+        .map_err(|e| format!("cannot open {}: {e}", shown_rel(rel)))?;
+    if !path.starts_with(&top) {
+        return Err(format!(
+            "refused: {} leads outside the worktree",
+            shown_rel(rel)
+        ));
+    }
+    Ok(path)
+}
+
+/// The entries of folder `rel` of worktree `root`, without [`FILES_HIDDEN`], sorted and capped at
+/// [`FILES_ENTRY_CAP`]. A folder no longer on disk (deleted in the worktree) lists nothing; one leading outside the
+/// worktree is refused ([`resolve_inside`]).
+pub fn list_folder(root: &Path, rel: &str) -> Result<FolderListing, String> {
+    check_rel(rel)?;
+    if !rel.is_empty()
+        && !root.as_os_str().is_empty()
+        && std::fs::symlink_metadata(root.join(rel))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(FolderListing::default());
+    }
+    let dir = resolve_inside(root, rel)?;
+    let read =
+        std::fs::read_dir(&dir).map_err(|e| format!("cannot read {}: {e}", shown_rel(rel)))?;
+    let mut entries = Vec::new();
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if FILES_HIDDEN.contains(&name.as_str()) {
+            continue;
+        }
+        let is_dir = match entry.file_type() {
+            // A symlink opens as what it points to; one leading outside is refused when opened.
+            Ok(kind) if kind.is_symlink() => {
+                std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir())
+            }
+            Ok(kind) => kind.is_dir(),
+            Err(_) => false,
+        };
+        entries.push(FolderEntry { name, is_dir });
+    }
+    Ok(cap_entries(entries, FILES_ENTRY_CAP))
+}
+
+/// Whether `bytes` (a file's first bytes) look binary: a NUL among the first 8000, as git decides.
+pub fn is_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0)
+}
+
+/// `bytes` as text within `max_lines` lines (invalid UTF-8 replaced), and whether anything was left out.
+/// `complete` is false when more bytes followed the ones read: the last, partial line is dropped then.
+pub fn cap_text(bytes: &[u8], complete: bool, max_lines: usize) -> (String, bool) {
+    let mut end = bytes.len();
+    let mut cut = !complete;
+    if !complete && let Some(i) = bytes.iter().rposition(|b| *b == b'\n') {
+        end = i + 1;
+    }
+    if let Some(i) = bytes[..end]
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+        .map(|(i, _)| i)
+        .nth(max_lines.saturating_sub(1))
+        && i + 1 < end
+    {
+        end = i + 1;
+        cut = true;
+    }
+    (String::from_utf8_lossy(&bytes[..end]).into_owned(), cut)
+}
+
+/// What a files pane shows of a file's text, or of its diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewText {
+    /// The text, masked.
+    Text {
+        /// The text.
+        text: String,
+        /// Whether it was cut at [`FILES_PREVIEW_LINES`] or [`FILES_PREVIEW_BYTES`].
+        cut: bool,
+    },
+    /// A binary file.
+    Binary,
+}
+
+/// A file as a files pane shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePreview {
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its text, or that it is binary.
+    pub body: PreviewText,
+}
+
+/// Text from `bytes` (`complete` when nothing followed them): binary, or capped and masked with `redactor`.
+fn preview_text(bytes: &[u8], complete: bool, redactor: &Redactor) -> PreviewText {
+    if is_binary(bytes) {
+        return PreviewText::Binary;
+    }
+    let (text, cut) = cap_text(bytes, complete, FILES_PREVIEW_LINES);
+    PreviewText::Text {
+        text: redactor.redact(&text).into_owned(),
+        cut,
+    }
+}
+
+/// File `rel` of worktree `root`: its size and its first [`FILES_PREVIEW_BYTES`] as masked text, or that it is
+/// binary. Refused outside the worktree ([`resolve_inside`]) and for anything but a regular file.
+pub fn read_preview(root: &Path, rel: &str, redactor: &Redactor) -> Result<FilePreview, String> {
+    use std::io::Read;
+    let path = resolve_inside(root, rel)?;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{rel} is not a regular file"));
+    }
+    let file = std::fs::File::open(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(FILES_PREVIEW_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {rel}: {e}"))?;
+    let complete = bytes.len() <= FILES_PREVIEW_BYTES;
+    bytes.truncate(FILES_PREVIEW_BYTES);
+    Ok(FilePreview {
+        size: meta.len(),
+        body: preview_text(&bytes, complete, redactor),
+    })
+}
+
+/// Run git in `dir` (prompts off, no optional locks, pathspecs literal) and return its stdout; exit status 1
+/// counts as success when `one_is_ok` (a `--no-index` diff that found differences).
+fn run_git_bytes(dir: &Path, args: &[&str], one_is_ok: bool) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("git")
+        .args(["--no-optional-locks", "--literal-pathspecs"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(output.stdout),
+        Some(1) if one_is_ok => Ok(output.stdout),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(match stderr.trim() {
+                "" => format!("git {} exited with {}", args.join(" "), output.status),
+                why => format!("git: {why}"),
+            })
+        }
+    }
+}
+
+/// The changes of worktree `root`, from `git status --porcelain=v1 -z` (untracked folders as one entry).
+pub fn git_status(root: &Path) -> Result<GitStatus, String> {
+    let dir = resolve_inside(root, "")?;
+    let prefix = run_git_bytes(&dir, &["rev-parse", "--show-prefix"], false)?;
+    let prefix = String::from_utf8_lossy(&prefix);
+    let text = run_git_bytes(&dir, &["status", "--porcelain=v1", "-z"], false)?;
+    Ok(GitStatus::new(
+        parse_porcelain_z(&String::from_utf8_lossy(&text)),
+        prefix.trim_end_matches('\n'),
+    ))
+}
+
+/// What file `rel` of worktree `root`, with `change`, changed: `git diff HEAD -- <file>` (staged and unstaged;
+/// plain `git diff -- <file>` before the first commit), or the whole file as added when it is untracked. Masked
+/// with `redactor` and capped like a preview.
+pub fn file_diff(
+    root: &Path,
+    rel: &str,
+    change: GitChange,
+    redactor: &Redactor,
+) -> Result<PreviewText, String> {
+    check_rel(rel)?;
+    let dir = resolve_inside(root, "")?;
+    let mut out = if change == GitChange::Untracked {
+        // git reads the file itself here, so it must be inside first.
+        resolve_inside(root, rel)?;
+        let args = [
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-index",
+            "--",
+            "/dev/null",
+            rel,
+        ];
+        run_git_bytes(&dir, &args, true)?
+    } else {
+        let head = ["diff", "--no-color", "--no-ext-diff", "HEAD", "--", rel];
+        match run_git_bytes(&dir, &head, false) {
+            Ok(out) => out,
+            Err(_) => run_git_bytes(
+                &dir,
+                &["diff", "--no-color", "--no-ext-diff", "--", rel],
+                false,
+            )?,
+        }
+    };
+    if out.is_empty() {
+        return Ok(PreviewText::Text {
+            text: "No differences from the last commit.".to_owned(),
+            cut: false,
+        });
+    }
+    let complete = out.len() <= FILES_PREVIEW_BYTES;
+    out.truncate(FILES_PREVIEW_BYTES);
+    Ok(preview_text(&out, complete, redactor))
+}
+
+/// One row of a files pane's tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeRow {
+    /// The entry's path relative to the worktree (the folder's, for `More`, `Loading` and `Refused`).
+    pub path: String,
+    /// Its name (empty for `More`, `Loading` and `Refused`).
+    pub name: String,
+    /// How deep it is: 0 for the worktree's own entries.
+    pub depth: usize,
+    /// What it is.
+    pub kind: TreeRowKind,
+}
+
+/// What a tree row is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeRowKind {
+    /// A folder.
+    Folder {
+        /// Whether it is open.
+        open: bool,
+        /// Whether something under it changed.
+        changed: bool,
+        /// One of [`FILES_HEAVY`].
+        heavy: bool,
+    },
+    /// A file, with its change.
+    File(Option<GitChange>),
+    /// How many more entries the folder has than are listed.
+    More(usize),
+    /// The folder is being read.
+    Loading,
+    /// Why the folder cannot be listed.
+    Refused(String),
+}
+
+/// What a files pane knows of its worktree: the folders read, which are open, which are being read, and the git
+/// status. Only the worktree itself and the folders the user opened are ever read.
+#[derive(Clone, Debug)]
+pub struct FileTree {
+    root: PathBuf,
+    folders: HashMap<String, Result<FolderListing, String>>,
+    open: HashSet<String>,
+    reading: HashSet<String>,
+    status: Option<Result<GitStatus, String>>,
+}
+
+impl FileTree {
+    /// The tree of worktree `root`, with nothing read yet: [`FileTree::refresh`] says what to read first.
+    pub fn new(root: PathBuf) -> FileTree {
+        FileTree {
+            root,
+            folders: HashMap::new(),
+            open: HashSet::from([String::new()]),
+            reading: HashSet::new(),
+            status: None,
+        }
+    }
+
+    /// The worktree.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether a folder is being read.
+    pub fn is_reading(&self) -> bool {
+        !self.reading.is_empty()
+    }
+
+    /// Open or close folder `rel`. True when it was opened and must be read now (it is marked as being read).
+    pub fn toggle(&mut self, rel: &str) -> bool {
+        if rel.is_empty() || self.open.remove(rel) {
+            return false;
+        }
+        self.open.insert(rel.to_owned());
+        if self.folders.contains_key(rel) || self.reading.contains(rel) {
+            return false;
+        }
+        self.reading.insert(rel.to_owned());
+        true
+    }
+
+    /// The open folders whose parents are open too, to read again; each is marked as being read, and what it
+    /// showed stays until its new listing comes. Listings of the other folders are dropped, so they are read
+    /// again when opened.
+    pub fn refresh(&mut self) -> Vec<String> {
+        let shown: HashSet<String> = self
+            .open
+            .iter()
+            .filter(|rel| self.parents_open(rel))
+            .cloned()
+            .collect();
+        self.folders.retain(|rel, _| shown.contains(rel));
+        self.reading.extend(shown.iter().cloned());
+        let mut shown: Vec<String> = shown.into_iter().collect();
+        shown.sort();
+        shown
+    }
+
+    fn parents_open(&self, rel: &str) -> bool {
+        let mut dir = rel;
+        while !dir.is_empty() {
+            dir = parent_of(dir);
+            if !self.open.contains(dir) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Folder `rel` was read.
+    pub fn set_listing(&mut self, rel: &str, listing: Result<FolderListing, String>) {
+        self.reading.remove(rel);
+        self.folders.insert(rel.to_owned(), listing);
+    }
+
+    /// Git status ran.
+    pub fn set_status(&mut self, status: Result<GitStatus, String>) {
+        self.status = Some(status);
+    }
+
+    /// The git status, once it ran and if it worked.
+    pub fn status(&self) -> Option<&GitStatus> {
+        self.status.as_ref().and_then(|s| s.as_ref().ok())
+    }
+
+    /// Why git status failed, if it did.
+    pub fn status_error(&self) -> Option<&str> {
+        self.status
+            .as_ref()
+            .and_then(|s| s.as_ref().err())
+            .map(String::as_str)
+    }
+
+    /// The change of file `rel`, if the status knows one.
+    pub fn change_of(&self, rel: &str) -> Option<GitChange> {
+        self.status().and_then(|s| s.of(rel))
+    }
+
+    /// The rows of the tree, depth first: each open folder's entries after it (with the deleted files git knows
+    /// of), and only changed paths when `changed_only`.
+    pub fn rows(&self, changed_only: bool) -> Vec<TreeRow> {
+        let mut out = Vec::new();
+        self.push_rows("", 0, changed_only, &mut out);
+        out
+    }
+
+    fn push_rows(&self, dir: &str, depth: usize, changed_only: bool, out: &mut Vec<TreeRow>) {
+        let note = |kind| TreeRow {
+            path: dir.to_owned(),
+            name: String::new(),
+            depth,
+            kind,
+        };
+        let listing = match self.folders.get(dir) {
+            None if self.reading.contains(dir) => return out.push(note(TreeRowKind::Loading)),
+            None => return,
+            Some(Err(why)) => return out.push(note(TreeRowKind::Refused(why.clone()))),
+            Some(Ok(listing)) => listing,
+        };
+        let status = self.status();
+        let mut gone: Vec<FolderEntry> = status
+            .map(|s| s.deleted_in(dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(name, _)| !listing.entries.iter().any(|e| &e.name == name))
+            .map(|(name, is_dir)| FolderEntry { name, is_dir })
+            .collect();
+        let merged;
+        let entries: &[FolderEntry] = if gone.is_empty() {
+            &listing.entries
+        } else {
+            gone.extend(listing.entries.iter().cloned());
+            sort_entries(&mut gone);
+            merged = gone;
+            &merged
+        };
+        for entry in entries {
+            let path = join_rel(dir, &entry.name);
+            if entry.is_dir {
+                let changed = status.is_some_and(|s| s.changed_under(&path));
+                if changed_only && !changed {
+                    continue;
+                }
+                let open = self.open.contains(&path);
+                out.push(TreeRow {
+                    kind: TreeRowKind::Folder {
+                        open,
+                        changed,
+                        heavy: FILES_HEAVY.contains(&entry.name.as_str()),
+                    },
+                    path: path.clone(),
+                    name: entry.name.clone(),
+                    depth,
+                });
+                if open {
+                    self.push_rows(&path, depth + 1, changed_only, out);
+                }
+            } else {
+                let change = status.and_then(|s| s.of(&path));
+                if changed_only && change.is_none() {
+                    continue;
+                }
+                out.push(TreeRow {
+                    kind: TreeRowKind::File(change),
+                    path,
+                    name: entry.name.clone(),
+                    depth,
+                });
+            }
+        }
+        if listing.more > 0 {
+            out.push(note(TreeRowKind::More(listing.more)));
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -2700,7 +3368,7 @@ impl PluginHost {
         })
     }
 
-    /// The pane kind (`terminal`, `http`, `logs`, `sql` or `web`) of plugin pane `pane` of `space` and its
+    /// The pane kind (`terminal`, `http`, `logs`, `sql`, `web` or `files`) of plugin pane `pane` of `space` and its
     /// resolved settings (a base URL or page with `{PORT}` filled, say); `None` when the pane has no mount or
     /// its plugin is not usable. The settings are `None` when they cannot be filled.
     pub fn mounted_pane(
@@ -3333,6 +4001,13 @@ mod tests {
         let terminal = get("terminal")?;
         let s = pane_settings(terminal, &mount("terminal", MountSettings::default()), &ctx)?;
         assert_eq!(s.terminal, None);
+        let files = get("files")?;
+        let s = pane_settings(files, &mount("files", MountSettings::default()), &ctx)?;
+        assert_eq!(
+            s.files_root.as_deref(),
+            Some(Path::new("/code/api-worktrees/fix-retry")),
+            "the files pane shows the repo's worktree, not its main checkout"
+        );
         Ok(())
     }
 }

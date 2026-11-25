@@ -11,6 +11,7 @@ pub const BUILTIN_MANIFESTS: &[(&str, &str)] = &[
     ("logs", include_str!("builtin/logs.toml")),
     ("database", include_str!("builtin/database.toml")),
     ("browser", include_str!("builtin/browser.toml")),
+    ("files", include_str!("builtin/files.toml")),
     ("jira", include_str!("builtin/jira.toml")),
     ("figma", include_str!("builtin/figma.toml")),
 ];
@@ -109,6 +110,11 @@ mod tests {
         assert!(matches!(builtin("logs").pane, PaneSpec::Logs { .. }));
         assert!(matches!(builtin("database").pane, PaneSpec::Sql { .. }));
         assert!(matches!(builtin("browser").pane, PaneSpec::Web { .. }));
+        assert_eq!(builtin("files").pane, PaneSpec::Files);
+        assert!(
+            builtin("files").tools.is_empty(),
+            "the files pane reads on its own"
+        );
         for m in builtin_manifests().into_iter().flatten() {
             assert!(
                 !m.scope.allows("production"),

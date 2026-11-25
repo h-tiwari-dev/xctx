@@ -453,7 +453,11 @@ impl Workspace {
                 }
                 self.ensure_plugin_ticker(cx);
             }
-            PaneSpec::Http { .. } | PaneSpec::Sql { .. } | PaneSpec::Web { .. } => {}
+            // A files pane reads its worktree itself when it is first drawn.
+            PaneSpec::Http { .. }
+            | PaneSpec::Sql { .. }
+            | PaneSpec::Web { .. }
+            | PaneSpec::Files => {}
         }
         cx.notify();
     }

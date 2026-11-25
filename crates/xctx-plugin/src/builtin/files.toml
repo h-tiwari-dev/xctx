@@ -1,0 +1,8 @@
+# Files: a read-only explorer of the repo's worktree in the space, with each file's git status, its text and its
+# diff. It reads only inside the worktree and has no tools.
+name = "files"
+version = "1.0.0"
+description = "Browse the repo's files in the space"
+
+[pane]
+kind = "files"
