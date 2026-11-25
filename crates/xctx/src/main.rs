@@ -19,6 +19,8 @@ mod persist;
 mod plugin_backend;
 mod plugin_host;
 mod plugin_jobs;
+mod plugin_menu_dialog;
+mod plugin_panes;
 #[cfg(test)]
 mod plugin_tests;
 mod space_graph;

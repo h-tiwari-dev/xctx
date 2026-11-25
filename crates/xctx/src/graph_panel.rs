@@ -324,8 +324,18 @@ impl Workspace {
             entity.clone(),
             entity.clone(),
         );
+        let refusals = self.fork_refusals_in(state);
+        let mut notes = self.attempt_notes(&tab.space.id);
+        for (agent, why) in &refusals {
+            let note = match notes.get(agent) {
+                Some(lineage) => format!("{lineage} · no attempts: {why}"),
+                None => format!("no attempts: {why}"),
+            };
+            notes.insert(agent.clone(), note.into());
+        }
         let graph = AgentGraphView::new(state.graph().clone())
-            .notes(self.attempt_notes(&tab.space.id))
+            .notes(notes)
+            .fork_hidden(refusals.into_keys().collect())
             .on_fork(move |agent, window, cx| {
                 let agent = agent.clone();
                 let _ = fork.update(cx, |this, cx| this.open_fork_dialog(agent, window, cx));

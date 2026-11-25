@@ -1320,6 +1320,8 @@ impl Workspace {
             };
             self.redactor.extend(report.secrets.clone());
             self.plugins.learn_secrets(&check.space, &report.secrets);
+            // The panes' text is masked with what mise found.
+            self.plugin_panes.changed();
             missing += report.missing.len();
             if let Some(inbox) = self.inbox.as_mut()
                 && let Err(e) = inbox.sync_missing(

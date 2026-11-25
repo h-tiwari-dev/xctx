@@ -56,6 +56,8 @@ actions!(
         ForkAttempts,
         /// Open the review sheet on the latest round of attempts of the space being shown.
         ReviewAttempts,
+        /// Open the Plugins menu of the space being shown.
+        OpenPlugins,
     ]
 );
 
@@ -92,6 +94,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-g", ToggleGraph, ws),
         KeyBinding::new("cmd-shift-f", ForkAttempts, ws),
         KeyBinding::new("cmd-shift-r", ReviewAttempts, ws),
+        KeyBinding::new("cmd-shift-p", OpenPlugins, ws),
         KeyBinding::new("cmd-0", ShowHome, ws),
         KeyBinding::new("cmd-enter", LaunchDraft, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
@@ -102,9 +105,10 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
-/// The hints shown in a space.
-pub fn space_key_hints() -> Vec<KeyHint> {
-    vec![
+/// The hints shown in a space. `fork` is whether ⌘⇧F can fork the writer it would pick (its runner can fork
+/// sessions); without it the fork hint is left out.
+pub fn space_key_hints(fork: bool) -> Vec<KeyHint> {
+    let mut hints = vec![
         KeyHint::new("⌘D/⌘⇧D", "split"),
         KeyHint::new("⌘W", "close"),
         KeyHint::new("⌘⌥←→↑↓", "focus"),
@@ -113,8 +117,13 @@ pub fn space_key_hints() -> Vec<KeyHint> {
         KeyHint::new("⌘G", "graph"),
         KeyHint::new("⌘⇧F", "fork"),
         KeyHint::new("⌘⇧R", "review"),
+        KeyHint::new("⌘⇧P", "plugins"),
         KeyHint::new("⌘0", "home"),
-    ]
+    ];
+    if !fork {
+        hints.retain(|hint| hint.keys.as_ref() != "⌘⇧F");
+    }
+    hints
 }
 
 /// The hints shown on Home.
@@ -125,4 +134,22 @@ pub fn home_key_hints() -> Vec<KeyHint> {
         KeyHint::new("⌘1-9", "spaces"),
         KeyHint::new("⌘Q", "quit"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fork_hint_shows_only_when_forking_is_possible() {
+        let keys = |fork| -> Vec<String> {
+            space_key_hints(fork)
+                .iter()
+                .map(|h| h.keys.to_string())
+                .collect()
+        };
+        assert!(keys(true).contains(&"⌘⇧F".to_owned()));
+        assert!(!keys(false).contains(&"⌘⇧F".to_owned()));
+        assert!(keys(false).contains(&"⌘⇧P".to_owned()));
+    }
 }

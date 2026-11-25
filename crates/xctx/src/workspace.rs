@@ -26,9 +26,9 @@ use crate::home::HomeDraft;
 use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
-    FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
-    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph, ToggleZoom,
-    WORKSPACE_CONTEXT, home_key_hints, space_key_hints,
+    FocusRight, FocusUp, ForkAttempts, LaunchDraft, OpenPlugins, Quit, ResizeDown, ResizeLeft,
+    ResizeRight, ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph,
+    ToggleZoom, WORKSPACE_CONTEXT, home_key_hints, space_key_hints,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
@@ -144,6 +144,8 @@ pub(crate) struct Workspace {
     pub(crate) runners: RunnerRegistry,
     /// Whether the task that redraws logs panes and fires their events is running.
     pub(crate) plugin_ticker: bool,
+    /// The drawn plugin panes' own state (inputs, selections, the views last built).
+    pub(crate) plugin_panes: crate::plugin_panes::PluginPanes,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -279,6 +281,7 @@ impl Workspace {
             plugins: PluginHost::new(data_dir, user_plugin_dir()),
             runners: load_runners(user_runner_dir().as_deref()),
             plugin_ticker: false,
+            plugin_panes: Default::default(),
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -547,7 +550,8 @@ impl Workspace {
         let shape = self.active_tab().map(|tab| layout_shape(tab.space.shape));
         let graph_open = self.active_tab().is_some_and(|tab| tab.graph_open);
         let entity = cx.entity().downgrade();
-        let (home, select, reshape, ship, discard, graph) = (
+        let (home, select, reshape, ship, discard, graph, plugins) = (
+            entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
@@ -564,6 +568,13 @@ impl Workspace {
                 let _ = graph.update(cx, |this, cx| {
                     if this.dialog.is_none() {
                         this.toggle_graph(window, cx);
+                    }
+                });
+            })
+            .on_plugins(move |window, cx| {
+                let _ = plugins.update(cx, |this, cx| {
+                    if this.dialog.is_none() {
+                        this.open_plugins_menu(window, cx);
                     }
                 });
             })
@@ -616,7 +627,7 @@ impl Workspace {
                     .branch(branch)
                     .shape(layout_shape(space.shape))
                     .zoomed(tab.layout.tree().is_zoomed())
-                    .hints(space_key_hints());
+                    .hints(space_key_hints(self.strip_can_fork(tab)));
             }
             None => {
                 bar = bar.hints(home_key_hints());
@@ -632,6 +643,8 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
+        self.sync_plugin_panes(window, cx);
+        self.refresh_plugin_panes(cx);
         let body = match self.active_tab() {
             Some(tab) => self.render_space(tab, cx),
             None => self.render_home(window, cx),
@@ -694,6 +707,10 @@ impl Render for Workspace {
             .on_action(Self::pane_shortcut::<ForkAttempts>(
                 cx,
                 |this, window, cx| this.fork_from_keys(window, cx),
+            ))
+            .on_action(Self::pane_shortcut::<OpenPlugins>(
+                cx,
+                |this, window, cx| this.open_plugins_menu(window, cx),
             ))
             .on_action(Self::pane_shortcut::<ReviewAttempts>(
                 cx,

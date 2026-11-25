@@ -323,6 +323,11 @@ impl Workspace {
             );
             return;
         };
+        // A writer whose runner cannot fork sessions has no attempts; say why rather than fail later.
+        if let Some(why) = self.fork_refusal(&space, &agent) {
+            self.info(format!("{agent} cannot be forked: {why}"), cx);
+            return;
+        }
         let mut inputs = Vec::new();
         let mut subscriptions = Vec::new();
         for n in 1..=MAX_ATTEMPTS {
@@ -519,6 +524,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Whether ⌘⇧F and the strip's "Fork…" (which fork the focused writer, else the only one) have a writer
+    /// whose runner can fork, so they are offered. When the graph is not loaded, or the writer is ambiguous, the
+    /// dialog decides and says why.
+    pub(crate) fn strip_can_fork(&self, tab: &SpaceTab) -> bool {
+        let Some(state) = self.graphs.get(&tab.space.id) else {
+            return true;
+        };
+        match fork_target(state.graph(), Some(tab.layout.focused().0)) {
+            Ok(agent) => !self.fork_refusals_in(state).contains_key(&agent),
+            Err(_) => true,
+        }
+    }
+
     /// The pane area of `tab`: the attempt strip over the space's split view, or over the attempt it shows, when
     /// the space has attempts; else just the split view.
     pub(crate) fn render_space_body(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
@@ -535,7 +553,7 @@ impl Workspace {
         let strip = AttemptStrip::new(strip_chips(set, shown, &self.redactor))
             .can_review(can_review(set))
             .busy(self.attempt_jobs.contains(&tab.space.id))
-            .can_fork((set.live().count() as u32) < MAX_ATTEMPTS)
+            .can_fork((set.live().count() as u32) < MAX_ATTEMPTS && self.strip_can_fork(tab))
             .on_select(move |number, window, cx| {
                 let _ = select.update(cx, |this, cx| this.select_attempt(number, window, cx));
             })

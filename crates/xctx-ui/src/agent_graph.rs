@@ -4,7 +4,7 @@
 //! The panel draws an [`AgentGraph`] the app passes in and reports what the user did through callbacks with the
 //! agent's [`AgentNodeId`] (or the [`HelperKind`] to add). It keeps no state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui::{App, FontWeight, SharedString, Window, div, prelude::*, px};
@@ -82,6 +82,8 @@ struct CardHandlers {
     on_talk: Option<NodeHandler>,
     on_remove: Option<NodeHandler>,
     on_fork: Option<NodeHandler>,
+    /// Writers whose "Fork…" is hidden (their runner cannot fork sessions).
+    no_fork: HashSet<AgentNodeId>,
 }
 
 /// The Agent Graph panel: Orchestrator on top, Writers in the middle, Helpers and the add-helper buttons below.
@@ -116,6 +118,13 @@ impl AgentGraphView {
         handler: impl Fn(&AgentNodeId, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.handlers.on_fork = Some(Rc::new(handler));
+        self
+    }
+
+    /// Hide "Fork…" on these writers' cards, for example because their runner cannot fork sessions (say why
+    /// in their [`AgentGraphView::notes`]).
+    pub fn fork_hidden(mut self, writers: HashSet<AgentNodeId>) -> Self {
+        self.handlers.no_fork = writers;
         self
     }
 
@@ -259,7 +268,10 @@ fn agent_card(
             handlers.on_talk.as_ref(),
         )
     });
-    let fork = (node.role.is_writer() && handlers.on_fork.is_some()).then(|| {
+    let fork = (node.role.is_writer()
+        && handlers.on_fork.is_some()
+        && !handlers.no_fork.contains(&node.id))
+    .then(|| {
         card_button(
             "fork",
             "Fork…",
