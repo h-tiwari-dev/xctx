@@ -23,7 +23,13 @@ fn the_space_mise_file_holds_the_port_and_is_ignored_without_touching_tracked_fi
     let text = fs::read_to_string(&path)?;
     assert!(text.contains("[env]\nPORT = \"4002\"\n"), "{text}");
     assert!(text.contains("XCTX_SPACE = \"rate-limit\""), "{text}");
-
+    assert!(
+        text.contains(&format!(
+            "XCTX_DATA_DIR = \"{}\"",
+            mise::space_data_dir("rate-limit").display()
+        )),
+        "{text}"
+    );
     assert!(xgit::is_ignored(
         &worktree,
         Path::new("mise.rate-limit.toml")

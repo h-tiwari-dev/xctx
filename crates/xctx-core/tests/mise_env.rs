@@ -196,8 +196,11 @@ fn a_production_space_layers_its_own_mise_file_over_mise_production_toml() -> Te
     assert_eq!(values["PROD_ONLY"], "yes", "mise.production.toml is loaded");
     assert_eq!(values["PORT"], "4001", "the space's PORT wins: {values}");
     assert_eq!(values["XCTX_SPACE"], "s");
+    assert_eq!(
+        values["XCTX_DATA_DIR"],
+        mise::space_data_dir("s").to_string_lossy().as_ref()
+    );
     assert_eq!(values["STRIPE_KEY"], "sk_live_42");
-
     let report = isolated(&dir).inspect(&dir, Some(&mise_env))?;
     assert!(report.is_complete(), "{report:?}");
     let names: Vec<_> = report.secrets.keys().map(String::as_str).collect();

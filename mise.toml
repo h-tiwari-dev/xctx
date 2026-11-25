@@ -3,6 +3,7 @@ rust = { version = "1.100.0", components = ["rustfmt", "clippy"] }
 
 [tasks.dev]
 description = "Run the xctx app in debug mode (xctx-ctl is built next to it for its panes)"
+env = { XCTX_CONTROL_SOCKET = "" }
 run = ["cargo build -q -p xctx-control --bin xctx-ctl", "cargo run -p xctx"]
 
 [tasks.ctl]
