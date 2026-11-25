@@ -447,6 +447,7 @@ impl Workspace {
                         );
                     }
                     if this.plugins.dirty.swap(false, Ordering::Relaxed) {
+                        this.plugin_panes.logs_changed();
                         cx.notify();
                     }
                     let tailing = this.plugins.any_tails();
@@ -509,6 +510,7 @@ impl Workspace {
                             .write_pending = Some(item.clone());
                     }
                     self.plugins.pending_writes.insert(item.clone(), pending);
+                    self.plugin_panes.changed();
                     ToolCallResult::Gated(item)
                 });
                 done(self, result, cx);
@@ -530,12 +532,14 @@ impl Workspace {
         let plugin = job.plan.plugin.clone();
         let builtin = job.plan.builtin().map(str::to_owned).unwrap_or_default();
         self.set_pane_busy(&id, pane, &builtin, true);
+        self.plugin_panes.changed();
         cx.notify();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let result = executor.spawn(async move { job.run() }).await;
             let _ = this.update(cx, |this, cx| {
                 this.set_pane_busy(&id, pane, &builtin, false);
+                this.plugin_panes.changed();
                 let result = match result {
                     Ok(output) => {
                         this.plugins.apply_effect(&id, pane, &output.effect);
@@ -619,6 +623,7 @@ impl Workspace {
             ),
             Err(e) => {
                 self.set_pane_error(id, pane, builtin, e.message.clone());
+                self.plugin_panes.changed();
                 self.error(e.message, cx);
             }
         }
@@ -763,6 +768,7 @@ impl Workspace {
         }
         let gate = gate.clone();
         let id = gate.space.clone();
+        self.plugin_panes.changed();
         match &gate.kind {
             PluginGateKind::WriteCall { tool, args } => {
                 let pending = self
@@ -852,6 +858,7 @@ impl Workspace {
 
     /// The user turned down a plugin gate: forget the call or mount it held.
     pub(crate) fn plugin_gate_rejected(&mut self, item: &ItemId) {
+        self.plugin_panes.changed();
         if let Some(pending) = self.plugins.pending_writes.remove(item) {
             self.plugins.clear_write_pending(&pending.space, item);
         }
@@ -991,27 +998,61 @@ impl Workspace {
     /// Why writer `agent` of `space` cannot be forked into attempts because of its runner, if it cannot: the
     /// runner's own "cannot fork" message.
     pub(crate) fn fork_refusal(&mut self, space: &Space, agent: &AgentNodeId) -> Option<String> {
-        match self.lane_runner(space, agent) {
-            Err(e) => Some(e),
-            Ok(Some(runner)) if !runner.can_fork() => Some(
-                RunnerError::Unsupported {
-                    runner: runner.name.clone(),
-                    capability: Capability::ForkSession,
-                }
-                .to_string(),
-            ),
-            Ok(_) => None,
-        }
+        let state = self.graphs.load(space).ok()?;
+        let chosen = state
+            .graph()
+            .node(agent)
+            .and_then(|n| n.runner.clone())
+            .or_else(|| state.doc().runner.clone());
+        runner_fork_refusal(chosen.as_deref(), &self.runners)
+    }
+
+    /// Why each writer of the loaded graph `state` cannot be forked because of its runner, for the writers that
+    /// cannot: the attempt entry points hide or disable Fork for them, with this as the reason.
+    pub(crate) fn fork_refusals_in(
+        &self,
+        state: &crate::space_graph::SpaceGraphState,
+    ) -> std::collections::HashMap<AgentNodeId, String> {
+        let space_runner = state.doc().runner.as_deref();
+        state
+            .graph()
+            .writers()
+            .filter_map(|w| {
+                let chosen = w.runner.as_deref().or(space_runner);
+                runner_fork_refusal(chosen, &self.runners).map(|why| (w.id.clone(), why))
+            })
+            .collect()
     }
 }
 
-/// The plugin panes' side: what they show and what they do. They are drawn by the next part of Milestone 5,
-/// Wave 3 (the pane worker), which calls these from the space tab's render and the panes' callbacks.
-#[allow(dead_code)]
+/// Why a writer running the runner named `chosen` (its lane's, else its space's; `None` for `pi`, which forks)
+/// cannot be forked into attempts, if it cannot: the runner is not installed, or its own "cannot fork
+/// sessions" message.
+pub(crate) fn runner_fork_refusal(
+    chosen: Option<&str>,
+    runners: &xctx_plugin::RunnerRegistry,
+) -> Option<String> {
+    let name = chosen?;
+    match runners.get(name) {
+        None => Some(format!("the runner {name} is not installed")),
+        Some(runner) if !runner.manifest.can_fork() => Some(
+            RunnerError::Unsupported {
+                runner: runner.manifest.name.clone(),
+                capability: Capability::ForkSession,
+            }
+            .to_string(),
+        ),
+        Some(_) => None,
+    }
+}
+
+/// The plugin panes' side: what they show and what they do. The panes (`plugin_panes.rs`) read these before a
+/// frame and call them from their buttons; the Plugins menu (`plugin_menu_dialog.rs`) lists the plugins.
 impl Workspace {
     /// Choose the runner of space `id` (`agent` `None`) or of one of its lanes, `None` for the default (`pi`,
     /// or the space's). The change applies the next time the agent's pane starts. Refused for a runner that is
     /// not installed.
+    #[allow(dead_code)] // No caller yet: the runner picker and its control method are still to come.
     pub(crate) fn set_runner(
         &mut self,
         id: &SpaceId,
@@ -1098,6 +1139,7 @@ impl Workspace {
         let state = &mut self.plugins.runtime(id).http_state;
         state.selected = exchange;
         state.diff = None;
+        self.plugin_panes.changed();
         cx.notify();
     }
 
@@ -1205,6 +1247,7 @@ impl Workspace {
     /// Drop the lines of logs pane `pane` of `id`.
     pub(crate) fn logs_clear(&mut self, id: &SpaceId, pane: PaneId, cx: &mut Context<Self>) {
         if self.plugins.logs_clear(id, pane) {
+            self.plugin_panes.changed();
             cx.notify();
         }
     }

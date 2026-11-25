@@ -6466,6 +6466,7 @@ dependencies = [
  "xctx-inbox",
  "xctx-layout",
  "xctx-plugin",
+ "xctx-plugin-view",
  "xctx-term",
  "xctx-term-view",
  "xctx-ui",

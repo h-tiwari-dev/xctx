@@ -473,8 +473,32 @@ pub fn repo_worktree(space: &Space, repo: &str) -> PathBuf {
         .unwrap_or_default()
 }
 
+/// The values of the settings `manifest` lists under `secrets` that are not secret (see
+/// [`xctx_connectors::PLAIN_SETTINGS`]: where a service is, such as `JIRA_BASE_URL`, not how to get in) and that
+/// mise did not report among `known` (mise only reports the values it redacts): each looked up with `lookup`
+/// (the app's process environment), when set and not empty. Secrets are never looked up this way: they come
+/// from mise only, and stay masked.
+pub fn plain_settings(
+    manifest: &Manifest,
+    known: &BTreeMap<String, String>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    manifest
+        .secrets
+        .iter()
+        .filter(|name| xctx_connectors::PLAIN_SETTINGS.contains(&name.as_str()))
+        .filter(|name| !known.contains_key(name.as_str()))
+        .filter_map(|name| {
+            lookup(name)
+                .filter(|v| !v.is_empty())
+                .map(|v| (name.clone(), v))
+        })
+        .collect()
+}
+
 /// The context a call of `manifest`'s tools runs in for `space`, working in `repo`: its worktree, `PORT`,
-/// effective `MISE_ENV` and production flag, the space's secrets the manifest declares, and `redactor`.
+/// effective `MISE_ENV` and production flag, the space's secrets the manifest declares, its plain settings
+/// (see [`plain_settings`], from the process environment when mise did not report them), and `redactor`.
 pub fn call_context(
     space: &Space,
     repo: &str,
@@ -488,7 +512,13 @@ pub fn call_context(
         port: Some(space.port),
         mise_env: space.effective_mise_env(),
         space_production: space.production,
-        secrets: declared_secrets(manifest, secrets),
+        secrets: {
+            let mut declared = declared_secrets(manifest, secrets);
+            declared.extend(plain_settings(manifest, secrets, |name| {
+                std::env::var(name).ok()
+            }));
+            declared
+        },
         redactor: redactor.clone(),
     }
 }
@@ -2187,6 +2217,36 @@ impl PluginHost {
         })
     }
 
+    /// The pane kind (`terminal`, `http`, `logs`, `sql` or `web`) of plugin pane `pane` of `space` and its
+    /// resolved settings (a base URL or page with `{PORT}` filled, say); `None` when the pane has no mount or
+    /// its plugin is not usable. The settings are `None` when they cannot be filled.
+    pub fn mounted_pane(
+        &mut self,
+        space: &Space,
+        pane: PaneId,
+        redactor: &Redactor,
+    ) -> Option<(&'static str, Option<PaneSettings>)> {
+        let mount = self
+            .mounts(&space.id)
+            .ok()?
+            .iter()
+            .find(|m| m.pane == pane)
+            .cloned()?;
+        let registry = self.registry(space);
+        let manifest = registry.usable(&mount.plugin)?.manifest.clone();
+        let ctx = call_context(
+            space,
+            &mount.repo,
+            &self.secrets(&space.id),
+            redactor,
+            &manifest,
+        );
+        Some((
+            manifest.pane.kind(),
+            pane_settings(&manifest, &mount, &ctx).ok(),
+        ))
+    }
+
     /// What logs pane `pane` of `space` shows; `None` when it has no tail.
     pub fn logs_data(
         &self,
@@ -2337,6 +2397,41 @@ mod tests {
             Some(PathBuf::from("/Users/me/.config/xctx/runners"))
         );
         assert_eq!(config_dir_in(None, None, "plugins"), None);
+    }
+
+    #[test]
+    fn plain_settings_come_from_the_environment_and_secrets_never_do() -> TestResult {
+        let jira = xctx_plugin::builtin_manifests()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|m| m.name == "jira")
+            .ok_or("no jira")?;
+        let env = |name: &str| match name {
+            "JIRA_BASE_URL" => Some("http://127.0.0.1:9/jira".to_owned()),
+            "JIRA_EMAIL" => Some("from-env@x.invalid".to_owned()),
+            "JIRA_API_TOKEN" => Some("tok-from-env".to_owned()),
+            _ => None,
+        };
+        // mise reported the email (it redacts it): its value wins; the base URL comes from the environment; the
+        // token is a secret and is never read from the environment.
+        let known: BTreeMap<String, String> = [("JIRA_EMAIL", "me@x.invalid")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let plain = plain_settings(&jira, &known, env);
+        assert_eq!(
+            plain.into_iter().collect::<Vec<_>>(),
+            [(
+                "JIRA_BASE_URL".to_owned(),
+                "http://127.0.0.1:9/jira".to_owned()
+            )]
+        );
+        // Unset or empty values are left out, so the call still says which setting is missing.
+        let empty = plain_settings(&jira, &BTreeMap::new(), |name| {
+            (name == "JIRA_BASE_URL").then(String::new)
+        });
+        assert!(empty.is_empty());
+        Ok(())
     }
 
     #[test]

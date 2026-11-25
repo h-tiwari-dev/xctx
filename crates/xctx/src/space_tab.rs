@@ -113,10 +113,14 @@ pub(crate) fn is_current_shape(current: SpaceShape, shape: Shape) -> bool {
     current == space_shape(shape)
 }
 
-/// The header of a pane: the program's own title when it set one, else `<repo> · <kind>`, with the exit code
+/// The header of a pane: the program's own title when it set one, else `<repo> · <kind>` (`<repo> · <plugin>`
+/// for a plugin pane), with the exit code
 /// once it exited.
 pub(crate) fn pane_title(role: &PaneRole, terminal: Option<&PaneTerminal>) -> String {
-    let fallback = format!("{} · {}", role.repo, pane_kind_label(role.kind));
+    let fallback = match (&role.kind, &role.plugin) {
+        (PaneKind::Plugin, Some(plugin)) => format!("{} · {plugin}", role.repo),
+        _ => format!("{} · {}", role.repo, pane_kind_label(role.kind)),
+    };
     match terminal {
         Some(PaneTerminal::Running { title, exited, .. }) => {
             let title = title
@@ -393,7 +397,11 @@ impl Workspace {
                 let handle = view.focus_handle(cx);
                 handle.focus(window, cx);
             }
-            _ => self.focus_handle.focus(window, cx),
+            // A plugin pane drawn by a renderer takes the keys in its main input (Esc leaves it).
+            _ => match self.plugin_pane_focus(&(tab.space.id.clone(), focused), cx) {
+                Some(handle) => handle.focus(window, cx),
+                None => self.focus_handle.focus(window, cx),
+            },
         }
     }
 
@@ -601,6 +609,7 @@ impl Workspace {
             .is_some_and(|r| r.kind == PaneKind::Plugin);
         tab.layout.close(pane).map_err(|e| layout_error(id, e))?;
         tab.terminals.remove(&pane);
+        self.plugin_panes.forget(id, pane);
         if was_plugin {
             self.plugin_pane_closed(id, pane, cx);
         }
@@ -794,6 +803,7 @@ impl Workspace {
             .map_err(RpcError::internal)?;
         for pane in &result.removed {
             tab.terminals.remove(&pane.id);
+            self.plugin_panes.forget(id, pane.id);
         }
         self.sync_agent_panes(id);
         for pane in &result.added {
@@ -822,6 +832,7 @@ impl Workspace {
             self.persist(id, cx);
         }
         self.stop_space_plugins(id, cx);
+        self.plugin_panes.forget_space(id);
         let sessions = self
             .tabs
             .remove(id)
@@ -884,16 +895,20 @@ impl Workspace {
                         .child(message.clone())
                         .into_any_element(),
                     // Plugin panes drawn by a first-party renderer have no terminal.
-                    None if pane.role.kind == PaneKind::Plugin => div()
-                        .size_full()
-                        .p(Theme::SPACE_3)
-                        .text_size(Theme::TEXT_SM)
-                        .text_color(theme.text_subtle)
-                        .child(format!(
-                            "{} plugin",
-                            pane.role.plugin.as_deref().unwrap_or("unknown")
-                        ))
-                        .into_any_element(),
+                    None if pane.role.kind == PaneKind::Plugin => self
+                        .render_plugin_pane(&tab.space.id, pane.id, cx)
+                        .unwrap_or_else(|| {
+                            div()
+                                .size_full()
+                                .p(Theme::SPACE_3)
+                                .text_size(Theme::TEXT_SM)
+                                .text_color(theme.text_subtle)
+                                .child(format!(
+                                    "{} plugin",
+                                    pane.role.plugin.as_deref().unwrap_or("unknown")
+                                ))
+                                .into_any_element()
+                        }),
                     None => div()
                         .size_full()
                         .p(Theme::SPACE_3)
@@ -954,6 +969,10 @@ mod tests {
     fn titles_fall_back_to_repo_and_kind() {
         let role = PaneRole::new(PaneKind::Agent, "api");
         assert_eq!(pane_title(&role, None), "api · agent");
+        assert_eq!(
+            pane_title(&PaneRole::for_plugin("api-client", "api"), None),
+            "api · api-client"
+        );
         assert_eq!(
             pane_title(&role, Some(&PaneTerminal::Failed("x".into()))),
             "api · agent — failed to start"

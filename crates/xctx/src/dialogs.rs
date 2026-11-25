@@ -16,6 +16,7 @@ use crate::keymap::DIALOG_CONTEXT;
 use crate::lifecycle::{
     dirty_repos, discard_message, discard_space, ship_report_lines, ship_space,
 };
+use crate::plugin_menu_dialog::PluginsState;
 use crate::space_graph::clean_scratch;
 use crate::workspace::{View, Workspace, in_flight_message, wait_message};
 
@@ -43,6 +44,8 @@ pub(crate) enum Dialog {
     /// Compare a round of attempts, and adopt or discard them (see `attempt_ui.rs`). Its jobs do not keep it
     /// open.
     Review(ReviewState),
+    /// The space's Plugins menu (see `plugin_menu_dialog.rs`).
+    Plugins(PluginsState),
 }
 
 impl Dialog {
@@ -53,6 +56,7 @@ impl Dialog {
             | Dialog::Shipped { space, .. } => space,
             Dialog::Fork(fork) => &fork.space,
             Dialog::Review(review) => &review.space,
+            Dialog::Plugins(plugins) => &plugins.space,
         }
     }
 
@@ -99,7 +103,7 @@ impl Dialog {
                     *dirty = dirty_repos;
                 }
             }
-            Dialog::Shipped { .. } | Dialog::Fork(_) | Dialog::Review(_) => {}
+            Dialog::Shipped { .. } | Dialog::Fork(_) | Dialog::Review(_) | Dialog::Plugins(_) => {}
         }
     }
 }
@@ -492,6 +496,11 @@ impl Workspace {
                 .key_context(DIALOG_CONTEXT)
                 .track_focus(&self.dialog_focus)
                 .into_any_element(),
+            Dialog::Plugins(plugins) => self
+                .render_plugins_menu(plugins, cx)
+                .key_context(DIALOG_CONTEXT)
+                .track_focus(&self.dialog_focus)
+                .into_any_element(),
             _ => self
                 .render_confirmation(dialog, &theme, cx)
                 .key_context(DIALOG_CONTEXT)
@@ -659,7 +668,7 @@ impl Workspace {
                 )
             }
             // Drawn by `render_dialog` itself.
-            Dialog::Fork(_) | Dialog::Review(_) => panel(&theme),
+            Dialog::Fork(_) | Dialog::Review(_) | Dialog::Plugins(_) => panel(&theme),
         }
     }
 }

@@ -34,6 +34,8 @@ pub const BROWSER_NO_SCREENSHOT: &str = "No screenshot yet. Open a page.";
 /// Where the pane is with Chrome.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BrowserStatus {
+    /// Chrome has not been started yet: Open starts it; Reload is disabled.
+    Idle,
     /// No Chrome or Chromium is installed: Open and Reload are disabled and the install hint shows.
     ChromeNotFound,
     /// Chrome is starting or a page is loading: Open and Reload are disabled.
@@ -49,6 +51,7 @@ impl BrowserStatus {
     /// The status line's text.
     pub fn label(&self) -> SharedString {
         match self {
+            Self::Idle => "Not started".into(),
             Self::ChromeNotFound => CHROME_NOT_FOUND.into(),
             Self::Connecting => "Connecting…".into(),
             Self::Ready => "Ready".into(),
@@ -62,6 +65,7 @@ impl BrowserStatus {
             Self::ChromeNotFound | Self::Failed(_) => Tone::Danger,
             Self::Connecting => Tone::Warning,
             Self::Ready => Tone::Success,
+            Self::Idle => Tone::Neutral,
         }
     }
 }
@@ -397,6 +401,8 @@ mod tests {
         assert!(!pane(BrowserStatus::ChromeNotFound).can_open());
         assert!(!pane(BrowserStatus::Connecting).can_open());
         assert!(pane(BrowserStatus::Ready).can_open());
+        assert!(pane(BrowserStatus::Idle).can_open());
+        assert!(!pane(BrowserStatus::Idle).can_reload());
         assert!(pane(BrowserStatus::Failed("gone".into())).can_open());
         assert!(pane(BrowserStatus::Ready).can_reload());
         assert!(!pane(BrowserStatus::Failed("gone".into())).can_reload());
