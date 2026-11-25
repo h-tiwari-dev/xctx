@@ -6,8 +6,9 @@
 //! the live workspace, running [`CallJob`]s on the background executor and the results on the UI thread.
 //!
 //! On disk, under the data directory:
-//! - `plugin-trust.json`: the repo plugins the user trusted, each by repo, plugin name and the SHA-256 of its
-//!   `plugin.toml`, so an edited manifest asks again;
+//! - `plugin-trust.json`: the repo plugins the user trusted, each by repo, plugin name and the SHA-256 of the
+//!   `plugin.toml` bytes the registry parsed, so an edited manifest asks again (trust covers the manifest, not the
+//!   scripts it runs);
 //! - `spaces/<slug>/plugins.json`: the plugins mounted in a space, one entry per plugin pane, with the settings
 //!   chosen when mounting (a logs command, a database file, a base URL);
 //! - `spaces/<slug>/http.json`: the API client's history (see `xctx_http`);
@@ -23,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use xctx_browser::{ConsoleEntry, NetworkError, ScreenshotOptions, UrlPolicy};
 use xctx_channel::{FindingSeverity, ScratchDir};
 use xctx_connectors::{BuiltinContext, Database, LogBuffer, LogLine, LogSource};
@@ -38,9 +38,9 @@ use xctx_http::{EventRules, Exchange, ExchangeDiff, HttpHistory, Request, SendOp
 use xctx_inbox::{Inbox, ItemBody, ItemId, Level, Notice, PluginGate, PluginGateKind, Source};
 use xctx_layout::{PaneId, PaneKind, RolePane};
 use xctx_plugin::{
-    CallContext, CallPlan, Effect, Invocation, LoopAction, MANIFEST_FILE, Manifest, PaneSpec,
-    ParamKind, Plugin, REPO_PLUGINS_DIR, Registry, SqlEngine, fill_context, match_events,
-    pane_argv, plan_call, run_plan,
+    CallContext, CallPlan, Effect, FiredEvent, Invocation, LoopAction, Manifest, PaneSpec,
+    ParamKind, Plugin, Registry, SqlEngine, fill_context, loop_outcome, match_events, pane_argv,
+    plan_call, run_plan_isolated,
 };
 
 use crate::plugin_backend::{
@@ -79,8 +79,24 @@ pub const EVENT_DEBOUNCE: Duration = Duration::from_secs(5);
 /// The most characters of an event's detail kept in a finding or a notice.
 pub const MAX_EVENT_DETAIL_CHARS: usize = 1000;
 
-/// The most characters of a write call's arguments shown in its Inbox gate.
+/// The most characters of a write call's masked arguments an Inbox gate shows. A call whose arguments are longer is
+/// refused rather than gated, so the user always sees everything that would run.
 pub const MAX_GATE_ARGS_CHARS: usize = 4000;
+
+/// The most distinct events one tool call records as findings; the rest are counted in the summary only.
+pub const MAX_EVENTS_PER_CALL: usize = 20;
+
+/// The same plugin's same event posts at most one Inbox notice per space in this window, unless it newly stops
+/// the loop or the loop waits for approval, which always post.
+pub const NOTICE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// The variables of xctx's own environment a tool or a tailed command is given; everything else (tokens, the
+/// control socket, the user's other secrets) is left out. `LC_*` is allowed as a prefix.
+pub const TOOL_ENV_ALLOWLIST: &[&str] =
+    &["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM"];
+
+/// The `PATH` a tool gets when the app knows no better one.
+pub const DEFAULT_TOOL_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// How many lines of a logs pane a space keeps.
 pub const LOG_CAPACITY: usize = xctx_connectors::DEFAULT_LOG_CAPACITY;
@@ -92,6 +108,32 @@ pub fn event_author(plugin: &str) -> String {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The whole environment a tool or a tailed command starts with: the allowed variables of `base` (xctx's own
+/// environment, see [`TOOL_ENV_ALLOWLIST`]), then `path` as `PATH` (the panes' `PATH`; [`DEFAULT_TOOL_PATH`]
+/// without one), then `extra` (the plan's `MISE_ENV`, `PORT`, `XCTX_SPACE` and declared secrets), which wins.
+pub fn isolated_env(
+    base: impl IntoIterator<Item = (String, String)>,
+    path: Option<String>,
+    extra: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = base
+        .into_iter()
+        .filter(|(k, _)| TOOL_ENV_ALLOWLIST.contains(&k.as_str()) || k.starts_with("LC_"))
+        .collect();
+    env.insert(
+        "PATH".to_owned(),
+        path.filter(|p| !p.is_empty())
+            .unwrap_or_else(|| DEFAULT_TOOL_PATH.to_owned()),
+    );
+    env.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
+}
+
+/// xctx's own environment, as text (variables that are not valid UTF-8 are left out).
+fn process_env() -> impl Iterator<Item = (String, String)> {
+    std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -165,18 +207,11 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> 
 // -------------------------------------------------------------------------------------------------------------
 // Trust
 
-/// The SHA-256 of a manifest's bytes, in hex: what trusting a repo plugin records.
+/// The SHA-256 of a manifest's bytes, in hex: what trusting a repo plugin records. The registry hashes the bytes
+/// it parsed ([`Plugin::manifest_hash`]); use that, not a second read of the file.
+#[cfg(test)]
 pub fn manifest_hash(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// The manifest file of `repo`'s plugin `plugin` in the folder the space works in (its worktree).
-pub fn repo_manifest_path(worktree: &Path, plugin: &str) -> PathBuf {
-    worktree
-        .join(REPO_PLUGINS_DIR)
-        .join(plugin)
-        .join(MANIFEST_FILE)
+    xctx_plugin::manifest_hash(bytes)
 }
 
 /// One trusted repo plugin.
@@ -186,7 +221,7 @@ pub struct TrustEntry {
     pub repo: PathBuf,
     /// The plugin's name.
     pub plugin: String,
-    /// [`manifest_hash`] of the manifest the user trusted.
+    /// The SHA-256 of the manifest bytes the user trusted ([`Plugin::manifest_hash`]).
     pub hash: String,
 }
 
@@ -312,6 +347,31 @@ pub struct Mount {
     /// What was chosen when mounting.
     #[serde(default)]
     pub settings: MountSettings,
+    /// True when the user made the mount from the Plugins menu, so its paths (an absolute log file or database)
+    /// are the user's choice. False for an agent's `plugin.mount`, for panes found in a layout, and for mounts
+    /// saved before this was recorded: their paths must stay in the worktree.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_paths: bool,
+}
+
+impl MountSettings {
+    /// The settings as they may be shown: URLs and the database with credentials masked
+    /// ([`xctx_http::mask_url`]), everything masked with `redactor`.
+    pub fn masked(&self, redactor: &Redactor) -> MountSettings {
+        let url = |u: &Option<String>| u.as_deref().map(|u| xctx_http::mask_url(u, redactor));
+        let text = |t: &str| redactor.redact(t).into_owned();
+        MountSettings {
+            command: self
+                .command
+                .as_ref()
+                .map(|argv| argv.iter().map(|a| text(a)).collect()),
+            log_file: self.log_file.as_deref().map(text),
+            engine: self.engine,
+            database: url(&self.database),
+            base_url: url(&self.base_url),
+            url: url(&self.url),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -360,6 +420,39 @@ pub fn save_mounts(data_dir: &Path, slug: &str, mounts: &[Mount]) -> Result<(), 
     )
 }
 
+/// What a space's plugins keep in `data_dir` that goes when the space is shipped or discarded: its
+/// `plugins.json` and its browser profile (`browser-profiles/<slug>`). Empty for a slug that is not valid.
+pub fn space_plugin_files(data_dir: &Path, slug: &str) -> Vec<PathBuf> {
+    if check_slug(slug).is_err() {
+        return Vec::new();
+    }
+    vec![
+        data_dir.join("spaces").join(slug).join(MOUNTS_FILE),
+        data_dir.join(BROWSER_PROFILES_DIR).join(slug),
+    ]
+}
+
+/// Remove `paths` (files or folders) that exist, saying which could not be removed.
+pub fn remove_paths(paths: &[PathBuf]) -> Result<(), String> {
+    let mut failed = Vec::new();
+    for path in paths {
+        let result = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+            Ok(_) => std::fs::remove_file(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            failed.push(format!("{}: {e}", path.display()));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not remove {}", failed.join("; ")))
+    }
+}
+
 /// `mounts` in step with a layout's `panes`: entries whose pane is gone (or is no longer that plugin's) are
 /// dropped, and each plugin pane without an entry gets one with no settings. Returns whether anything changed.
 pub fn reconcile_mounts(mounts: &mut Vec<Mount>, panes: &[RolePane]) -> bool {
@@ -381,6 +474,7 @@ pub fn reconcile_mounts(mounts: &mut Vec<Mount>, panes: &[RolePane]) -> bool {
                 plugin,
                 repo: pane.role.repo.clone(),
                 settings: MountSettings::default(),
+                user_paths: false,
             });
         }
     }
@@ -521,13 +615,23 @@ pub fn call_context(
     }
 }
 
-/// A write call's arguments as its Inbox gate shows them: compact JSON, masked, cut at
-/// [`MAX_GATE_ARGS_CHARS`].
-pub fn masked_args_summary(args: &Map<String, Value>, redactor: &Redactor) -> String {
+/// A write call's arguments as its Inbox gate shows them: compact JSON, masked. Refused when longer than
+/// [`MAX_GATE_ARGS_CHARS`]: the gate must show everything that would run, so the agent is told to send a smaller
+/// call.
+pub fn masked_args_summary(
+    args: &Map<String, Value>,
+    redactor: &Redactor,
+) -> Result<String, String> {
     let mut value = Value::Object(args.clone());
     redactor.redact_json(&mut value);
     let text = value.to_string();
-    cut_chars(&text, MAX_GATE_ARGS_CHARS)
+    let len = text.chars().count();
+    if len > MAX_GATE_ARGS_CHARS {
+        return Err(format!(
+            "the arguments of this write are {len} characters, more than the {MAX_GATE_ARGS_CHARS} its Inbox request can show; send a smaller call (split the change into several writes)"
+        ));
+    }
+    Ok(text)
 }
 
 /// `text` cut to `max` characters, with an ellipsis when cut.
@@ -619,6 +723,19 @@ pub fn pane_settings(
     Ok(out)
 }
 
+/// What a write through a pane with `settings` reaches, masked, for its Inbox gate: the database, else the base
+/// URL, else the page. `None` when the pane has none of these.
+pub fn write_target(settings: &PaneSettings, redactor: &Redactor) -> Option<String> {
+    settings
+        .database
+        .as_ref()
+        .map(|d| d.location.clone())
+        .or_else(|| settings.base_url.clone())
+        .or_else(|| settings.url.clone())
+        .map(|t| xctx_http::mask_url(&t, redactor))
+        .filter(|t| !t.trim().is_empty())
+}
+
 /// What the API client does: send a request, replay one from the history, or diff two.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HttpAction {
@@ -699,6 +816,9 @@ pub struct CallEnv {
     pub secrets: BTreeMap<String, String>,
     /// The sql pane the call's result shows in.
     pub pane: Option<PaneId>,
+    /// True when the pane's mount was made by the user, so its log file or database may be outside the worktree
+    /// (see [`Mount::user_paths`]).
+    pub user_paths: bool,
 }
 
 impl CallEnv {
@@ -753,7 +873,11 @@ impl CallJob {
         let mask = |e: String| redactor.redact(&e).into_owned();
         match &self.plan.invocation {
             Invocation::Run { .. } => {
-                let output = run_plan(&self.plan, TOOL_TIMEOUT, TOOL_MAX_OUTPUT)
+                // The tool starts from a cleared environment: a few of xctx's variables, the panes' PATH, and
+                // the plan's own (see `isolated_env`), never xctx's tokens and secrets.
+                let mut plan = self.plan.clone();
+                plan.env = isolated_env(process_env(), plan.env.get("PATH").cloned(), &plan.env);
+                let output = run_plan_isolated(&plan, TOOL_TIMEOUT, TOOL_MAX_OUTPUT)
                     .map_err(|e| mask(e.to_string()))?;
                 let events = match_events(&self.manifest, output.lines())
                     .into_iter()
@@ -944,7 +1068,7 @@ pub fn run_http(
                 let detail = format!(
                     "{} {} -> {} in {} ms",
                     exchange.request.method,
-                    redactor.redact(&exchange.request.url),
+                    xctx_http::mask_url(&exchange.request.url, redactor),
                     status_text(exchange.status()),
                     exchange.elapsed_ms()
                 );
@@ -1019,7 +1143,9 @@ fn run_page(
                 .get("full_page")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // A page that redirected or was clicked away to another site is not captured.
             let png = browser.with_page(policy, redactor, |page| {
+                page.allowed_current_url()?;
                 page.screenshot_with(ScreenshotOptions {
                     clip: None,
                     full_page,
@@ -1052,6 +1178,7 @@ fn run_page(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             browser.with_page(policy, redactor, |page| {
+                page.allowed_current_url()?;
                 page.pump(Duration::from_millis(200))
             })?;
             Ok(page_output(&browser.snapshot(), errors_only, "console"))
@@ -1114,6 +1241,7 @@ fn run_connector(
     ctx.logs = env.logs.clone();
     ctx.database = env.database.clone();
     ctx.scratch_dir = env.scratch.as_ref().map(|s| s.root().to_path_buf());
+    ctx.user_paths = env.user_paths;
     let out = xctx_connectors::run_builtin(name, args, &ctx).map_err(|e| e.to_string())?;
     let effect = if name.starts_with("sql.") {
         PaneEffect::Sql(out.json.clone())
@@ -1189,7 +1317,93 @@ pub fn event_action(action: LoopAction) -> PluginEventAction {
     }
 }
 
-/// Drops repeats of an event: the same space, plugin, event and detail within [`EVENT_DEBOUNCE`].
+/// `detail` without the parts that change from one firing of the same thing to the next (an elapsed time such as
+/// `in 31 ms` or `1.2s`, a timestamp such as `2024-05-01T10:00:00Z` or `10:00:00.123`), so repeats debounce.
+pub fn stable_detail(detail: &str) -> String {
+    let is_number = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let is_duration = |t: &str| {
+        ["ms", "s", "µs", "us"]
+            .iter()
+            .any(|unit| t.strip_suffix(unit).is_some_and(is_number))
+    };
+    let is_timestamp = |t: &str| {
+        let digits = t.chars().filter(char::is_ascii_digit).count();
+        digits >= 4
+            && t.chars().any(|c| matches!(c, ':' | '-' | 'T'))
+            && t.chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | '.' | 'T' | 'Z' | '+'))
+    };
+    let words: Vec<&str> = detail.split_whitespace().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i].trim_matches(|c: char| matches!(c, '[' | ']' | '(' | ')' | ','));
+        let unit_next = words
+            .get(i + 1)
+            .is_some_and(|n| matches!(*n, "ms" | "s" | "µs" | "us"));
+        if is_number(word) && unit_next {
+            i += 2;
+            continue;
+        }
+        if is_duration(word) || is_timestamp(word) {
+            i += 1;
+            continue;
+        }
+        kept.push(words[i]);
+        i += 1;
+    }
+    kept.join(" ")
+}
+
+/// Rate-limits the Inbox notices of plugin events: one per space, plugin and event per [`NOTICE_INTERVAL`].
+#[derive(Debug, Default)]
+pub struct NoticeLimiter {
+    posted: HashMap<(String, String, String), Instant>,
+}
+
+impl NoticeLimiter {
+    /// Whether a notice of `event` may be posted at `now`; when it may, it counts as posted.
+    pub fn admit(&mut self, space: &str, plugin: &str, event: &str, now: Instant) -> bool {
+        self.posted
+            .retain(|_, at| now.saturating_duration_since(*at) < NOTICE_INTERVAL);
+        let key = (space.to_owned(), plugin.to_owned(), event.to_owned());
+        if self.posted.contains_key(&key) {
+            return false;
+        }
+        self.posted.insert(key, now);
+        true
+    }
+}
+
+/// One event of a call, after repeats of the same name were collapsed into it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollapsedEvent {
+    /// The event's name.
+    pub name: String,
+    /// The first detail it fired with.
+    pub detail: String,
+    /// How many times it fired in the call.
+    pub count: usize,
+}
+
+/// `events` (name, detail) collapsed by name in the order each name first fired: the first detail and a count.
+pub fn collapse_events(events: &[(String, String)]) -> Vec<CollapsedEvent> {
+    let mut out: Vec<CollapsedEvent> = Vec::new();
+    for (name, detail) in events {
+        match out.iter_mut().find(|e| &e.name == name) {
+            Some(e) => e.count += 1,
+            None => out.push(CollapsedEvent {
+                name: name.clone(),
+                detail: detail.clone(),
+                count: 1,
+            }),
+        }
+    }
+    out
+}
+
+/// Drops repeats of an event: the same space, plugin, event and detail within [`EVENT_DEBOUNCE`]. Callers pass
+/// the [`stable_detail`], so an elapsed time does not make a repeat look new.
 #[derive(Debug, Default)]
 pub struct EventDebounce {
     seen: HashMap<(String, String, String, String), Instant>,
@@ -1244,9 +1458,10 @@ pub struct EventReport {
     pub debounced: bool,
     /// What it did to the loop.
     pub loop_effect: LoopEffect,
-    /// The finding recorded in the shared space.
-    pub finding: Option<u64>,
-    /// The Inbox notice posted (a notice event, a failure, or a loop now waiting for approval).
+    /// The findings recorded in the shared space, one per distinct event (at most [`MAX_EVENTS_PER_CALL`]).
+    pub findings: Vec<u64>,
+    /// The Inbox notice posted, at most one per call: the loop newly stopped, the loop waits for approval, or a
+    /// notice or failure event not posted in the last [`NOTICE_INTERVAL`].
     pub notice: Option<ItemId>,
     /// One line on what happened, masked, for the status bar.
     pub summary: String,
@@ -1523,6 +1738,10 @@ pub struct PendingMount {
     pub repo: Option<String>,
     /// What was chosen.
     pub settings: MountSettings,
+    /// For a repo plugin's trust gate, the registry's hash of the manifest the user is asked about.
+    pub hash: Option<String>,
+    /// True when an agent asked (`plugin.mount`), so the mount's paths are not the user's.
+    pub from_agent: bool,
 }
 
 /// What mounting needs first.
@@ -1534,6 +1753,9 @@ pub enum MountCheck {
     NeedsTrust {
         /// The repo, by name in the space.
         repo: String,
+        /// The registry's hash of the exact manifest bytes it parsed ([`Plugin::manifest_hash`]): what the user
+        /// is asked to trust.
+        hash: String,
     },
     /// The user must approve the mount, for this reason.
     NeedsApproval(String),
@@ -1565,6 +1787,9 @@ pub struct PluginHost {
     runtimes: HashMap<SpaceId, SpaceRuntime>,
     debounce: EventDebounce,
     tail_debounce: TailDebounce,
+    notices: NoticeLimiter,
+    /// The value of `XCTX_DATA_DIR` scratch directories are made under (see `scratch_dir_in`).
+    scratch_data_dir: Option<OsString>,
     /// Write calls waiting in the Inbox, by item.
     pub pending_writes: HashMap<ItemId, PendingWrite>,
     /// Mounts waiting in the Inbox, by item.
@@ -1582,6 +1807,7 @@ impl PluginHost {
     pub fn new(data_dir: Option<PathBuf>, user_dir: Option<PathBuf>) -> PluginHost {
         let (trust, trust_error) = TrustStore::load(data_dir.as_deref());
         let (events_tx, events_rx) = channel();
+        let scratch_data_dir = data_dir.as_ref().map(|d| d.clone().into_os_string());
         PluginHost {
             data_dir,
             user_dir,
@@ -1591,6 +1817,8 @@ impl PluginHost {
             runtimes: HashMap::new(),
             debounce: EventDebounce::default(),
             tail_debounce: TailDebounce::default(),
+            notices: NoticeLimiter::default(),
+            scratch_data_dir,
             pending_writes: HashMap::new(),
             pending_mounts: HashMap::new(),
             secrets: HashMap::new(),
@@ -1599,6 +1827,12 @@ impl PluginHost {
             events_rx,
             dirty: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Make scratch directories (where `page.screenshot` saves) as the rest of the app does, from this value of
+    /// `XCTX_DATA_DIR` (see `scratch_dir_in`). A new host uses its own data directory, so tests stay in it.
+    pub fn set_scratch_data_dir(&mut self, data_dir: Option<OsString>) {
+        self.scratch_data_dir = data_dir;
     }
 
     /// The plugins `space` can use (see [`space_registry`]).
@@ -1747,7 +1981,15 @@ impl PluginHost {
             let repo = plugin_repo(space, found)
                 .map(|r| r.name.clone())
                 .unwrap_or_default();
-            return Ok((MountCheck::NeedsTrust { repo }, found.manifest.clone()));
+            let hash = found.manifest_hash.clone().ok_or_else(|| {
+                RpcError::internal(format!(
+                    "{plugin}: the registry kept no hash of its manifest"
+                ))
+            })?;
+            return Ok((
+                MountCheck::NeedsTrust { repo, hash },
+                found.manifest.clone(),
+            ));
         }
         if from_agent && let Some(reason) = mount_gate_reason(&found.manifest) {
             return Ok((MountCheck::NeedsApproval(reason), found.manifest.clone()));
@@ -1755,17 +1997,32 @@ impl PluginHost {
         Ok((MountCheck::Ready, found.manifest.clone()))
     }
 
-    /// Trust `space`'s repo plugin `plugin` as its manifest is now.
-    pub fn trust_repo_plugin(&mut self, space: &Space, plugin: &str) -> Result<(), String> {
+    /// Trust `space`'s repo plugin `plugin`, whose manifest the user was asked about when it hashed to `asked`
+    /// (the registry's hash of the bytes it parsed, recorded in the gate). Refused when nothing was recorded, and
+    /// when the manifest the registry reads now hashes differently: the user must be asked about the new one.
+    pub fn trust_repo_plugin(
+        &mut self,
+        space: &Space,
+        plugin: &str,
+        asked: &str,
+    ) -> Result<(), String> {
+        if asked.trim().is_empty() {
+            return Err(format!(
+                "this request does not record which manifest of {plugin} it was about; reject it and mount {plugin} again to be asked"
+            ));
+        }
         let registry = self.registry(space);
         let found = registry
             .get(plugin)
             .ok_or_else(|| format!("{} has no plugin named {plugin} any more", space.id))?;
         let repo = plugin_repo(space, found)
             .ok_or_else(|| format!("{plugin} is not one of {}'s repo plugins", space.id))?;
-        let bytes = std::fs::read(repo_manifest_path(&repo.worktree, plugin))
-            .map_err(|e| format!("could not read {plugin}'s manifest: {e}"))?;
-        self.trust.trust(&repo.repo, plugin, &manifest_hash(&bytes))
+        match found.manifest_hash.as_deref() {
+            Some(hash) if hash == asked => self.trust.trust(&repo.repo, plugin, hash),
+            _ => Err(format!(
+                "the manifest of {plugin} changed since you were asked; mount it again to be asked about the new one"
+            )),
+        }
     }
 
     /// The runtime of `space`, made on first use (its http history loaded from disk; a damaged history, or one
@@ -1843,14 +2100,13 @@ impl PluginHost {
             Err(e) => (LogTail::failed(buffer, String::new(), e.clone()), Some(e)),
             Ok(settings) => match (settings.logs_command, settings.logs_file) {
                 (Some(argv), _) => {
-                    let mut env: BTreeMap<String, String> = space.env().into_iter().collect();
-                    env.insert(
+                    let mut extra: BTreeMap<String, String> = space.env().into_iter().collect();
+                    extra.insert(
                         xctx_plugin::SPACE_ENV.to_owned(),
                         space.id.as_str().to_owned(),
                     );
-                    if let Some(path) = path_env {
-                        env.insert("PATH".to_owned(), path);
-                    }
+                    // A cleared environment: a few of xctx's variables, the panes' PATH, the space's.
+                    let env = isolated_env(process_env(), path_env, &extra);
                     match LogTail::command(&argv, &ctx.worktree, &env, buffer.clone(), target) {
                         Ok(tail) => (tail, None),
                         Err(e) => {
@@ -1923,15 +2179,37 @@ impl PluginHost {
 
     /// The events tails matched since the last call, without those of the same event that fired from a tail
     /// moments ago (see [`TailDebounce`]).
+    /// Events from a pane whose mount is gone (it was unmounted while its lines were in flight) are dropped.
     pub fn drain_tail_events(&mut self, now: Instant) -> Vec<TailEvent> {
         let events: Vec<TailEvent> = self.events_rx.try_iter().collect();
         events
             .into_iter()
             .filter(|e| {
+                self.mounts.get(&e.space).is_some_and(|mounts| {
+                    mounts
+                        .iter()
+                        .any(|m| m.pane == e.pane && m.plugin == e.plugin)
+                })
+            })
+            .filter(|e| {
                 self.tail_debounce
                     .admit(e.space.as_str(), &e.plugin, &e.event, now)
             })
             .collect()
+    }
+
+    /// Forget space `id`, which was shipped or discarded: its mounts, runtime, waiting calls and mounts, and
+    /// secrets. Returns the files to remove in the background (see [`space_plugin_files`]).
+    pub fn forget_space(&mut self, id: &SpaceId) -> Vec<PathBuf> {
+        self.mounts.remove(id);
+        self.runtimes.remove(id);
+        self.secrets.remove(id);
+        self.pending_writes.retain(|_, p| &p.space != id);
+        self.pending_mounts.retain(|_, p| &p.space != id);
+        self.data_dir
+            .as_deref()
+            .map(|dir| space_plugin_files(dir, id.as_str()))
+            .unwrap_or_default()
     }
 
     /// Check a call of `plugin`'s `tool` with `args` in `space` (through `pane` when given) and get it ready: a
@@ -1973,12 +2251,18 @@ impl PluginHost {
             let rationale = str_arg(args, "reason")
                 .map(|r| redactor.redact(r).into_owned())
                 .filter(|r| !r.trim().is_empty());
+            let shown = masked_args_summary(args, redactor).map_err(RpcError::invalid_params)?;
+            let target = pane_settings(&manifest, &mount, &ctx)
+                .ok()
+                .and_then(|s| write_target(&s, redactor));
             let gate = PluginGate {
                 space: space.id.clone(),
                 plugin: plugin.to_owned(),
                 kind: PluginGateKind::WriteCall {
                     tool: tool.to_owned(),
-                    args: masked_args_summary(args, redactor),
+                    args: shown,
+                    pane: Some(mount.pane.0),
+                    target,
                 },
                 rationale,
             };
@@ -2034,12 +2318,42 @@ impl PluginHost {
             http_base: settings.base_url.clone(),
             logs,
             database: settings.database.clone(),
-            scratch: crate::space_graph::scratch_dir_for(space.id.as_str()).ok(),
+            scratch: crate::space_graph::scratch_dir_in(
+                self.scratch_data_dir.clone(),
+                space.id.as_str(),
+            )
+            .ok(),
             browser,
             web_url: settings.url.clone(),
             secrets: ctx.secrets.clone(),
             pane: Some(pane),
+            user_paths: mount.user_paths,
         })
+    }
+
+    /// Whether a write restored from its gate after a restart, through `pane` (`None` when the gate recorded
+    /// none), can run without guessing its mount: refused when no pane was recorded and `plugin` has several
+    /// mounts in `space`, so it cannot run against the wrong database or service.
+    pub fn check_restored_pane(
+        &mut self,
+        space: &SpaceId,
+        plugin: &str,
+        pane: Option<PaneId>,
+    ) -> Result<(), String> {
+        if pane.is_some() {
+            return Ok(());
+        }
+        let mounts = self
+            .mounts(space)?
+            .iter()
+            .filter(|m| m.plugin == plugin)
+            .count();
+        if mounts > 1 {
+            return Err(format!(
+                "this request does not say which of the {mounts} {plugin} panes of {space} it is for, and xctx restarted since it was asked; reject it and ask again"
+            ));
+        }
+        Ok(())
     }
 
     /// Whether `message` has not been shown before (and now counts as shown).
@@ -2087,11 +2401,9 @@ impl PluginHost {
         }
     }
 
-    /// Fire `plugin`'s `event` in `space` with `detail`, as its manifest maps it: record a finding in the shared
-    /// space; `fail` stops the loop at its stage and `pass` moves it on (see [`apply_loop_action`]); a notice, a
-    /// failure, or a loop now waiting for approval is posted to the Inbox. A repeat within [`EVENT_DEBOUNCE`]
-    /// does nothing. `state` is the space's graph state; without it (it could not be loaded) only the Inbox is
-    /// told. Refused for an unknown plugin.
+    /// Fire `plugin`'s `event` in `space` with `detail`, as its manifest maps it: [`PluginHost::fire_events`] with
+    /// one event.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn fire_event(
         &mut self,
@@ -2104,46 +2416,137 @@ impl PluginHost {
         redactor: &Redactor,
         now: Instant,
     ) -> Result<EventReport, RpcError> {
+        self.fire_events(
+            state,
+            inbox,
+            space,
+            plugin,
+            &[(event.to_owned(), detail.to_owned())],
+            redactor,
+            now,
+        )
+    }
+
+    /// Fire the events one call of `plugin` in `space` raised (name, detail), as its manifest maps them.
+    ///
+    /// Repeats of a name are collapsed (its first detail, with a count), and at most [`MAX_EVENTS_PER_CALL`]
+    /// distinct events are recorded as findings in the shared space. An event that repeats one fired within
+    /// [`EVENT_DEBOUNCE`] (by its [`stable_detail`]) does nothing. The loop gets at most one action for the whole
+    /// call, the strongest of the events' ([`loop_outcome`]: `fail` over `pass` over `notice`; see
+    /// [`apply_loop_action`]). At most one Inbox notice is posted: when the loop newly stopped, when it waits for
+    /// approval, or else for the strongest `fail` or `notice` event, once per [`NOTICE_INTERVAL`].
+    ///
+    /// `state` is the space's graph state; without it (it could not be loaded) only the Inbox is told. Refused for
+    /// an unknown plugin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fire_events(
+        &mut self,
+        state: Option<&mut SpaceGraphState>,
+        inbox: Option<&mut Inbox>,
+        space: &Space,
+        plugin: &str,
+        events: &[(String, String)],
+        redactor: &Redactor,
+        now: Instant,
+    ) -> Result<EventReport, RpcError> {
         let registry = self.registry(space);
         let found = registry
             .usable(plugin)
             .ok_or_else(|| RpcError::not_found(format!("no usable plugin named {plugin}")))?;
-        let action = found.manifest.action_for(event);
-        let detail = cut_chars(redactor.redact(detail).trim(), MAX_EVENT_DETAIL_CHARS);
+        let manifest = found.manifest.clone();
         let id = &space.id;
-        let summary = if detail.is_empty() {
-            format!("{plugin}: {event}")
-        } else {
-            format!("{plugin}: {event}: {detail}")
+        let summary_of = |name: &str, detail: &str, count: usize| {
+            let times = if count > 1 {
+                format!(" (×{count})")
+            } else {
+                String::new()
+            };
+            if detail.is_empty() {
+                format!("{plugin}: {name}{times}")
+            } else {
+                format!("{plugin}: {name}{times}: {detail}")
+            }
+        };
+        let mut admitted: Vec<(CollapsedEvent, Option<LoopAction>)> = Vec::new();
+        for mut event in collapse_events(events) {
+            event.detail = cut_chars(
+                redactor.redact(&event.detail).trim(),
+                MAX_EVENT_DETAIL_CHARS,
+            );
+            if self.debounce.admit(
+                id.as_str(),
+                plugin,
+                &event.name,
+                &stable_detail(&event.detail),
+                now,
+            ) {
+                let action = manifest.action_for(&event.name);
+                admitted.push((event, action));
+            }
+        }
+        let fired: Vec<FiredEvent> = admitted
+            .iter()
+            .filter_map(|(e, action)| {
+                action.map(|action| FiredEvent {
+                    name: e.name.clone(),
+                    action,
+                    line: e.detail.clone(),
+                })
+            })
+            .collect();
+        let action = loop_outcome(&fired);
+        // The event the call is summed up by: the first with the loop action, else the first admitted.
+        let lead = admitted
+            .iter()
+            .find(|(_, a)| action.is_some() && *a == action)
+            .or_else(|| admitted.first())
+            .map(|(e, _)| e.clone());
+        let others = admitted.len().saturating_sub(1);
+        let summary = match &lead {
+            Some(e) => {
+                let mut summary = summary_of(&e.name, &e.detail, e.count);
+                if others > 0 {
+                    summary.push_str(&format!(
+                        " (and {others} other event{})",
+                        if others == 1 { "" } else { "s" }
+                    ));
+                }
+                summary
+            }
+            None => match events.first() {
+                Some((name, _)) => format!("{plugin}: {name}"),
+                None => format!("{plugin}: no events"),
+            },
         };
         let mut report = EventReport {
             action,
-            debounced: false,
+            debounced: lead.is_none(),
             loop_effect: LoopEffect::Unchanged,
-            finding: None,
+            findings: Vec::new(),
             notice: None,
             summary: summary.clone(),
             errors: Vec::new(),
         };
-        if !self
-            .debounce
-            .admit(id.as_str(), plugin, event, &detail, now)
-        {
-            report.debounced = true;
+        let Some(lead) = lead else {
             return Ok(report);
-        }
+        };
         if let Some(state) = state {
-            match state.shared_mut().add_finding(
-                &event_author(plugin),
-                event_severity(action),
-                None,
-                None,
-                &summary,
-            ) {
-                Ok(finding) => report.finding = Some(finding),
-                Err(e) => report
-                    .errors
-                    .push(format!("could not record the finding: {e}")),
+            for (event, event_action) in admitted.iter().take(MAX_EVENTS_PER_CALL) {
+                match state.shared_mut().add_finding(
+                    &event_author(plugin),
+                    event_severity(*event_action),
+                    None,
+                    None,
+                    &summary_of(&event.name, &event.detail, event.count),
+                ) {
+                    Ok(finding) => report.findings.push(finding),
+                    Err(e) => {
+                        report
+                            .errors
+                            .push(format!("could not record the finding: {e}"));
+                        break;
+                    }
+                }
             }
             if let Some(action) = action {
                 match state.change(|doc| {
@@ -2155,24 +2558,44 @@ impl PluginHost {
                 }
             }
         }
+        let body = (!lead.detail.is_empty()).then(|| {
+            if lead.count > 1 {
+                format!("{} (×{})", lead.detail, lead.count)
+            } else {
+                lead.detail.clone()
+            }
+        });
         let notice = match (action, report.loop_effect) {
             (_, LoopEffect::Advanced(LoopDecision::NeedsApproval(stage))) => {
                 Some(loop_approval_notice(id, stage))
             }
-            (Some(LoopAction::Notice), _) => Some(Notice {
-                title: format!("{plugin}: {event} in {id}"),
-                body: (!detail.is_empty()).then(|| detail.clone()),
-                level: Level::Warning,
-            }),
-            (Some(LoopAction::Fail), effect) => Some(Notice {
-                title: if effect == LoopEffect::Blocked {
-                    format!("{plugin}: {event} stopped the loop of {id}")
-                } else {
-                    format!("{plugin}: {event} in {id}")
-                },
-                body: (!detail.is_empty()).then(|| detail.clone()),
-                level: Level::Error,
-            }),
+            (Some(LoopAction::Fail), LoopEffect::Blocked) => {
+                // Always told; and it counts, so the same failure while stopped does not post again soon.
+                self.notices.admit(id.as_str(), plugin, &lead.name, now);
+                Some(Notice {
+                    title: format!("{plugin}: {} stopped the loop of {id}", lead.name),
+                    body,
+                    level: Level::Error,
+                })
+            }
+            (Some(LoopAction::Fail), _)
+                if self.notices.admit(id.as_str(), plugin, &lead.name, now) =>
+            {
+                Some(Notice {
+                    title: format!("{plugin}: {} in {id}", lead.name),
+                    body,
+                    level: Level::Error,
+                })
+            }
+            (Some(LoopAction::Notice), _)
+                if self.notices.admit(id.as_str(), plugin, &lead.name, now) =>
+            {
+                Some(Notice {
+                    title: format!("{plugin}: {} in {id}", lead.name),
+                    body,
+                    level: Level::Warning,
+                })
+            }
             _ => None,
         };
         if let (Some(notice), Some(inbox)) = (notice, inbox) {
@@ -2189,7 +2612,10 @@ impl PluginHost {
     /// What `space`'s API client pane shows.
     pub fn http_data(&mut self, space: &Space, redactor: &Redactor) -> HttpPaneData {
         let base_url = self.mounted_kind(space, redactor, |m, s| match &m.pane {
-            PaneSpec::Http { .. } => s.base_url.clone(),
+            PaneSpec::Http { .. } => s
+                .base_url
+                .as_deref()
+                .map(|u| xctx_http::mask_url(u, redactor)),
             _ => None,
         });
         let runtime = self.runtime(&space.id);
@@ -2321,7 +2747,7 @@ impl PluginHost {
                 .unwrap_or_default()
                 .to_owned(),
             database: database
-                .map(|d| redactor.redact(&d.location).into_owned())
+                .map(|d| xctx_http::mask_url(&d.location, redactor))
                 .unwrap_or_default(),
             result: state.result.as_ref().map(SqlTable::from_json),
             error: state.error,
@@ -2339,8 +2765,9 @@ impl PluginHost {
             .unwrap_or_default()
     }
 
-    /// The plugins mounted in `space`, in mount order.
-    pub fn mounted(&mut self, space: &Space) -> Vec<MountedPlugin> {
+    /// The plugins mounted in `space`, in mount order, their settings masked with `redactor` (see
+    /// [`MountSettings::masked`]).
+    pub fn mounted(&mut self, space: &Space, redactor: &Redactor) -> Vec<MountedPlugin> {
         let mounts = self
             .mounts(&space.id)
             .map(<[Mount]>::to_vec)
@@ -2355,7 +2782,7 @@ impl PluginHost {
                 pane: m.pane,
                 plugin: m.plugin,
                 repo: m.repo,
-                settings: m.settings,
+                settings: m.settings.masked(redactor),
             })
             .collect()
     }
@@ -2515,6 +2942,7 @@ mod tests {
                 command: Some(vec!["tail".into(), "-f".into(), "log/dev.log".into()]),
                 ..MountSettings::default()
             },
+            user_paths: true,
         }];
         save_mounts(dir.path(), "s", &mounts)?;
         assert_eq!(load_mounts(dir.path(), "s")?, mounts);
@@ -2644,14 +3072,18 @@ mod tests {
             "statement".into(),
             json!("UPDATE users SET pw = 's3cret-pw'"),
         );
-        let summary = masked_args_summary(&args, &redactor);
+        let summary = masked_args_summary(&args, &redactor).unwrap_or_default();
         assert!(summary.contains("[REDACTED:DB_PASSWORD]"), "{summary}");
         assert!(!summary.contains("s3cret-pw"));
+        // Too long to show whole: refused, never cut (what runs must be what the user saw).
         let mut long = Map::new();
         long.insert("x".into(), json!("a".repeat(10_000)));
-        assert_eq!(
-            masked_args_summary(&long, &redactor).chars().count(),
-            MAX_GATE_ARGS_CHARS
+        let refused = masked_args_summary(&long, &redactor);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("send a smaller call")),
+            "{refused:?}"
         );
     }
 
@@ -2666,6 +3098,125 @@ mod tests {
             .map(|m| m.name.as_str())
             .collect();
         assert_eq!(gated, ["jira"]);
+        Ok(())
+    }
+
+    #[test]
+    fn tools_get_a_cleared_environment_with_an_allowlist() {
+        let base = [
+            ("HOME", "/Users/me"),
+            ("LC_ALL", "en_US.UTF-8"),
+            ("TERM", "xterm"),
+            ("GITHUB_TOKEN", "ghp_secret"),
+            ("XCTX_CONTROL_SOCKET", "/tmp/xctx.sock"),
+            ("PATH", "/usr/bin"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let extra: BTreeMap<String, String> = [("PORT", "4011"), ("HOME", "/space/home")]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .into();
+        let env = isolated_env(
+            base.clone(),
+            Some("/opt/homebrew/bin:/usr/bin".into()),
+            &extra,
+        );
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["HOME", "LC_ALL", "PATH", "PORT", "TERM"]
+        );
+        assert_eq!(env["PATH"], "/opt/homebrew/bin:/usr/bin");
+        // The plan's own variables win.
+        assert_eq!(env["HOME"], "/space/home");
+        let bare = isolated_env(base, None, &BTreeMap::new());
+        assert_eq!(bare["PATH"], DEFAULT_TOOL_PATH);
+        assert!(!bare.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn elapsed_times_and_timestamps_stay_out_of_the_debounce_key() {
+        assert_eq!(
+            stable_detail("GET http://127.0.0.1:4011/x -> 500 in 31 ms"),
+            stable_detail("GET http://127.0.0.1:4011/x -> 500 in 7 ms")
+        );
+        assert_eq!(
+            stable_detail("2024-05-01T10:00:00Z ERROR boom (took 1.2s)"),
+            "ERROR boom (took"
+        );
+        assert_eq!(stable_detail("10:00:00.123 panicked"), "panicked");
+        // Statuses, ports and paths stay.
+        assert_ne!(
+            stable_detail("GET http://127.0.0.1:4011/x -> 500 in 31 ms"),
+            stable_detail("GET http://127.0.0.1:4011/x -> 503 in 31 ms")
+        );
+    }
+
+    #[test]
+    fn a_calls_events_collapse_by_name() {
+        let events: Vec<(String, String)> = [("a", "1"), ("b", "x"), ("a", "2"), ("a", "3")]
+            .map(|(n, d)| (n.to_owned(), d.to_owned()))
+            .into();
+        assert_eq!(
+            collapse_events(&events),
+            [
+                CollapsedEvent {
+                    name: "a".into(),
+                    detail: "1".into(),
+                    count: 3
+                },
+                CollapsedEvent {
+                    name: "b".into(),
+                    detail: "x".into(),
+                    count: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn notices_of_an_event_are_rate_limited() {
+        let mut limiter = NoticeLimiter::default();
+        let t0 = Instant::now();
+        assert!(limiter.admit("s", "logs", "app.crash", t0));
+        assert!(!limiter.admit("s", "logs", "app.crash", t0 + Duration::from_secs(60)));
+        assert!(limiter.admit("s", "logs", "app.other", t0 + Duration::from_secs(60)));
+        assert!(limiter.admit("t", "logs", "app.crash", t0 + Duration::from_secs(60)));
+        assert!(limiter.admit("s", "logs", "app.crash", t0 + NOTICE_INTERVAL));
+    }
+
+    #[test]
+    fn settings_are_masked_for_display() {
+        let redactor = Redactor::new([("DB_PW".to_owned(), "hunter22".to_owned())]);
+        let settings = MountSettings {
+            command: Some(vec!["tail".into(), "--token=hunter22".into()]),
+            database: Some("postgres://app:pw-123@db.local/app".into()),
+            base_url: Some("http://localhost:4011/?api_key=k-77".into()),
+            ..MountSettings::default()
+        };
+        let shown = format!("{:?}", settings.masked(&redactor));
+        for secret in ["hunter22", "pw-123", "k-77"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(shown.contains("db.local"), "{shown}");
+    }
+
+    #[test]
+    fn a_shipped_spaces_plugin_files_are_removed() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let files = space_plugin_files(dir.path(), "fix-retry");
+        save_mounts(dir.path(), "fix-retry", &[])?;
+        std::fs::create_dir_all(
+            dir.path()
+                .join(BROWSER_PROFILES_DIR)
+                .join("fix-retry/Default"),
+        )?;
+        std::fs::create_dir_all(dir.path().join(BROWSER_PROFILES_DIR).join("other"))?;
+        assert!(files.iter().all(|f| f.exists()));
+        remove_paths(&files)?;
+        assert!(files.iter().all(|f| !f.exists()));
+        assert!(dir.path().join(BROWSER_PROFILES_DIR).join("other").exists());
+        // Gone already is fine; a slug that could escape is never removed.
+        remove_paths(&files)?;
+        assert!(space_plugin_files(dir.path(), "../x").is_empty());
         Ok(())
     }
 
@@ -2698,6 +3249,7 @@ mod tests {
             plugin: plugin.into(),
             repo: "api".into(),
             settings,
+            user_paths: false,
         };
         let http = get("api-client")?;
         let ctx = call_context(&space, "api", &BTreeMap::new(), &redactor, http);

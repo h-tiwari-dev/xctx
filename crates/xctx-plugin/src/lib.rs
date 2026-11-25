@@ -38,7 +38,7 @@ pub use manifest::{
     ParamSpec, Pattern, Scope, SqlEngine, ToolAction, ToolSpec,
 };
 pub use registry::{LoadProblem, Plugin, REPO_PLUGINS_DIR, Registry, Source, manifest_hash};
-pub use run::{ToolOutput, run_plan};
+pub use run::{ToolOutput, run_plan, run_plan_isolated};
 pub use runner::{
     ArgsTemplate, BUILTIN_RUNNERS, Capability, DEFAULT_RUNNER, RUNNER_FILE, Runner, RunnerError,
     RunnerManifest, RunnerProblem, RunnerRegistry, RunnerSession, RunnerStart, TaskStyle,

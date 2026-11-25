@@ -108,7 +108,7 @@ impl Workspace {
     /// The plugins mounted in space `id`, in mount order (for the Plugins menu and pane headers).
     pub(crate) fn mounted_plugins(&mut self, id: &SpaceId) -> Vec<MountedPlugin> {
         match self.active_space(id) {
-            Some(space) => self.plugins.mounted(&space),
+            Some(space) => self.plugins.mounted(&space, &self.redactor),
             None => Vec::new(),
         }
     }
@@ -143,14 +143,20 @@ impl Workspace {
             )));
         }
         let (check, _) = self.plugins.mount_check(&space, plugin, from_agent)?;
-        let kind = match check {
+        let (kind, hash) = match check {
             MountCheck::Ready => {
                 return self
-                    .mount_now(id, plugin, repo, settings, window, cx)
+                    .mount_now(id, plugin, repo, settings, !from_agent, window, cx)
                     .map(MountOutcome::Mounted);
             }
-            MountCheck::NeedsTrust { repo } => PluginGateKind::TrustRepoPlugin { repo },
-            MountCheck::NeedsApproval(reason) => PluginGateKind::Mount { reason },
+            MountCheck::NeedsTrust { repo, hash } => (
+                PluginGateKind::TrustRepoPlugin {
+                    repo,
+                    hash: hash.clone(),
+                },
+                Some(hash),
+            ),
+            MountCheck::NeedsApproval(reason) => (PluginGateKind::Mount { reason }, None),
         };
         let gate = PluginGate {
             space: id.clone(),
@@ -158,17 +164,40 @@ impl Workspace {
             kind,
             rationale: None,
         };
+        let pending = PendingMount {
+            space: id.clone(),
+            plugin: plugin.to_owned(),
+            repo,
+            settings,
+            hash,
+            from_agent,
+        };
+        let waiting = self.waiting_gate(&gate, |this, item| {
+            this.plugins.pending_mounts.get(item) == Some(&pending)
+        });
+        if let Some(item) = waiting {
+            return Ok(MountOutcome::Gated(item));
+        }
         let item = self.post_plugin_gate(gate, cx)?;
-        self.plugins.pending_mounts.insert(
-            item.clone(),
-            PendingMount {
-                space: id.clone(),
-                plugin: plugin.to_owned(),
-                repo,
-                settings,
-            },
-        );
+        self.plugins.pending_mounts.insert(item.clone(), pending);
         Ok(MountOutcome::Gated(item))
+    }
+
+    /// The pending Inbox item that asks exactly what `gate` asks, and whose held call or mount `same` says is the
+    /// same, so a repeated request does not post a second one.
+    fn waiting_gate(
+        &self,
+        gate: &PluginGate,
+        same: impl Fn(&Self, &ItemId) -> bool,
+    ) -> Option<ItemId> {
+        let body = ItemBody::PluginGate(gate.clone());
+        self.inbox
+            .as_ref()?
+            .items()
+            .iter()
+            .filter(|i| i.is_pending() && i.body == body)
+            .map(|i| i.id.clone())
+            .find(|id| same(self, id))
     }
 
     fn post_plugin_gate(
@@ -204,13 +233,16 @@ impl Workspace {
         Ok(item)
     }
 
-    /// Mount `plugin` now, with no gate (see [`Workspace::mount_plugin`]).
+    /// Mount `plugin` now, with no gate (see [`Workspace::mount_plugin`]). `user_paths` is true only when the user
+    /// made the mount (see [`crate::plugin_host::Mount::user_paths`]).
+    #[allow(clippy::too_many_arguments)]
     fn mount_now(
         &mut self,
         id: &SpaceId,
         plugin: &str,
         repo: Option<String>,
         settings: MountSettings,
+        user_paths: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<PaneId, RpcError> {
@@ -235,6 +267,7 @@ impl Workspace {
                 plugin: plugin.to_owned(),
                 repo,
                 settings,
+                user_paths,
             },
         ) {
             self.error(format!("could not record the mount of {plugin}: {e}"), cx);
@@ -355,6 +388,7 @@ impl Workspace {
                 plugin: name.clone(),
                 repo: pane.role.repo.clone(),
                 settings: MountSettings::default(),
+                user_paths: false,
             },
         };
         match &manifest.pane {
@@ -438,6 +472,7 @@ impl Workspace {
                 cx.background_executor().timer(TAIL_TICK).await;
                 let keep_going = this.update(cx, |this, cx| {
                     for event in this.plugins.drain_tail_events(Instant::now()) {
+                        // One line is one batch: at most one loop action and one notice.
                         let _ = this.fire_plugin_event(
                             &event.space,
                             &event.plugin,
@@ -484,13 +519,12 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, Result<ToolCallResult, RpcError>, &mut Context<Self>) + 'static,
     ) {
-        let Some(space) = self.active_space(id) else {
-            done(
-                self,
-                Err(RpcError::not_found(format!("no active space named {id}"))),
-                cx,
-            );
-            return;
+        let space = match self.open_space_for_plugins(id) {
+            Ok(space) => space,
+            Err(e) => {
+                done(self, Err(e), cx);
+                return;
+            }
         };
         let prepared =
             self.plugins
@@ -498,6 +532,19 @@ impl Workspace {
         match prepared {
             Err(e) => done(self, Err(e), cx),
             Ok(Prepared::Gate(gate, pending)) => {
+                let waiting = self.waiting_gate(&gate, |this, item| {
+                    this.plugins.pending_writes.get(item) == Some(&pending)
+                });
+                if let Some(item) = waiting {
+                    self.info(
+                        format!(
+                            "the same {tool} call already waits in the Inbox for your approval"
+                        ),
+                        cx,
+                    );
+                    done(self, Ok(ToolCallResult::Gated(item)), cx);
+                    return;
+                }
                 let result = self.post_plugin_gate(gate, cx).map(|item| {
                     if let Some(pane) = pending.pane
                         && tool == "sql.write"
@@ -543,11 +590,12 @@ impl Workspace {
                 let result = match result {
                     Ok(output) => {
                         this.plugins.apply_effect(&id, pane, &output.effect);
-                        for (event, detail) in &output.events {
-                            if let Err(e) = this.fire_plugin_event(&id, &plugin, event, detail, cx)
-                            {
-                                this.error(e.message, cx);
-                            }
+                        // All of a call's events at once: at most one loop action and one notice.
+                        if !output.events.is_empty()
+                            && let Err(e) =
+                                this.fire_plugin_events(&id, &plugin, &output.events, cx)
+                        {
+                            this.error(e.message, cx);
                         }
                         Ok(ToolCallResult::Output(output))
                     }
@@ -637,11 +685,9 @@ impl Workspace {
         builtin: &str,
         args: Map<String, Value>,
     ) -> Result<CallJob, RpcError> {
-        let space = self
-            .active_space(id)
-            .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+        let space = self.open_space_for_plugins(id)?;
         let registry = self.plugins.registry(&space);
-        let mounted = self.plugins.mounted(&space);
+        let mounted = self.plugins.mounted(&space, &self.redactor);
         let mount = mounted
             .iter()
             .find(|m| m.kind == kind && pane.is_none_or(|p| p == m.pane))
@@ -691,9 +737,22 @@ impl Workspace {
     // ---------------------------------------------------------------------------------------------------------
     // Events
 
-    /// Fire `plugin`'s `event` in space `id` with `detail` (see [`crate::plugin_host::PluginHost::fire_event`]):
-    /// a finding in the shared space, the loop failed or moved on as the manifest maps it, an Inbox notice, and
-    /// a line in the status bar. Repeats within a few seconds do nothing.
+    /// The open space `id`, for a plugin call, event or pane action: refused when its tab is not open, so an
+    /// agent cannot start Chrome, tails or plugin state for a space the user closed.
+    pub(crate) fn open_space_for_plugins(&self, id: &SpaceId) -> Result<Space, RpcError> {
+        if let Some(tab) = self.tabs.get(id) {
+            return Ok(tab.space.clone());
+        }
+        if self.active_space(id).is_some() {
+            Err(RpcError::conflict(format!(
+                "space {id} is not open; open its tab to use its plugins"
+            )))
+        } else {
+            Err(RpcError::not_found(format!("no active space named {id}")))
+        }
+    }
+
+    /// Fire `plugin`'s `event` in space `id` with `detail`: [`Workspace::fire_plugin_events`] with one event.
     pub(crate) fn fire_plugin_event(
         &mut self,
         id: &SpaceId,
@@ -702,17 +761,27 @@ impl Workspace {
         detail: &str,
         cx: &mut Context<Self>,
     ) -> Result<EventReport, RpcError> {
-        let space = self
-            .active_space(id)
-            .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+        self.fire_plugin_events(id, plugin, &[(event.to_owned(), detail.to_owned())], cx)
+    }
+
+    /// Fire the events one call of `plugin` raised in the open space `id` (see
+    /// [`crate::plugin_host::PluginHost::fire_events`]): findings in the shared space, at most one loop action,
+    /// at most one Inbox notice, and a line in the status bar. Repeats within a few seconds do nothing.
+    pub(crate) fn fire_plugin_events(
+        &mut self,
+        id: &SpaceId,
+        plugin: &str,
+        events: &[(String, String)],
+        cx: &mut Context<Self>,
+    ) -> Result<EventReport, RpcError> {
+        let space = self.open_space_for_plugins(id)?;
         let state = self.graphs.load(&space).ok();
-        let report = self.plugins.fire_event(
+        let report = self.plugins.fire_events(
             state,
             self.inbox.as_mut(),
             &space,
             plugin,
-            event,
-            detail,
+            events,
             &self.redactor,
             Instant::now(),
         )?;
@@ -745,8 +814,9 @@ impl Workspace {
 
     /// Carry out an approved plugin gate: run the write (with `approved`) and post its result as a notice and a
     /// finding; mount the plugin; or record the trust (and mount, when a mount asked for it). The gate is marked
-    /// approved once that is done; when it cannot start (the space is not open, the call's arguments were lost
-    /// to a restart) it stays pending and the status bar says why.
+    /// approved only once that is done: a write is settled only when it ran; when it cannot start (the space is
+    /// not open, the call's arguments were lost to a restart) or fails, it stays pending and the status bar says
+    /// why, so it can be approved again or rejected.
     pub(crate) fn approve_plugin_gate(
         &mut self,
         item: ItemId,
@@ -770,23 +840,24 @@ impl Workspace {
         let id = gate.space.clone();
         self.plugin_panes.changed();
         match &gate.kind {
-            PluginGateKind::WriteCall { tool, args } => {
-                let pending = self
-                    .plugins
-                    .pending_writes
-                    .get(&item)
-                    .cloned()
-                    .or_else(|| restored_write(&gate, tool, args));
-                let Some(pending) = pending else {
-                    self.error(
-                        "the arguments of this call were masked and xctx restarted since it was asked; reject it and ask again",
-                        cx,
-                    );
-                    return;
+            PluginGateKind::WriteCall {
+                tool, args, pane, ..
+            } => {
+                let kept = self.plugins.pending_writes.get(&item).cloned();
+                let pending = match kept {
+                    Some(pending) => pending,
+                    None => match self.restore_write(&gate, tool, args, *pane) {
+                        Ok(pending) => pending,
+                        Err(why) => {
+                            self.error(why, cx);
+                            return;
+                        }
+                    },
                 };
                 self.widen_approvals.insert(item.clone());
                 let (plugin, tool) = (pending.plugin.clone(), pending.tool.clone());
                 let approved = item.clone();
+                let held = pending.clone();
                 self.call_plugin_tool(
                     &id,
                     &pending.plugin,
@@ -797,16 +868,37 @@ impl Workspace {
                     cx,
                     move |this, result, cx| {
                         this.widen_approvals.remove(&approved);
-                        this.plugins.pending_writes.remove(&approved);
-                        this.plugins.clear_write_pending(&pending.space, &approved);
-                        this.write_finished(&pending.space, &approved, &plugin, &tool, result, cx);
+                        match result {
+                            Ok(ToolCallResult::Output(output)) => {
+                                this.plugins.pending_writes.remove(&approved);
+                                this.plugins.clear_write_pending(&held.space, &approved);
+                                this.settle_approved(&approved, cx);
+                                this.write_finished(&held.space, &plugin, &tool, &output, cx);
+                            }
+                            Ok(ToolCallResult::Gated(_)) => {}
+                            Err(e) => {
+                                // It did not run (or did not finish): it stays in the Inbox, to approve again.
+                                this.plugins
+                                    .pending_writes
+                                    .insert(approved.clone(), held.clone());
+                                this.error(
+                                    format!(
+                                        "{tool} ({plugin}) in {} did not run: {}; it still waits in the Inbox: approve it again to retry, or reject it",
+                                        held.space, e.message
+                                    ),
+                                    cx,
+                                );
+                            }
+                        }
+                        this.plugin_panes.changed();
                     },
                 );
             }
             PluginGateKind::Mount { .. } => {
                 let pending = self.plugins.pending_mounts.get(&item).cloned();
                 let (repo, settings) = pending.map(|p| (p.repo, p.settings)).unwrap_or_default();
-                match self.mount_now(&id, &gate.plugin, repo, settings, window, cx) {
+                // A mount gate is an agent's request: its paths are not the user's.
+                match self.mount_now(&id, &gate.plugin, repo, settings, false, window, cx) {
                     Ok(_) => {
                         self.plugins.pending_mounts.remove(&item);
                         self.settle_approved(&item, cx);
@@ -817,12 +909,31 @@ impl Workspace {
                     ),
                 }
             }
-            PluginGateKind::TrustRepoPlugin { .. } => {
+            PluginGateKind::TrustRepoPlugin { hash, .. } => {
                 let Some(space) = self.active_space(&id) else {
                     self.error(format!("space {id} is not active"), cx);
                     return;
                 };
-                if let Err(e) = self.plugins.trust_repo_plugin(&space, &gate.plugin) {
+                let pending_hash = self
+                    .plugins
+                    .pending_mounts
+                    .get(&item)
+                    .and_then(|p| p.hash.clone());
+                let asked = match (pending_hash, hash.as_str()) {
+                    (Some(kept), shown) if !shown.is_empty() && kept != shown => {
+                        self.error(
+                            format!(
+                                "the request to trust {} does not match what was asked; reject it and mount it again",
+                                gate.plugin
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+                    (Some(kept), _) => kept,
+                    (None, shown) => shown.to_owned(),
+                };
+                if let Err(e) = self.plugins.trust_repo_plugin(&space, &gate.plugin, &asked) {
                     self.error(format!("could not trust {}: {e}", gate.plugin), cx);
                     return;
                 }
@@ -834,6 +945,7 @@ impl Workspace {
                             &gate.plugin,
                             pending.repo,
                             pending.settings,
+                            !pending.from_agent,
                             window,
                             cx,
                         ) {
@@ -856,6 +968,24 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The write behind `gate` whose call was not kept (xctx restarted), rebuilt from what the gate shows (see
+    /// [`restored_write`]). Refused when its arguments were masked or cut, and when the gate recorded no pane
+    /// while the plugin has several mounts in the space, so it cannot run against the wrong one.
+    fn restore_write(
+        &mut self,
+        gate: &PluginGate,
+        tool: &str,
+        args: &str,
+        pane: Option<u64>,
+    ) -> Result<PendingWrite, String> {
+        let pending = restored_write(gate, tool, args, pane).ok_or(
+            "the arguments of this call were masked and xctx restarted since it was asked; reject it and ask again",
+        )?;
+        self.plugins
+            .check_restored_pane(&gate.space, &gate.plugin, pending.pane)?;
+        Ok(pending)
+    }
+
     /// The user turned down a plugin gate: forget the call or mount it held.
     pub(crate) fn plugin_gate_rejected(&mut self, item: &ItemId) {
         self.plugin_panes.changed();
@@ -873,35 +1003,19 @@ impl Workspace {
         }
     }
 
-    /// An approved write finished: settle its gate, and post what it did as a notice and a finding.
+    /// An approved write ran: post what it did as a notice and a finding.
     fn write_finished(
         &mut self,
         id: &SpaceId,
-        item: &ItemId,
         plugin: &str,
         tool: &str,
-        result: Result<ToolCallResult, RpcError>,
+        out: &CallOutput,
         cx: &mut Context<Self>,
     ) {
-        self.settle_approved(item, cx);
-        let (notice, ok) = match &result {
-            Ok(ToolCallResult::Output(out)) => (
-                Notice {
-                    title: format!("Ran {tool} ({plugin}) in {id}"),
-                    body: Some(cut_chars(&out.text, MAX_RESULT_NOTICE_CHARS)),
-                    level: Level::Info,
-                },
-                true,
-            ),
-            Ok(ToolCallResult::Gated(_)) => return,
-            Err(e) => (
-                Notice {
-                    title: format!("{tool} ({plugin}) failed in {id}"),
-                    body: Some(cut_chars(&e.message, MAX_RESULT_NOTICE_CHARS)),
-                    level: Level::Error,
-                },
-                false,
-            ),
+        let notice = Notice {
+            title: format!("Ran {tool} ({plugin}) in {id}"),
+            body: Some(cut_chars(&out.text, MAX_RESULT_NOTICE_CHARS)),
+            level: Level::Info,
         };
         let summary = format!(
             "{}: {}",
@@ -911,14 +1025,9 @@ impl Workspace {
         if let Some(space) = self.active_space(id)
             && let Ok(state) = self.graphs.load(&space)
         {
-            let severity = if ok {
-                event_severity(None)
-            } else {
-                event_severity(Some(xctx_plugin::LoopAction::Fail))
-            };
             let _ = state.shared_mut().add_finding(
                 &event_author(plugin),
-                severity,
+                event_severity(None),
                 None,
                 None,
                 &cut_chars(&summary, MAX_RESULT_NOTICE_CHARS),
@@ -930,11 +1039,7 @@ impl Workspace {
         {
             self.error(format!("could not post to the Inbox: {e}"), cx);
         }
-        if ok {
-            self.info(title, cx);
-        } else {
-            self.error(title, cx);
-        }
+        self.info(title, cx);
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -1254,8 +1359,13 @@ impl Workspace {
 }
 
 /// The pending write behind a gate whose call was not kept (xctx restarted): its shown arguments, when they are
-/// a JSON object with nothing masked in them.
-fn restored_write(gate: &PluginGate, tool: &str, args: &str) -> Option<PendingWrite> {
+/// a JSON object with nothing masked in them, through the pane the gate recorded (`None` when it recorded none).
+fn restored_write(
+    gate: &PluginGate,
+    tool: &str,
+    args: &str,
+    pane: Option<u64>,
+) -> Option<PendingWrite> {
     if args.contains("[REDACTED:") || args.ends_with('…') {
         return None;
     }
@@ -1265,7 +1375,7 @@ fn restored_write(gate: &PluginGate, tool: &str, args: &str) -> Option<PendingWr
             plugin: gate.plugin.clone(),
             tool: tool.to_owned(),
             args: map,
-            pane: None,
+            pane: pane.map(PaneId),
         }),
         _ => None,
     }
@@ -1283,6 +1393,8 @@ mod tests {
                 kind: PluginGateKind::WriteCall {
                     tool: "sql.write".into(),
                     args: args.into(),
+                    pane: Some(4),
+                    target: None,
                 },
                 rationale: None,
             },
@@ -1293,14 +1405,16 @@ mod tests {
     #[test]
     fn a_write_survives_a_restart_only_when_nothing_was_masked() {
         let (g, args) = gate(r#"{"statement":"DELETE FROM t","reason":"r"}"#);
-        let restored = restored_write(&g, "sql.write", &args);
+        let restored = restored_write(&g, "sql.write", &args, Some(4));
         assert_eq!(
-            restored.map(|p| p.args.get("statement").cloned()),
-            Some(Some(json!("DELETE FROM t")))
+            restored
+                .as_ref()
+                .map(|p| (p.args.get("statement").cloned(), p.pane)),
+            Some((Some(json!("DELETE FROM t")), Some(PaneId(4))))
         );
         let (g, args) = gate(r#"{"statement":"UPDATE t SET pw='[REDACTED:PW]'"}"#);
-        assert!(restored_write(&g, "sql.write", &args).is_none());
+        assert!(restored_write(&g, "sql.write", &args, Some(4)).is_none());
         let (g, args) = gate("not json");
-        assert!(restored_write(&g, "sql.write", &args).is_none());
+        assert!(restored_write(&g, "sql.write", &args, None).is_none());
     }
 }

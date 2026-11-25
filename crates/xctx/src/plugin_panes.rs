@@ -523,7 +523,8 @@ impl Workspace {
             return missing(format!("a {kind} plugin pane has no renderer"));
         };
         let settings = settings.unwrap_or_default();
-        let mask = |text: &str| self.redactor.redact(text).into_owned();
+        // URLs with their credentials (user info, token-like query values) masked too.
+        let mask = |text: &str| xctx_http::mask_url(text, &self.redactor);
         let mut inputs = Vec::new();
         let state = match renderer {
             RendererKind::Http => {
