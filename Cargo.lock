@@ -6593,6 +6593,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xctx-nav"
+version = "0.1.0"
+dependencies = [
+ "xctx-core",
+ "xctx-graph",
+ "xctx-inbox",
+ "xctx-layout",
+]
+
+[[package]]
 name = "xctx-plugin"
 version = "0.1.0"
 dependencies = [
