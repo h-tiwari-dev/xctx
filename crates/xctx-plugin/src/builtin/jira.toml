@@ -1,8 +1,9 @@
-# The Jira connector. Its token comes from the space's mise secrets; comments go through the Inbox.
+# The Jira connector. Its site, account email and API token come from the space's mise environment (the token
+# is masked); comments go through the Inbox.
 name = "jira"
 version = "1.0.0"
 description = "Read Jira issues and comment on them"
-secrets = ["JIRA_API_TOKEN"]
+secrets = ["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"]
 
 [pane]
 kind = "web"

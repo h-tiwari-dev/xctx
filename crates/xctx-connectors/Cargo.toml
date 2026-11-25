@@ -1,0 +1,19 @@
+[package]
+name = "xctx-connectors"
+version.workspace = true
+edition.workspace = true
+description = "The built-in plugin tools that run inside the app without a window: logs.query, sql.read and sql.write (through sqlite3 and psql), and the Jira and Figma connectors"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
+url = "2"
+xctx-core = { path = "../xctx-core" }
+xctx-http = { path = "../xctx-http" }
+xctx-plugin = { path = "../xctx-plugin" }
+
+[dev-dependencies]
+tempfile = "3"

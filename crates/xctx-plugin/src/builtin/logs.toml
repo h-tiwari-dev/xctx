@@ -17,6 +17,7 @@ params = [
   { name = "level", type = "string", description = "error, warn, info or debug" },
   { name = "since_secs", type = "integer", description = "Only lines from the last this many seconds" },
   { name = "limit", type = "integer", description = "At most this many lines, newest last" },
+  { name = "error_threshold", type = "integer", description = "Raise logs.error when more error lines than this fall in the window (since_secs, or the last 60 seconds)" },
 ]
 
 [[events]]
