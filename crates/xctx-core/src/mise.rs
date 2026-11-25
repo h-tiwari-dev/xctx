@@ -2,13 +2,14 @@
 //! mise loads it when `MISE_ENV=<slug>`, layered over the repository's `mise.toml` (and under `mise.local.toml`).
 //! The file is ignored through the repository's `info/exclude`, so no tracked file changes.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, io_error};
 use crate::git;
-use crate::store::write_atomic;
+use crate::store::{DATA_DIR_ENV, write_atomic};
 
 /// The name of the mise file for the space `slug`: `mise.<slug>.toml`.
 pub fn mise_file_name(slug: &str) -> String {
@@ -22,9 +23,40 @@ pub fn space_env_vars(slug: &str, port: u16) -> Vec<(String, String)> {
         ("XCTX_SPACE".to_owned(), slug.to_owned()),
     ]
 }
+/// Where a space's scratch directories live when the host has no `XCTX_DATA_DIR` set.
+pub const DEFAULT_SCRATCH_BASE: &str = "/tmp/xctx-scratch";
 
-/// The text of a space's mise file.
+/// The isolated `XCTX_DATA_DIR` written into `mise.<slug>.toml` for space `slug`:
+/// `<host XCTX_DATA_DIR>/scratch/<slug>/data` when the host has `XCTX_DATA_DIR` set, else
+/// `/tmp/xctx-scratch/<slug>/data`. A dev build started inside the space opens this directory instead of the
+/// host's store, and it is removed with the space's scratch directory on Ship or Discard.
+pub fn space_data_dir(slug: &str) -> PathBuf {
+    space_data_dir_in(std::env::var_os(DATA_DIR_ENV), slug)
+}
+
+/// [`space_data_dir`] from an explicit value of the host's `XCTX_DATA_DIR`, so it can be decided without
+/// reading the process environment. An empty value counts as unset.
+pub fn space_data_dir_in(host_data_dir: Option<OsString>, slug: &str) -> PathBuf {
+    let scratch_base = match host_data_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("scratch"),
+        None => PathBuf::from(DEFAULT_SCRATCH_BASE),
+    };
+    scratch_base.join(slug).join("data")
+}
+
+/// The text of a space's mise file, setting `PORT`, `XCTX_SPACE` and an isolated `XCTX_DATA_DIR` under the
+/// space's scratch directory (see [`space_data_dir`]).
 pub fn mise_file_contents(slug: &str, title: &str, port: u16) -> String {
+    mise_file_contents_with_data_dir(slug, title, port, &space_data_dir(slug))
+}
+
+/// [`mise_file_contents`] with an explicit `XCTX_DATA_DIR` path.
+pub fn mise_file_contents_with_data_dir(
+    slug: &str,
+    title: &str,
+    port: u16,
+    data_dir: &Path,
+) -> String {
     let title: String = title.chars().filter(|c| !c.is_control()).collect();
     let mut text = format!(
         "# Written by xctx for the space \"{title}\". Used when MISE_ENV={slug}; mise.local.toml still wins.\n\
@@ -33,6 +65,10 @@ pub fn mise_file_contents(slug: &str, title: &str, port: u16) -> String {
     for (key, value) in space_env_vars(slug, port) {
         text.push_str(&format!("{key} = {}\n", toml_string(&value)));
     }
+    text.push_str(&format!(
+        "{DATA_DIR_ENV} = {}\n",
+        toml_string(&data_dir.to_string_lossy())
+    ));
     text
 }
 
@@ -201,10 +237,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contents_hold_the_port_and_space_and_escape_the_title() {
-        let text = mise_file_contents("rate-limit", "say \"hi\"\nnow", 4001);
+    fn contents_hold_the_port_space_and_data_dir_and_escape_the_title() {
+        let data_dir = space_data_dir_in(None, "rate-limit");
+        assert_eq!(data_dir, PathBuf::from("/tmp/xctx-scratch/rate-limit/data"));
+        let nested = space_data_dir_in(Some("/tmp/host-data".into()), "rate-limit");
+        assert_eq!(
+            nested,
+            PathBuf::from("/tmp/host-data/scratch/rate-limit/data")
+        );
+        let text =
+            mise_file_contents_with_data_dir("rate-limit", "say \"hi\"\nnow", 4001, &data_dir);
         assert!(
-            text.contains("[env]\nPORT = \"4001\"\nXCTX_SPACE = \"rate-limit\"\n"),
+            text.contains(
+                "[env]\nPORT = \"4001\"\nXCTX_SPACE = \"rate-limit\"\nXCTX_DATA_DIR = \"/tmp/xctx-scratch/rate-limit/data\"\n"
+            ),
             "{text}"
         );
         assert!(text.contains("MISE_ENV=rate-limit"), "{text}");
