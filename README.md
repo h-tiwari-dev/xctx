@@ -19,7 +19,13 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
 
 **Milestone 4 (complete):** git-branch a writer agent into competing attempts, each with its own worktree, `PORT` and forked `pi` session. Compare them on a review sheet (⌘⇧R), adopt the winner and discard the rest. Fork with ⌘⇧F. See [`docs/m4.md`](docs/m4.md).
 
-**Next: Milestone 5**, plugins and connectors as live panes; see [`docs/roadmap.md`](docs/roadmap.md).
+**Milestone 5 (complete):** plugins are live panes and agent tools. ⌘⇧P opens a space's Plugins menu, which mounts
+first-party plugins (terminal, logs, API client, database, browser, Jira, Figma) and plugins from user or repo
+`plugin.toml` manifests (repo plugins need trust first). Agents call a plugin's tools over the harness, and every
+write waits for approval in the Inbox. A plugin's events can start or stop the space's loop. See
+[`docs/m5.md`](docs/m5.md).
+
+No further milestone is planned yet; see [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Prerequisites
 

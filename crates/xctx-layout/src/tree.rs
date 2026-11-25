@@ -457,6 +457,33 @@ impl PaneTree {
         Ok(id)
     }
 
+    /// Split the whole tree in two along `axis`: everything there is now keeps the first side (left or top) with
+    /// `ratio` of the space, and `new_pane` takes the second side and the focus. Ends any zoom. `ratio` is
+    /// clamped to [`MIN_SPLIT_RATIO`]..=[`MAX_SPLIT_RATIO`]. Returns the new split's id.
+    pub fn split_root(
+        &mut self,
+        axis: SplitAxis,
+        new_pane: PaneId,
+        ratio: f32,
+    ) -> Result<SplitId, LayoutError> {
+        let ratio = checked_ratio(ratio)?;
+        if self.contains(new_pane) {
+            return Err(LayoutError::DuplicatePane(new_pane));
+        }
+        let id = self.fresh_split_id();
+        let old = std::mem::replace(&mut self.root, PaneNode::Leaf { pane: new_pane });
+        self.root = PaneNode::Split {
+            id,
+            axis,
+            ratio,
+            first: Box::new(old),
+            second: Box::new(PaneNode::Leaf { pane: new_pane }),
+        };
+        self.focused = new_pane;
+        self.zoomed = None;
+        Ok(id)
+    }
+
     /// Remove `target`; its sibling takes its space. If `target` was focused, focus moves to the pane that was
     /// next to it (the sibling's nearest pane), and if it was zoomed the zoom ends. Returns the focused pane
     /// afterwards. Fails with [`LayoutError::LastPane`] when `target` is the only pane.
@@ -772,6 +799,31 @@ mod tests {
         let other = tree.split(P1, SplitAxis::Vertical, P3, 0.5).unwrap();
         assert_ne!(split, other);
         assert_eq!(tree.panes(), vec![P1, P3, P2]);
+    }
+
+    #[test]
+    fn split_root_puts_the_whole_tree_first_and_the_new_pane_second() {
+        let (mut tree, outer, inner) = one_beside_two();
+        tree.set_zoom(Some(P3)).unwrap();
+        let root = tree.split_root(SplitAxis::Horizontal, P4, 0.65).unwrap();
+        assert!(root != outer && root != inner);
+        assert_eq!(tree.panes(), vec![P1, P2, P3, P4]);
+        assert_eq!(tree.focused(), P4);
+        assert!(!tree.is_zoomed());
+        assert!(approx(split_ratio(&tree, root), 0.65));
+        let layout = tree.layout(Rect::new(0.0, 0.0, 1000.0, 500.0), 0.0);
+        let p4 = layout.panes.iter().find(|p| p.id == P4).map(|p| p.rect);
+        assert_rect(p4.unwrap(), 650.0, 0.0, 350.0, 500.0);
+        let before = tree.clone();
+        assert_eq!(
+            tree.split_root(SplitAxis::Vertical, P2, 0.5),
+            Err(LayoutError::DuplicatePane(P2))
+        );
+        assert!(matches!(
+            tree.split_root(SplitAxis::Vertical, PaneId(9), f32::NAN),
+            Err(LayoutError::InvalidRatio(_))
+        ));
+        assert_eq!(tree, before);
     }
 
     #[test]
