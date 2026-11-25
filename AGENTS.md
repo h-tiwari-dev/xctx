@@ -1,8 +1,8 @@
 # Working in this repo
 
 xctx is a native macOS agent multiplexer written in Rust with GPUI. The vision is in `design/README.md`, the multi-milestone
-plan is in `docs/roadmap.md`, and Milestones 1 to 5 are complete (`docs/m1.md` to `docs/m5.md`); no further
-milestone is planned yet. Read these before changing anything. `docs/m2.md` ends with notes for
+plan is in `docs/roadmap.md`, Milestones 1 to 5 are complete (`docs/m1.md` to `docs/m5.md`), and Milestone 6
+is active (`docs/m6.md`, `docs/m6-theme.md`). Read these before changing anything. `docs/m2.md` ends with notes for
 working here: keeping tests away from the user's mise config, the Swift prototype, and taking screenshots of the window.
 
 ## Commands
