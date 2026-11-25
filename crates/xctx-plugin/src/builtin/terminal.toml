@@ -1,0 +1,19 @@
+# The Terminal plugin: any command in a pane (lazydocker, k9s, tail -f ...), and one-off commands for agents.
+name = "terminal"
+version = "1.0.0"
+description = "Any command in a pane, and one-off commands in the space's worktree"
+
+[pane]
+kind = "terminal"
+# Empty: the command is chosen when mounting (the user's shell by default).
+run = []
+
+[[tools]]
+name = "shell.run"
+description = "Run one program with its arguments in the space's worktree, with its MISE_ENV and PORT, a timeout and capped output. No shell: pass the program and each argument separately."
+effect = "read"
+run = ["{command}", "{args}"]
+params = [
+  { name = "command", type = "path", required = true, description = "The program to run, such as `cargo` or `./bin/check`" },
+  { name = "args", type = "strings", description = "Its arguments, one per element" },
+]

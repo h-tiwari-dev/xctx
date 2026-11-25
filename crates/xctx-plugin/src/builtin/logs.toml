@@ -1,0 +1,25 @@
+# Logs: tails a command or a file, with filtering and level colouring.
+name = "logs"
+version = "1.0.0"
+description = "Tail a command or a file, filter it and query it"
+
+[pane]
+# Neither `run` nor `file`: the source is chosen when mounting.
+kind = "logs"
+
+[[tools]]
+name = "logs.query"
+description = "Lines matching a pattern or a level, in a time window"
+effect = "read"
+builtin = "logs.query"
+params = [
+  { name = "pattern", type = "string", description = "A regular expression the lines must match" },
+  { name = "level", type = "string", description = "error, warn, info or debug" },
+  { name = "since_secs", type = "integer", description = "Only lines from the last this many seconds" },
+  { name = "limit", type = "integer", description = "At most this many lines, newest last" },
+]
+
+[[events]]
+name = "logs.error"
+match = { field = "event", equals = "logs.error" }
+action = "notice"

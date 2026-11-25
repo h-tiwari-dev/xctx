@@ -1,0 +1,35 @@
+# Browser: a page of the space's app in Chrome, with its screenshot, console and network errors in the pane.
+name = "browser"
+version = "1.0.0"
+description = "Open the space's app in Chrome and see its screenshot, console and network errors"
+
+[pane]
+kind = "web"
+url = "http://localhost:{PORT}"
+
+[[tools]]
+name = "page.open"
+description = "Open a page of the space's app"
+effect = "read"
+builtin = "page.open"
+params = [
+  { name = "path", type = "string", required = true, description = "The path, or a full localhost URL" },
+]
+
+[[tools]]
+name = "page.screenshot"
+description = "A screenshot of the open page, saved in the space's artifacts"
+effect = "read"
+builtin = "page.screenshot"
+params = [
+  { name = "full_page", type = "boolean", description = "The whole page rather than the viewport" },
+]
+
+[[tools]]
+name = "page.console"
+description = "The open page's console messages and network errors"
+effect = "read"
+builtin = "page.console"
+params = [
+  { name = "errors_only", type = "boolean", description = "Only errors" },
+]

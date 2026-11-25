@@ -1,0 +1,30 @@
+# Database: read-only queries through the engine's command-line tool; writes wait in the Inbox.
+name = "database"
+version = "1.0.0"
+description = "Run read-only queries and see a table; writes need the user's approval"
+
+[pane]
+kind = "sql"
+engine = "sqlite"
+# The default; the database is usually chosen when mounting.
+database = "{WORKTREE}/db/development.sqlite3"
+
+[[tools]]
+name = "sql.read"
+description = "Run a read-only query (sqlite3 -readonly, or psql with default_transaction_read_only=on)"
+effect = "read"
+builtin = "sql.read"
+params = [
+  { name = "query", type = "string", required = true, description = "The SQL to run" },
+  { name = "limit", type = "integer", description = "At most this many rows" },
+]
+
+[[tools]]
+name = "sql.write"
+description = "Run a statement that changes data, once the user approves it in the Inbox"
+effect = "write"
+builtin = "sql.write"
+params = [
+  { name = "statement", type = "string", required = true, description = "The SQL to run" },
+  { name = "reason", type = "string", required = true, description = "Why, shown to the user" },
+]

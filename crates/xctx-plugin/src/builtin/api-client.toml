@@ -1,0 +1,49 @@
+# The API client: request, response and history in one pane, sending only to the space's own environment.
+name = "api-client"
+version = "1.0.0"
+description = "Send requests to the space's app, replay and diff them"
+
+[pane]
+kind = "http"
+base_url = "http://localhost:{PORT}"
+
+[[tools]]
+name = "http.send"
+description = "Send a request to the space's app and record it in the history"
+effect = "read"
+builtin = "http.send"
+params = [
+  { name = "method", type = "string", required = true, description = "GET, POST, PUT, PATCH, DELETE ..." },
+  { name = "path", type = "string", required = true, description = "The path, relative to the pane's base URL, or a full localhost URL" },
+  { name = "headers", type = "strings", description = "Headers as `Name: value`" },
+  { name = "body", type = "string", description = "The request body" },
+]
+
+[[tools]]
+name = "http.replay"
+description = "Send a request from the history again"
+effect = "read"
+builtin = "http.replay"
+params = [
+  { name = "id", type = "string", required = true, description = "The history entry to replay" },
+]
+
+[[tools]]
+name = "http.diff"
+description = "Compare the responses of two history entries"
+effect = "read"
+builtin = "http.diff"
+params = [
+  { name = "from", type = "string", required = true, description = "The first history entry" },
+  { name = "to", type = "string", required = true, description = "The second history entry" },
+]
+
+[[events]]
+name = "response.status"
+match = { field = "event", equals = "response.status" }
+action = "notice"
+
+[[events]]
+name = "response.slow"
+match = { field = "event", equals = "response.slow" }
+action = "notice"

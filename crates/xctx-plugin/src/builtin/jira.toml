@@ -1,0 +1,27 @@
+# The Jira connector. Its token comes from the space's mise secrets; comments go through the Inbox.
+name = "jira"
+version = "1.0.0"
+description = "Read Jira issues and comment on them"
+secrets = ["JIRA_API_TOKEN"]
+
+[pane]
+kind = "web"
+
+[[tools]]
+name = "issue.read"
+description = "An issue's summary, description, status and comments"
+effect = "read"
+builtin = "jira.issue.read"
+params = [
+  { name = "key", type = "string", required = true, description = "The issue key, such as PROJ-123" },
+]
+
+[[tools]]
+name = "issue.comment"
+description = "Comment on an issue, once the user approves it in the Inbox"
+effect = "write"
+builtin = "jira.issue.comment"
+params = [
+  { name = "key", type = "string", required = true, description = "The issue key, such as PROJ-123" },
+  { name = "body", type = "string", required = true, description = "The comment" },
+]
