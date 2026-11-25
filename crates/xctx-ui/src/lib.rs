@@ -1,7 +1,7 @@
 //! The window chrome of xctx, drawn with GPUI: the theme, the tab bar, the split view over an `xctx-layout`
 //! pane tree, the prompt input, the status bar, the Inbox panel, the Plan Gate card, the Parent Agent drawer,
 //! the Agent Graph panel, the Shared Space panel, the loop bar, the fork dialog, the attempt strip and the
-//! review sheet for competing attempts, and the small buttons, pills and badges they share.
+//! review sheet for competing attempts, the Plugins menu, and the small buttons, pills and badges they share.
 //!
 //! Components read their colours from the [`Theme`] global when one is set (`cx.set_global(Theme::dark())`),
 //! and fall back to [`Theme::dark`] otherwise. They hold no app state: the app passes in what to show and
@@ -15,6 +15,7 @@ pub mod inbox;
 pub mod loop_bar;
 pub mod parent_agent;
 pub mod plan_gate;
+pub mod plugin_menu;
 pub mod prompt;
 pub mod review_sheet;
 pub mod shared_space;
@@ -42,6 +43,10 @@ pub use loop_bar::{
 };
 pub use parent_agent::{AgentStatus, DRAWER_HEIGHT, PARENT_AGENT_ROLE, ParentAgentDrawer};
 pub use plan_gate::{PLAN_GATE_HINT, PLAN_NEEDS_REPO, PlanGateCard, PlanGateView, PlanRepo};
+pub use plugin_menu::{
+    PLUGIN_MENU_EMPTY, PLUGIN_PROBLEM_LIMIT, PLUGIN_ROW_LIMIT, PLUGIN_TRUST_HINT, PluginEntry,
+    PluginMenu, PluginMenuView, PluginProblemRow, PluginSource,
+};
 pub use prompt::{PromptBuffer, PromptEvent, PromptInput};
 pub use review_sheet::{
     DIFF_CHAR_LIMIT, DIFF_LINE_CHARS, DIFF_LINE_LIMIT, DiffExcerpt, DiffView, FILE_ROW_LIMIT,
