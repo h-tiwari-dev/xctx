@@ -1,0 +1,17 @@
+[package]
+name = "xctx-http"
+version.workspace = true
+edition.workspace = true
+description = "The API client core: requests and responses, history per space, replay and diff, and the status and slow-response events"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+thiserror = "2"
+ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
+url = "2"
+xctx-core = { path = "../xctx-core" }
+
+[dev-dependencies]
+tempfile = "3"
