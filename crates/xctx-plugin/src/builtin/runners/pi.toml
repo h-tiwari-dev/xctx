@@ -1,0 +1,17 @@
+# pi, the agent xctx runs by default. These arguments are exactly the ones xctx built for pi before runners
+# existed, so every session it named keeps opening and forking the same way.
+name = "pi"
+description = "pi coding agent: named sessions, resume, and forks (so attempts are available)"
+program = "pi"
+
+# The first message follows `--`: `pi -- <task>`.
+task = { style = "after-double-dash" }
+
+# Resume the worktree's most recent session.
+resume = ["--continue"]
+
+# Open session {session}, or create it.
+open_session = ["--session-id", "{session}"]
+
+# Copy session {source} (an id or a session file) into the new session {session}.
+fork_session = ["--fork", "{source}", "--session-id", "{session}"]

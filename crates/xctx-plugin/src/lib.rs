@@ -9,6 +9,10 @@
 //!   here but run by the app.
 //! - [`match_events`] finds the events a manifest declares in output lines, each with its [`LoopAction`].
 //!
+//! - [`RunnerManifest`] is a validated `runner.toml` ([`runner`] documents the format): the program an agent pane
+//!   runs and how it is given a task, resumes, opens and forks sessions. [`RunnerRegistry`] loads the built-in
+//!   runners (`pi`, `claude`) and the user's (`~/.config/xctx/runners`); [`build_args`] builds a runner's arguments.
+//!
 //! Nothing here runs code inside xctx: plugin tools are separate processes.
 
 #![warn(missing_docs)]
@@ -20,6 +24,7 @@ mod event;
 pub mod manifest;
 mod registry;
 mod run;
+pub mod runner;
 mod template;
 
 pub use builtin::{BUILTIN_MANIFESTS, builtin_manifests, builtin_origin};
@@ -34,3 +39,8 @@ pub use manifest::{
 };
 pub use registry::{LoadProblem, Plugin, REPO_PLUGINS_DIR, Registry, Source};
 pub use run::{ToolOutput, run_plan};
+pub use runner::{
+    ArgsTemplate, BUILTIN_RUNNERS, Capability, DEFAULT_RUNNER, RUNNER_FILE, Runner, RunnerError,
+    RunnerManifest, RunnerProblem, RunnerRegistry, RunnerSession, RunnerStart, TaskStyle,
+    build_args, builtin_runner_origin, stdin_task,
+};

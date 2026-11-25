@@ -1,0 +1,11 @@
+# Claude Code, as an example of a runner without sessions xctx can name: Claude Code only accepts UUIDs as session
+# ids, so xctx cannot open or fork its sessions, and attempts are not offered for it.
+name = "claude"
+description = "Claude Code: a task and resume, without named sessions or forks (no attempts)"
+program = "claude"
+
+# The first message follows `--`: `claude -- <task>`.
+task = { style = "after-double-dash" }
+
+# Resume the most recent conversation in the working directory.
+resume = ["--continue"]
