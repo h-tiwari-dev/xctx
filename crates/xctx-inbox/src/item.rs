@@ -101,6 +101,45 @@ pub struct AttemptProposal {
     pub rationale: Option<String>,
 }
 
+/// What a [`PluginGate`] asks the user to allow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginGateKind {
+    /// Run one call of a plugin's write tool, for example `sql.write` or `issue.comment`.
+    WriteCall {
+        /// The tool's name.
+        tool: String,
+        /// The call's arguments as the user should see them, already masked by whoever posted the gate.
+        args: String,
+    },
+    /// Mount a plugin that needs approval to mount, for example a connector with write tools.
+    Mount {
+        /// Why it needs approval, for example the write tools it brings.
+        reason: String,
+    },
+    /// Trust a repo's own plugin (in its `.xctx/plugins/`) so it can be mounted and run, the way mise needs trust.
+    TrustRepoPlugin {
+        /// The repo the plugin lives in.
+        repo: String,
+    },
+}
+
+/// A plugin action waiting for the user: a write tool call, a mount, or trusting a repo plugin. Approving it is
+/// the only way an agent's request does any of these; carrying it out is the app's job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginGate {
+    /// The space.
+    pub space: SpaceId,
+    /// The plugin's manifest name.
+    pub plugin: String,
+    /// What is asked. Stored as `request`, because the item's own `kind` tag already uses that name on disk.
+    #[serde(rename = "request")]
+    pub kind: PluginGateKind,
+    /// Why, from whoever asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
 /// A repo whose mise config requires a variable that is not set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingEnvVar {
@@ -138,6 +177,8 @@ pub enum ItemBody {
     SpaceWiden(SpaceWiden),
     /// See [`AttemptProposal`].
     AttemptProposal(AttemptProposal),
+    /// See [`PluginGate`].
+    PluginGate(PluginGate),
     /// See [`MissingEnvVar`].
     MissingEnvVar(MissingEnvVar),
     /// See [`Notice`].
@@ -154,6 +195,8 @@ pub enum ItemKind {
     SpaceWiden,
     /// [`ItemBody::AttemptProposal`].
     AttemptProposal,
+    /// [`ItemBody::PluginGate`].
+    PluginGate,
     /// [`ItemBody::MissingEnvVar`].
     MissingEnvVar,
     /// [`ItemBody::Notice`].
@@ -161,13 +204,14 @@ pub enum ItemKind {
 }
 
 impl ItemKind {
-    /// The name used on the control socket: `plan_gate`, `space_widen`, `attempt_proposal`, `missing_env_var` or
-    /// `notice`.
+    /// The name used on the control socket: `plan_gate`, `space_widen`, `attempt_proposal`, `plugin_gate`,
+    /// `missing_env_var` or `notice`.
     pub fn name(self) -> &'static str {
         match self {
             ItemKind::PlanGate => "plan_gate",
             ItemKind::SpaceWiden => "space_widen",
             ItemKind::AttemptProposal => "attempt_proposal",
+            ItemKind::PluginGate => "plugin_gate",
             ItemKind::MissingEnvVar => "missing_env_var",
             ItemKind::Notice => "notice",
         }
@@ -177,7 +221,10 @@ impl ItemKind {
     pub fn is_gate(self) -> bool {
         matches!(
             self,
-            ItemKind::PlanGate | ItemKind::SpaceWiden | ItemKind::AttemptProposal
+            ItemKind::PlanGate
+                | ItemKind::SpaceWiden
+                | ItemKind::AttemptProposal
+                | ItemKind::PluginGate
         )
     }
 }
@@ -186,7 +233,7 @@ impl ItemKind {
 ///
 /// | kind | to |
 /// | --- | --- |
-/// | Plan Gate, space widening | `Approved` or `Rejected` |
+/// | Plan Gate, space widening, attempt proposal, plugin gate | `Approved` or `Rejected` |
 /// | missing variable | `Resolved` (it is set now) or `Dismissed` |
 /// | notice | `Dismissed` |
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -280,6 +327,7 @@ impl InboxItem {
             ItemBody::PlanGate(_) => ItemKind::PlanGate,
             ItemBody::SpaceWiden(_) => ItemKind::SpaceWiden,
             ItemBody::AttemptProposal(_) => ItemKind::AttemptProposal,
+            ItemBody::PluginGate(_) => ItemKind::PluginGate,
             ItemBody::MissingEnvVar(_) => ItemKind::MissingEnvVar,
             ItemBody::Notice(_) => ItemKind::Notice,
         }
@@ -315,6 +363,15 @@ impl InboxItem {
                 let attempts = if a.count == 1 { "attempt" } else { "attempts" };
                 format!("Fork {} {attempts} of {} in {}", a.count, a.agent, a.space)
             }
+            ItemBody::PluginGate(g) => match &g.kind {
+                PluginGateKind::WriteCall { tool, .. } => {
+                    format!("Run {tool} ({}) in {}", g.plugin, g.space)
+                }
+                PluginGateKind::Mount { .. } => format!("Mount {} in {}", g.plugin, g.space),
+                PluginGateKind::TrustRepoPlugin { repo } => {
+                    format!("Trust {repo}'s plugin {} in {}", g.plugin, g.space)
+                }
+            },
             ItemBody::MissingEnvVar(m) => format!("{} needs {}", m.repo, m.var.name),
             ItemBody::Notice(n) => n.title.clone(),
         }
@@ -361,6 +418,37 @@ impl InboxItem {
                     "Each attempt gets its own worktree, PORT and a fork of the writer's session."
                         .to_owned(),
                 );
+            }
+            ItemBody::PluginGate(g) => {
+                if let Some(r) = &g.rationale {
+                    lines.push(r.clone());
+                }
+                match &g.kind {
+                    PluginGateKind::WriteCall { tool, args } => {
+                        if !args.trim().is_empty() {
+                            lines.push(format!("Arguments: {args}"));
+                        }
+                        lines.push(format!(
+                            "{tool} writes; it runs once, in this space's environment, only if you approve."
+                        ));
+                    }
+                    PluginGateKind::Mount { reason } => {
+                        lines.push(reason.clone());
+                        lines.push(
+                            "Its pane joins the space; its write tools still ask here each time."
+                                .to_owned(),
+                        );
+                    }
+                    PluginGateKind::TrustRepoPlugin { repo } => {
+                        lines.push(format!(
+                            "The plugin comes from {repo}'s .xctx/plugins/ and runs its own commands."
+                        ));
+                        lines.push(
+                            "Approving trusts it for this repo, the way mise trust does."
+                                .to_owned(),
+                        );
+                    }
+                }
             }
             ItemBody::MissingEnvVar(m) => {
                 if let Some(help) = &m.var.help {

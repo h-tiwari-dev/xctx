@@ -202,10 +202,7 @@ impl SpaceLayout {
         let id = PaneId(self.next_pane_id);
         self.tree.split(target, axis, id, SPLIT_RATIO)?;
         self.take_pane_id();
-        let role = PaneRole {
-            kind,
-            repo: repo.unwrap_or(target_repo),
-        };
+        let role = PaneRole::new(kind, repo.unwrap_or(target_repo));
         self.roles.insert(id, role.clone());
         Ok(RolePane { id, role })
     }
@@ -371,10 +368,7 @@ mod tests {
         let mut roles = layout.panes();
         roles.push(RolePane {
             id: PaneId(99),
-            role: PaneRole {
-                kind: PaneKind::Shell,
-                repo: "api".into(),
-            },
+            role: PaneRole::new(PaneKind::Shell, "api"),
         });
         let rebuilt = SpaceLayout::from_parts(layout.tree().clone(), roles.clone(), 1);
         assert_eq!(

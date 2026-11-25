@@ -814,10 +814,7 @@ mod tests {
     fn role_pane(id: u64, kind: PaneKind, repo: &str) -> RolePane {
         RolePane {
             id: PaneId(id),
-            role: PaneRole {
-                kind,
-                repo: repo.to_owned(),
-            },
+            role: PaneRole::new(kind, repo),
         }
     }
 

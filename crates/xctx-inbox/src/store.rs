@@ -10,7 +10,10 @@ use xctx_core::store::{data_dir, write_atomic};
 use xctx_core::{EnvReport, SpaceDraft, SpaceId};
 
 use crate::error::{InboxError, Result};
-use crate::item::{InboxItem, ItemBody, ItemId, ItemKind, ItemState, MissingEnvVar, Source};
+use crate::item::{
+    InboxItem, ItemBody, ItemId, ItemKind, ItemState, MissingEnvVar, PluginGate, PluginGateKind,
+    Source,
+};
 
 /// The Inbox's file in the data directory.
 pub const INBOX_FILE: &str = "inbox.json";
@@ -260,9 +263,10 @@ impl Inbox {
         })
     }
 
-    /// Approve a pending Plan Gate or space widening and return it as approved; the app then launches or widens.
-    /// A Plan Gate with no repos cannot be approved, nor a widening that adds no repos and does not switch to
-    /// production.
+    /// Approve a pending gate (Plan Gate, space widening, attempt proposal, plugin gate) and return it as approved;
+    /// the app then carries it out. A Plan Gate with no repos cannot be approved, nor a widening that adds no repos
+    /// and does not switch to production, nor an attempt proposal outside 1 to 4 attempts, nor a plugin gate with
+    /// no plugin, no tool (write call) or no repo (trust).
     pub fn approve(&mut self, id: &ItemId) -> Result<InboxItem> {
         self.settle(
             id,
@@ -285,12 +289,13 @@ impl Inbox {
                         count: a.count,
                     })
                 }
+                ItemBody::PluginGate(g) => check_plugin_gate(&item.id, g),
                 _ => Ok(()),
             },
         )
     }
 
-    /// Turn down a pending Plan Gate or space widening, with an optional note on why.
+    /// Turn down a pending gate, with an optional note on why.
     pub fn reject(&mut self, id: &ItemId, note: Option<String>) -> Result<InboxItem> {
         self.settle(
             id,
@@ -421,6 +426,24 @@ impl Inbox {
             }
             Ok(ids)
         })
+    }
+}
+
+/// Refuse to approve a plugin gate that does not say what it allows.
+fn check_plugin_gate(id: &ItemId, gate: &PluginGate) -> Result<()> {
+    let incomplete = |missing| {
+        Err(InboxError::IncompletePluginGate {
+            id: id.clone(),
+            missing,
+        })
+    };
+    if gate.plugin.trim().is_empty() {
+        return incomplete("no plugin");
+    }
+    match &gate.kind {
+        PluginGateKind::WriteCall { tool, .. } if tool.trim().is_empty() => incomplete("no tool"),
+        PluginGateKind::TrustRepoPlugin { repo } if repo.trim().is_empty() => incomplete("no repo"),
+        _ => Ok(()),
     }
 }
 

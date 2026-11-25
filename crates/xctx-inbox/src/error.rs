@@ -62,6 +62,15 @@ pub enum InboxError {
         /// How many it asked for.
         count: u32,
     },
+
+    /// A plugin gate names no plugin, or no tool for a write call, or no repo for a trust request.
+    #[error("the plugin gate in {id} is incomplete: {missing}")]
+    IncompletePluginGate {
+        /// The item.
+        id: ItemId,
+        /// What it lacks.
+        missing: &'static str,
+    },
 }
 
 /// The result type of the Inbox's fallible operations.

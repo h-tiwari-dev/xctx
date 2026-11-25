@@ -25,6 +25,8 @@ pub fn pane_kind_label(kind: PaneKind) -> &'static str {
         PaneKind::Agent => "agent",
         PaneKind::Shell => "shell",
         PaneKind::Git => "git",
+        // The plugin's own name and badge come with the Plugins menu (Milestone 5, Wave 2).
+        PaneKind::Plugin => "plugin",
     }
 }
 

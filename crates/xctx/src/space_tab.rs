@@ -896,10 +896,7 @@ mod tests {
 
     #[test]
     fn titles_fall_back_to_repo_and_kind() {
-        let role = PaneRole {
-            kind: PaneKind::Agent,
-            repo: "api".into(),
-        };
+        let role = PaneRole::new(PaneKind::Agent, "api");
         assert_eq!(pane_title(&role, None), "api · agent");
         assert_eq!(
             pane_title(&role, Some(&PaneTerminal::Failed("x".into()))),

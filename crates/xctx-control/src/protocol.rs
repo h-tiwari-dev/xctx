@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use xctx_layout::{PaneId, PaneKind, PaneTree, RolePane, Shape, SplitAxis};
 
 /// The protocol version [`Method::Ping`] reports. It goes up when a change would break existing clients.
@@ -301,13 +301,13 @@ impl Response {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Look at spaces, layouts, the Inbox, agent graphs, channels, contracts and loops.
+    /// Look at spaces, layouts, the Inbox, agent graphs, channels, contracts, loops, attempts and plugins.
     Read,
     /// Rearrange a space: split, close, focus, zoom and reshape panes; pause, add and remove agent lanes; advance a
-    /// loop.
+    /// loop; mount and unmount plugins.
     Layout,
     /// Propose work and tell the user things: draft or propose widening a space, post to the Inbox, the channel or
-    /// the contract, set the status line.
+    /// the contract, set the status line, call plugin tools (writes become Inbox gates) and report plugin events.
     Propose,
     /// Steer on the user's behalf: resume a paused agent and set how far a loop runs without asking. These undo a
     /// user's pause or loosen a user's gate, so [`crate::ServerConfig::default`] (what pane agents get) leaves it
@@ -389,11 +389,24 @@ pub enum Method {
     AttemptPropose,
     /// `attempt.diff`: the files an attempt changed since its fork, or one file's diff.
     AttemptDiff,
+    /// `plugin.list`: the plugins this xctx knows, where they come from and where they are mounted.
+    PluginList,
+    /// `plugin.tools`: a plugin's tools with their parameters and effects, so an agent knows how to call them.
+    PluginTools,
+    /// `plugin.mount`: mount a plugin into a space; its pane joins the layout. A connector with write tools or an
+    /// untrusted repo plugin posts a gate to the Inbox instead.
+    PluginMount,
+    /// `plugin.unmount`: unmount a plugin from a space, closing its pane and its tools.
+    PluginUnmount,
+    /// `plugin.call`: call a mounted plugin's tool. Read tools run; write tools post a gate to the Inbox.
+    PluginCall,
+    /// `plugin.emit`: report an event from a plugin's own tool, which the space routes to its loop.
+    PluginEmit,
 }
 
 impl Method {
     /// Every method, in the order `xctx-ctl help` lists them.
-    pub const ALL: [Method; 30] = [
+    pub const ALL: [Method; 36] = [
         Method::Ping,
         Method::SpaceList,
         Method::SpaceDraft,
@@ -424,6 +437,12 @@ impl Method {
         Method::AttemptReport,
         Method::AttemptPropose,
         Method::AttemptDiff,
+        Method::PluginList,
+        Method::PluginTools,
+        Method::PluginMount,
+        Method::PluginUnmount,
+        Method::PluginCall,
+        Method::PluginEmit,
     ];
 
     /// The name on the wire.
@@ -459,6 +478,12 @@ impl Method {
             Method::AttemptReport => "attempt.report",
             Method::AttemptPropose => "attempt.propose",
             Method::AttemptDiff => "attempt.diff",
+            Method::PluginList => "plugin.list",
+            Method::PluginTools => "plugin.tools",
+            Method::PluginMount => "plugin.mount",
+            Method::PluginUnmount => "plugin.unmount",
+            Method::PluginCall => "plugin.call",
+            Method::PluginEmit => "plugin.emit",
         }
     }
 
@@ -486,7 +511,9 @@ impl Method {
             | Method::GraphPause
             | Method::GraphAddLane
             | Method::GraphRemoveLane
-            | Method::LoopAdvance => Capability::Layout,
+            | Method::LoopAdvance
+            | Method::PluginMount
+            | Method::PluginUnmount => Capability::Layout,
             Method::GraphResume | Method::LoopSetAutonomy => Capability::Steer,
             Method::SpaceDraft
             | Method::InboxPost
@@ -496,8 +523,13 @@ impl Method {
             | Method::ContractAgree
             | Method::SpaceWidenPropose
             | Method::AttemptReport
-            | Method::AttemptPropose => Capability::Propose,
-            Method::AttemptList | Method::AttemptDiff => Capability::Read,
+            | Method::AttemptPropose
+            | Method::PluginCall
+            | Method::PluginEmit => Capability::Propose,
+            Method::AttemptList
+            | Method::AttemptDiff
+            | Method::PluginList
+            | Method::PluginTools => Capability::Read,
         }
     }
 
@@ -545,6 +577,22 @@ impl Method {
             }
             Method::AttemptDiff => {
                 "the files an attempt changed since its fork, or one file's diff"
+            }
+            Method::PluginList => {
+                "the plugins available (to a space), their tools and where they are mounted"
+            }
+            Method::PluginTools => {
+                "a plugin's tools with their parameters and whether each reads or writes"
+            }
+            Method::PluginMount => {
+                "mount a plugin into a space; connectors with writes and untrusted repo plugins ask in the Inbox"
+            }
+            Method::PluginUnmount => "unmount a plugin (or its pane) from a space",
+            Method::PluginCall => {
+                "call a mounted plugin's tool; read tools run, write tools post a gate to the Inbox"
+            }
+            Method::PluginEmit => {
+                "report a plugin event (from the plugin's own tool) to the space's loop"
             }
         }
     }
@@ -595,6 +643,14 @@ impl Method {
                 "space=<slug> agent=<writer id> count=<1-4> [instructions:='[\"...\",\"...\"]'] [rationale=<text>]"
             }
             Method::AttemptDiff => "space=<slug> attempt=<n> [path=<file>]",
+            Method::PluginList => "[space=<slug>]",
+            Method::PluginTools => "plugin=<name> [space=<slug>]",
+            Method::PluginMount => "space=<slug> plugin=<name> [repo=<name>]",
+            Method::PluginUnmount => "space=<slug> plugin=<name> | pane=<id>",
+            Method::PluginCall => {
+                "space=<slug> plugin=<name> tool=<name> [args:='{\"key\":\"value\"}']"
+            }
+            Method::PluginEmit => "space=<slug> plugin=<name> event=<name> [detail=<text>]",
         }
     }
 }
@@ -1000,6 +1056,85 @@ pub struct SpaceWidenProposeParams {
     pub rationale: Option<String>,
 }
 
+/// `plugin.list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginListParams {
+    /// Only the plugins this space can mount (built-in, user, and its own repos' plugins); every plugin this
+    /// xctx knows when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+}
+
+/// `plugin.tools`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginToolsParams {
+    /// The plugin's manifest name.
+    pub plugin: String,
+    /// The space asking, so a repo plugin of that space's repos can be found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+}
+
+/// `plugin.mount`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMountParams {
+    /// The space's slug.
+    pub space: String,
+    /// The plugin's manifest name.
+    pub plugin: String,
+    /// The space repo the plugin's pane and tools work in; the space's first repo when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+/// `plugin.unmount`. Name exactly one of `plugin` (every pane of it in the space) or `pane`; [`Call::parse`]
+/// refuses both or neither.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginUnmountParams {
+    /// The space's slug.
+    pub space: String,
+    /// The plugin to unmount, by its manifest name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    /// One plugin pane to close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<PaneId>,
+}
+
+/// `plugin.call`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCallParams {
+    /// The space's slug.
+    pub space: String,
+    /// The mounted plugin's manifest name.
+    pub plugin: String,
+    /// The tool's name, as `plugin.tools` lists it.
+    pub tool: String,
+    /// The tool's parameters by name. `xctx-ctl` takes them as `args:='{"key":"value"}'` (or `args={...}`).
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub args: Map<String, Value>,
+}
+
+/// `plugin.emit`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginEmitParams {
+    /// The space's slug.
+    pub space: String,
+    /// The plugin whose manifest declares the event.
+    pub plugin: String,
+    /// The event's name, as the manifest declares it.
+    pub event: String,
+    /// What happened: a line of text or the JSON the tool printed. Masked before it is stored or shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Value>,
+}
+
 /// A parsed request: a method and its typed parameters.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
@@ -1063,6 +1198,18 @@ pub enum Call {
     AttemptPropose(AttemptProposeParams),
     /// See [`Method::AttemptDiff`].
     AttemptDiff(AttemptDiffParams),
+    /// See [`Method::PluginList`].
+    PluginList(PluginListParams),
+    /// See [`Method::PluginTools`].
+    PluginTools(PluginToolsParams),
+    /// See [`Method::PluginMount`].
+    PluginMount(PluginMountParams),
+    /// See [`Method::PluginUnmount`].
+    PluginUnmount(PluginUnmountParams),
+    /// See [`Method::PluginCall`].
+    PluginCall(PluginCallParams),
+    /// See [`Method::PluginEmit`].
+    PluginEmit(PluginEmitParams),
 }
 
 fn params<P: DeserializeOwned>(method: Method, params: Option<Value>) -> Result<P, RpcError> {
@@ -1137,6 +1284,21 @@ impl Call {
             Method::AttemptReport => Call::AttemptReport(params(m, raw)?),
             Method::AttemptPropose => Call::AttemptPropose(params(m, raw)?),
             Method::AttemptDiff => Call::AttemptDiff(params(m, raw)?),
+            Method::PluginList => Call::PluginList(params(m, raw)?),
+            Method::PluginTools => Call::PluginTools(params(m, raw)?),
+            Method::PluginMount => Call::PluginMount(params(m, raw)?),
+            Method::PluginUnmount => {
+                let p: PluginUnmountParams = params(m, raw)?;
+                if p.plugin.is_some() == p.pane.is_some() {
+                    return Err(RpcError::invalid_params(format!(
+                        "{m}: name a plugin or a pane, not both or neither; usage: {m} {}",
+                        m.usage()
+                    )));
+                }
+                Call::PluginUnmount(p)
+            }
+            Method::PluginCall => Call::PluginCall(params(m, raw)?),
+            Method::PluginEmit => Call::PluginEmit(params(m, raw)?),
         })
     }
 
@@ -1173,6 +1335,12 @@ impl Call {
             Call::AttemptReport(_) => Method::AttemptReport,
             Call::AttemptPropose(_) => Method::AttemptPropose,
             Call::AttemptDiff(_) => Method::AttemptDiff,
+            Call::PluginList(_) => Method::PluginList,
+            Call::PluginTools(_) => Method::PluginTools,
+            Call::PluginMount(_) => Method::PluginMount,
+            Call::PluginUnmount(_) => Method::PluginUnmount,
+            Call::PluginCall(_) => Method::PluginCall,
+            Call::PluginEmit(_) => Method::PluginEmit,
         }
     }
 
@@ -1203,6 +1371,12 @@ impl Call {
             Call::AttemptReport(p) => to_value(p),
             Call::AttemptPropose(p) => to_value(p),
             Call::AttemptDiff(p) => to_value(p),
+            Call::PluginList(p) => to_value(p),
+            Call::PluginTools(p) => to_value(p),
+            Call::PluginMount(p) => to_value(p),
+            Call::PluginUnmount(p) => to_value(p),
+            Call::PluginCall(p) => to_value(p),
+            Call::PluginEmit(p) => to_value(p),
         }
     }
 
@@ -1232,6 +1406,12 @@ impl Call {
             Call::AttemptReport(p) => Some(&p.space),
             Call::AttemptPropose(p) => Some(&p.space),
             Call::AttemptDiff(p) => Some(&p.space),
+            Call::PluginList(p) => p.space.as_deref(),
+            Call::PluginTools(p) => p.space.as_deref(),
+            Call::PluginMount(p) => Some(&p.space),
+            Call::PluginUnmount(p) => Some(&p.space),
+            Call::PluginCall(p) => Some(&p.space),
+            Call::PluginEmit(p) => Some(&p.space),
         }
     }
 }
@@ -1348,7 +1528,7 @@ pub struct PaneZoomResult {
 pub struct InboxItemSummary {
     /// The item's id.
     pub id: String,
-    /// `plan_gate`, `missing_env_var`, `space_widen` or `notice`.
+    /// `plan_gate`, `space_widen`, `attempt_proposal`, `plugin_gate`, `missing_env_var` or `notice`.
     pub kind: String,
     /// `pending`, `approved`, `rejected` or `dismissed`.
     pub state: String,
@@ -1458,6 +1638,157 @@ pub struct AttemptDiffResult {
 pub struct SpaceWidenProposeResult {
     /// The space widening item posted to the Inbox; the space widens only when the user approves it.
     pub inbox_item: String,
+}
+
+/// Where a plugin comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSource {
+    /// Shipped with xctx: terminal, API client, logs, database, browser, the connectors.
+    Builtin,
+    /// The user's own, in `~/.config/xctx/plugins/<name>/`.
+    User,
+    /// A repo's own, in its `.xctx/plugins/`; it needs approval in the Inbox the first time.
+    Repo,
+}
+
+/// Whether a plugin tool only reads or also changes something.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolEffect {
+    /// Reads only; `plugin.call` runs it.
+    Read,
+    /// Changes something; `plugin.call` posts a gate to the Inbox and it runs only when the user approves.
+    Write,
+}
+
+/// A tool in `plugin.list`: enough to know it exists; `plugin.tools` has its parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginToolSummary {
+    /// The tool's name, for example `http.send`.
+    pub name: String,
+    /// Whether it reads or writes.
+    pub effect: ToolEffect,
+}
+
+/// A plugin in `plugin.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSummary {
+    /// The manifest name, which the other plugin methods take as `plugin=`.
+    pub name: String,
+    /// One line on what it is for.
+    pub description: String,
+    /// Where it comes from.
+    pub source: PluginSource,
+    /// For a repo plugin, the repo it lives in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// For a repo plugin, whether the user has trusted it yet; mounting an untrusted one posts a gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
+    /// The slugs of the spaces it is mounted in.
+    #[serde(default)]
+    pub mounted_in: Vec<String>,
+    /// Its tools.
+    #[serde(default)]
+    pub tools: Vec<PluginToolSummary>,
+}
+
+/// The result of `plugin.list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginListResult {
+    /// The plugins, built-in ones first, then by name.
+    pub plugins: Vec<PluginSummary>,
+}
+
+/// One parameter of a plugin tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginToolParam {
+    /// The name `plugin.call` takes it by in `args`.
+    pub name: String,
+    /// Its JSON type as the manifest declares it, for example `string`, `integer`, `number` or `boolean`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Whether a call must give it.
+    #[serde(default)]
+    pub required: bool,
+    /// What it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A plugin tool in `plugin.tools`: everything an agent needs to call it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginToolSpec {
+    /// The tool's name, which `plugin.call` takes as `tool=`.
+    pub name: String,
+    /// What it does.
+    pub description: String,
+    /// Whether it reads or writes; a write is a gate in the Inbox.
+    pub effect: ToolEffect,
+    /// Its parameters.
+    #[serde(default)]
+    pub params: Vec<PluginToolParam>,
+}
+
+/// The result of `plugin.tools`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginToolsResult {
+    /// The plugin's manifest name.
+    pub plugin: String,
+    /// Its tools, in manifest order.
+    pub tools: Vec<PluginToolSpec>,
+}
+
+/// The result of `plugin.mount`: exactly one of `pane` and `inbox_item` is set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginMountResult {
+    /// The plugin's new pane, when it was mounted now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<PaneId>,
+    /// The gate posted to the Inbox instead, when mounting needs the user's approval (a connector with write
+    /// tools, or a repo plugin not trusted yet). It mounts only when the user approves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_item: Option<String>,
+}
+
+/// The result of `plugin.unmount`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginUnmountResult {
+    /// The panes closed.
+    pub closed: Vec<PaneId>,
+}
+
+/// The result of `plugin.call`: exactly one of `output` and `inbox_item` is set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCallResult {
+    /// What a read tool returned, masked: the JSON it printed, or its text as a string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    /// The gate posted to the Inbox for a write tool; it runs only when the user approves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_item: Option<String>,
+}
+
+/// What a space's loop does with a plugin event, as the plugin's manifest maps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginEventAction {
+    /// Stop the loop at its stage.
+    Fail,
+    /// The stage's check passed.
+    Pass,
+    /// Post to the Inbox.
+    Notice,
+}
+
+/// The result of `plugin.emit`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginEmitResult {
+    /// What the loop did with the event; absent when the manifest maps it to nothing and it was only recorded
+    /// as a finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<PluginEventAction>,
 }
 
 /// The result of methods that only report success: `pane.close`, `pane.focus`, `status.set`.
@@ -1875,6 +2206,210 @@ mod tests {
         );
         let back: Response = serde_json::from_str(&err.to_line())?;
         assert_eq!(back, err);
+        Ok(())
+    }
+
+    fn m5_calls() -> Vec<Call> {
+        let mut args = Map::new();
+        args.insert("path".into(), json!("/health"));
+        args.insert("headers".into(), json!({"accept": "application/json"}));
+        vec![
+            Call::PluginList(PluginListParams {
+                space: Some("s".into()),
+            }),
+            Call::PluginTools(PluginToolsParams {
+                plugin: "http".into(),
+                space: Some("s".into()),
+            }),
+            Call::PluginMount(PluginMountParams {
+                space: "s".into(),
+                plugin: "http".into(),
+                repo: Some("api".into()),
+            }),
+            Call::PluginUnmount(PluginUnmountParams {
+                space: "s".into(),
+                plugin: Some("http".into()),
+                pane: None,
+            }),
+            Call::PluginUnmount(PluginUnmountParams {
+                space: "s".into(),
+                plugin: None,
+                pane: Some(PaneId(7)),
+            }),
+            Call::PluginCall(PluginCallParams {
+                space: "s".into(),
+                plugin: "http".into(),
+                tool: "http.send".into(),
+                args,
+            }),
+            Call::PluginEmit(PluginEmitParams {
+                space: "s".into(),
+                plugin: "http".into(),
+                event: "response.status".into(),
+                detail: Some(json!({"status": 503})),
+            }),
+        ]
+    }
+
+    #[test]
+    fn m5_calls_round_trip_through_their_params_and_name_their_space() -> Result<(), RpcError> {
+        let calls = m5_calls();
+        let mut methods: Vec<Method> = calls.iter().map(Call::method).collect();
+        methods.dedup();
+        assert_eq!(methods, Method::ALL[30..36], "every M5 method is covered");
+        for call in calls {
+            let parsed = Call::parse(call.method().name(), Some(call.params()))?;
+            assert_eq!(parsed, call);
+            assert_eq!(call.space(), Some("s"), "{}", call.method());
+        }
+        // Optional fields stay off the wire.
+        let list = Call::parse("plugin.list", None)?;
+        assert_eq!(list, Call::PluginList(PluginListParams::default()));
+        assert_eq!(list.space(), None);
+        let call = Call::parse(
+            "plugin.call",
+            Some(json!({"space": "s", "plugin": "logs", "tool": "logs.query"})),
+        )?;
+        assert_eq!(
+            call.params(),
+            json!({"space": "s", "plugin": "logs", "tool": "logs.query"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn m5_params_reject_mistakes_with_usage() {
+        for (method, params) in [
+            ("plugin.tools", json!({})),
+            ("plugin.mount", json!({"space": "s"})),
+            (
+                "plugin.mount",
+                json!({"space": "s", "plugin": "http", "pane": 1}),
+            ),
+            ("plugin.unmount", json!({"space": "s"})),
+            (
+                "plugin.unmount",
+                json!({"space": "s", "plugin": "http", "pane": 2}),
+            ),
+            (
+                "plugin.call",
+                json!({"space": "s", "plugin": "http", "tool": "t", "args": [1]}),
+            ),
+            (
+                "plugin.call",
+                json!({"space": "s", "plugin": "http", "tool": "t", "args": "x=1"}),
+            ),
+            ("plugin.call", json!({"space": "s", "plugin": "http"})),
+            ("plugin.emit", json!({"space": "s", "plugin": "http"})),
+        ] {
+            let err = Call::parse(method, Some(params)).err();
+            let err = err.map(|e| (e.kind(), e.message));
+            assert!(
+                matches!(&err, Some((Some(ErrorCode::InvalidParams), m)) if m.contains(&format!("usage: {method}"))),
+                "{method}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn m5_methods_need_the_capabilities_the_plan_gives_them() {
+        use Capability::{Layout, Propose, Read};
+        let expected = [
+            (Method::PluginList, Read),
+            (Method::PluginTools, Read),
+            (Method::PluginMount, Layout),
+            (Method::PluginUnmount, Layout),
+            (Method::PluginCall, Propose),
+            (Method::PluginEmit, Propose),
+        ];
+        for (method, capability) in expected {
+            assert_eq!(method.capability(), capability, "{method}");
+            assert!(!method.usage().is_empty(), "{method}");
+            assert!(!method.summary().is_empty(), "{method}");
+            assert_ne!(method.capability(), Capability::Steer);
+        }
+    }
+
+    #[test]
+    fn m5_results_have_stable_field_names() -> Result<(), serde_json::Error> {
+        let list = PluginListResult {
+            plugins: vec![PluginSummary {
+                name: "http".into(),
+                description: "API client".into(),
+                source: PluginSource::Builtin,
+                repo: None,
+                trusted: None,
+                mounted_in: vec!["s".into()],
+                tools: vec![PluginToolSummary {
+                    name: "http.send".into(),
+                    effect: ToolEffect::Read,
+                }],
+            }],
+        };
+        let value = serde_json::to_value(&list)?;
+        assert_eq!(
+            value,
+            json!({"plugins": [{
+                "name": "http", "description": "API client", "source": "builtin", "mounted_in": ["s"],
+                "tools": [{"name": "http.send", "effect": "read"}],
+            }]})
+        );
+        assert_eq!(serde_json::from_value::<PluginListResult>(value)?, list);
+
+        let tools = PluginToolsResult {
+            plugin: "sql".into(),
+            tools: vec![PluginToolSpec {
+                name: "sql.write".into(),
+                description: "run a write".into(),
+                effect: ToolEffect::Write,
+                params: vec![PluginToolParam {
+                    name: "query".into(),
+                    kind: "string".into(),
+                    required: true,
+                    description: None,
+                }],
+            }],
+        };
+        let value = serde_json::to_value(&tools)?;
+        assert_eq!(
+            value["tools"][0]["params"][0],
+            json!({"name": "query", "type": "string", "required": true})
+        );
+        assert_eq!(value["tools"][0]["effect"], "write");
+        assert_eq!(serde_json::from_value::<PluginToolsResult>(value)?, tools);
+
+        let gated = PluginMountResult {
+            pane: None,
+            inbox_item: Some("inbox-4".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&gated)?,
+            json!({"inbox_item": "inbox-4"})
+        );
+        let mounted = PluginMountResult {
+            pane: Some(PaneId(9)),
+            inbox_item: None,
+        };
+        assert_eq!(serde_json::to_value(&mounted)?, json!({"pane": 9}));
+        assert_eq!(
+            serde_json::to_value(PluginCallResult {
+                output: Some(json!({"status": 200})),
+                inbox_item: None,
+            })?,
+            json!({"output": {"status": 200}})
+        );
+        assert_eq!(
+            serde_json::to_value(PluginUnmountResult {
+                closed: vec![PaneId(3)]
+            })?,
+            json!({"closed": [3]})
+        );
+        assert_eq!(
+            serde_json::to_value(PluginEmitResult {
+                action: Some(PluginEventAction::Fail)
+            })?,
+            json!({"action": "fail"})
+        );
         Ok(())
     }
 
