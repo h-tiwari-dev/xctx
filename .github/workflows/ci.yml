@@ -21,9 +21,9 @@ jobs:
     name: fmt, clippy, tests
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: ci
       - run: mise run ci
@@ -33,15 +33,15 @@ jobs:
     needs: ci
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: release
       - run: mise run bundle
       - name: Zip the app
         run: ditto -c -k --keepParent xctx.app xctx-macos-arm64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: xctx-macos-arm64
           path: xctx-macos-arm64.zip
@@ -55,7 +55,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: xctx-macos-arm64
       - name: Replace the nightly release
