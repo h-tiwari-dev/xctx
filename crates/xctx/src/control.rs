@@ -720,23 +720,18 @@ impl Workspace {
                 &p.space,
                 window,
                 cx,
-                |this, id, window, cx| match this.mount_plugin(
-                    id,
-                    &p.plugin,
-                    p.repo,
-                    MountSettings::default(),
-                    true,
-                    window,
-                    cx,
-                )? {
-                    MountOutcome::Mounted(pane) => Ok(PluginMountResult {
-                        pane: Some(pane),
-                        inbox_item: None,
-                    }),
-                    MountOutcome::Gated(item) => Ok(PluginMountResult {
-                        pane: None,
-                        inbox_item: Some(item.as_str().to_owned()),
-                    }),
+                |this, id, window, cx| {
+                    let settings = this.agent_mount_settings(id, &p.plugin, p.repo.as_deref());
+                    match this.mount_plugin(id, &p.plugin, p.repo, settings, true, window, cx)? {
+                        MountOutcome::Mounted(pane) => Ok(PluginMountResult {
+                            pane: Some(pane),
+                            inbox_item: None,
+                        }),
+                        MountOutcome::Gated(item) => Ok(PluginMountResult {
+                            pane: None,
+                            inbox_item: Some(item.as_str().to_owned()),
+                        }),
+                    }
                 },
             )),
             Call::PluginUnmount(p) => {
@@ -1602,6 +1597,35 @@ impl Workspace {
         Ok(InboxPostResult {
             id: id.as_str().to_owned(),
         })
+    }
+
+    /// What `plugin.mount` mounts `plugin` with in `repo` of open space `id` (the space's first repo when `None`):
+    /// a `terminal` in a repo with a web app (see [`crate::dev_setup::web_app`]) runs its dev server on the
+    /// space's `PORT`, as launch does, since the protocol has no way to name a command; anything else mounts with
+    /// the defaults.
+    fn agent_mount_settings(
+        &self,
+        id: &SpaceId,
+        plugin: &str,
+        repo: Option<&str>,
+    ) -> MountSettings {
+        if plugin != "terminal" {
+            return MountSettings::default();
+        }
+        let worktree = self.tabs.get(id).and_then(|tab| {
+            let repos = &tab.space.repos;
+            match repo {
+                Some(name) => repos.iter().find(|r| r.name == name),
+                None => repos.first(),
+            }
+            .map(|r| r.worktree.clone())
+        });
+        MountSettings {
+            command: worktree
+                .and_then(|dir| crate::dev_setup::web_app(&dir))
+                .map(|app| app.command),
+            ..MountSettings::default()
+        }
     }
 
     /// `space.draft`: draft a space, post it to the Inbox as a Plan Gate, and show it on Home under the Parent
