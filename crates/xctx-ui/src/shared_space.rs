@@ -124,6 +124,7 @@ pub struct SharedSpacePanel {
     messages: Vec<ChannelMessage>,
     findings: Vec<Finding>,
     notes: Vec<Note>,
+    graph: Option<xctx_graph::AgentGraph>,
     on_tab: Option<TabHandler>,
     on_resolve_finding: Option<ResolveHandler>,
 }
@@ -143,11 +144,17 @@ impl SharedSpacePanel {
             messages: Vec::new(),
             findings: Vec::new(),
             notes: Vec::new(),
+            graph: None,
             on_tab: None,
             on_resolve_finding: None,
         }
     }
 
+    /// The space's agent graph, used to colour channel messages by agent identity.
+    pub fn graph(mut self, graph: xctx_graph::AgentGraph) -> Self {
+        self.graph = Some(graph);
+        self
+    }
     /// The tab to show.
     pub fn tab(mut self, tab: SharedTab) -> Self {
         self.tab = tab;
@@ -251,7 +258,7 @@ impl SharedSpacePanel {
                     .rounded(Theme::RADIUS_SM)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.bg)
+                    .bg(theme.chrome)
                     .font_family("Menlo")
                     .text_size(Theme::TEXT_XS)
                     .text_color(theme.text)
@@ -288,6 +295,9 @@ impl SharedSpacePanel {
             .iter()
             .rev()
             .map(|message| {
+                let identity_color = self.graph.as_ref().and_then(|graph| {
+                    crate::agent_graph::agent_identity_color(graph, &message.from, theme)
+                });
                 let to = message.to.clone().map(|to| {
                     div()
                         .min_w_0()
@@ -300,42 +310,55 @@ impl SharedSpacePanel {
                     .id(SharedString::from(format!("shared-message-{}", message.id)))
                     .debug_selector(|| format!("shared-message-{}", message.id))
                     .flex()
-                    .flex_col()
-                    .gap(Theme::SPACE_0_5)
+                    .gap(Theme::SPACE_2)
                     .py(Theme::SPACE_1)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(Theme::SPACE_2)
-                            .min_w_0()
-                            .child(
-                                Badge::new(message_kind_label(message.kind))
-                                    .tone(message_kind_tone(message.kind)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(Theme::TEXT_SM)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .child(message.from.clone()),
-                            )
-                            .children(to),
+                    .children(
+                        identity_color
+                            .map(|color| div().flex_none().w(px(2.0)).rounded(px(1.0)).bg(color)),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .text_size(Theme::TEXT_SM)
-                            .text_color(theme.text_muted)
-                            .children(
-                                message
-                                    .body
-                                    .lines()
-                                    .map(|line| div().min_h(px(14.0)).child(line.to_owned()))
-                                    .collect::<Vec<_>>(),
+                            .flex_1()
+                            .min_w_0()
+                            .gap(Theme::SPACE_0_5)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(Theme::SPACE_2)
+                                    .min_w_0()
+                                    .child(
+                                        Badge::new(message_kind_label(message.kind))
+                                            .tone(message_kind_tone(message.kind)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(Theme::TEXT_SM)
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(identity_color.unwrap_or(theme.text))
+                                            .child(message.from.clone()),
+                                    )
+                                    .children(to),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .text_size(Theme::TEXT_SM)
+                                    .text_color(theme.text_muted)
+                                    .children(
+                                        message
+                                            .body
+                                            .lines()
+                                            .map(|line| {
+                                                div().min_h(px(14.0)).child(line.to_owned())
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    ),
                             ),
                     )
             })
@@ -448,7 +471,7 @@ impl SharedSpacePanel {
                 div()
                     .pt(Theme::SPACE_2)
                     .border_t_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.border_subtle)
                     .child(section_heading("NOTES", theme)),
             )
             .child(notes_body)
@@ -521,7 +544,7 @@ impl RenderOnce for SharedSpacePanel {
                     .rounded(Theme::RADIUS_MD)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.elevated)
+                    .bg(theme.raised)
                     .child(
                         div()
                             .flex()

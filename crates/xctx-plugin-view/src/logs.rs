@@ -395,7 +395,7 @@ impl RenderOnce for LogsPaneView {
                     .rounded(Theme::RADIUS_SM)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.bg)
+                    .bg(theme.chrome)
                     .font_family("Menlo")
                     .text_size(Theme::TEXT_XS)
                     .children(rows)

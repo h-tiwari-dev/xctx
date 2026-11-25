@@ -71,6 +71,30 @@ pub fn can_resume(state: &AgentState) -> bool {
     matches!(state, AgentState::Paused | AgentState::Blocked { .. })
 }
 
+/// The identity colour for an agent in `graph`: [`Theme::accent`] for the orchestrator, or
+/// [`Theme::agent_color`] indexed by its position among non-orchestrator nodes in creation order.
+pub fn agent_identity_color(
+    graph: &AgentGraph,
+    agent_id: &str,
+    theme: &Theme,
+) -> Option<gpui::Hsla> {
+    let mut non_orch = 0usize;
+    for node in graph.nodes() {
+        let is_orch = matches!(node.role, AgentRole::Orchestrator);
+        if node.id.as_str() == agent_id || node.label == agent_id {
+            return Some(if is_orch {
+                theme.accent
+            } else {
+                theme.agent_color(non_orch)
+            });
+        }
+        if !is_orch {
+            non_orch += 1;
+        }
+    }
+    None
+}
+
 type NodeHandler = Rc<dyn Fn(&AgentNodeId, &mut Window, &mut App)>;
 type HelperHandler = Rc<dyn Fn(HelperKind, &mut Window, &mut App)>;
 
@@ -214,6 +238,7 @@ fn agent_card(
     node: &AgentNode,
     handlers: &CardHandlers,
     note: Option<&SharedString>,
+    identity_color: gpui::Hsla,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let tone = agent_state_tone(&node.state);
@@ -304,66 +329,74 @@ fn agent_card(
         .id(SharedString::from(format!("graph-card-{}", node.id)))
         .debug_selector(|| format!("graph-card-{}", node.id))
         .flex()
-        .flex_col()
         .flex_none()
-        .gap(Theme::SPACE_1)
         .w(px(196.0))
-        .p(Theme::SPACE_2)
         .rounded(Theme::RADIUS_MD)
         .border_1()
         .border_color(theme.border)
         .bg(theme.surface)
+        .overflow_hidden()
+        .child(div().flex_none().w(px(2.0)).bg(identity_color))
         .child(
             div()
                 .flex()
-                .items_center()
-                .gap(Theme::SPACE_1 + px(2.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(7.0))
-                        .rounded_full()
-                        .bg(theme.tone(tone).fg),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(Theme::TEXT_MD)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .child(node.label.clone()),
-                )
-                .child(Badge::new(agent_state_label(&node.state)).tone(tone)),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(Theme::SPACE_2)
-                .child(role_badge)
-                .child(
-                    div()
-                        .text_size(Theme::TEXT_XS)
-                        .text_color(theme.text_subtle)
-                        .child(turns),
-                ),
-        )
-        .children(reason)
-        .children(note)
-        .child(
-            div()
-                .flex()
-                .items_center()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
                 .gap(Theme::SPACE_1)
-                .pt(Theme::SPACE_0_5)
-                .children(pause)
-                .children(resume)
-                .children(talk)
-                .children(fork)
-                .child(div().flex_1())
-                .children(remove),
+                .p(Theme::SPACE_2)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(Theme::SPACE_1 + px(2.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(7.0))
+                                .rounded_full()
+                                .bg(theme.tone(tone).fg),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(Theme::TEXT_MD)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(identity_color)
+                                .child(node.label.clone()),
+                        )
+                        .child(Badge::new(agent_state_label(&node.state)).tone(tone)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(Theme::SPACE_2)
+                        .child(role_badge)
+                        .child(
+                            div()
+                                .text_size(Theme::TEXT_XS)
+                                .text_color(theme.text_subtle)
+                                .child(turns),
+                        ),
+                )
+                .children(reason)
+                .children(note)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(Theme::SPACE_1)
+                        .pt(Theme::SPACE_0_5)
+                        .children(pause)
+                        .children(resume)
+                        .children(talk)
+                        .children(fork)
+                        .child(div().flex_1())
+                        .children(remove),
+                ),
         )
 }
 
@@ -397,11 +430,11 @@ impl RenderOnce for AgentGraphView {
         let theme = Theme::of(cx);
         let handlers = &self.handlers;
 
-        let orchestrator = self
-            .graph
-            .orchestrator()
-            .map(|node| agent_card(node, handlers, self.notes.get(&node.id), &theme));
-
+        let orchestrator = self.graph.orchestrator().map(|node| {
+            let color =
+                agent_identity_color(&self.graph, node.id.as_str(), &theme).unwrap_or(theme.accent);
+            agent_card(node, handlers, self.notes.get(&node.id), color, &theme)
+        });
         let writers: Vec<&AgentNode> = self.graph.writers().collect();
         let contract_links = self
             .graph
@@ -414,8 +447,11 @@ impl RenderOnce for AgentGraphView {
             if index > 0 && contract_links > 0 {
                 writer_row.push(contract_link(&theme).into_any_element());
             }
+            let color = agent_identity_color(&self.graph, node.id.as_str(), &theme)
+                .unwrap_or_else(|| theme.agent_color(index));
             writer_row.push(
-                agent_card(node, handlers, self.notes.get(&node.id), &theme).into_any_element(),
+                agent_card(node, handlers, self.notes.get(&node.id), color, &theme)
+                    .into_any_element(),
             );
         }
         let contract_badge = (writers.len() > 1 && contract_links > 0).then(|| {
@@ -430,7 +466,12 @@ impl RenderOnce for AgentGraphView {
         let helpers: Vec<_> = self
             .graph
             .helpers()
-            .map(|node| agent_card(node, handlers, self.notes.get(&node.id), &theme))
+            .enumerate()
+            .map(|(index, node)| {
+                let color = agent_identity_color(&self.graph, node.id.as_str(), &theme)
+                    .unwrap_or_else(|| theme.agent_color(index));
+                agent_card(node, handlers, self.notes.get(&node.id), color, &theme)
+            })
             .collect();
         let add_buttons = HELPER_KINDS.into_iter().map(|kind| {
             let selector = format!("graph-add-{}", helper_kind_name(kind));
@@ -488,7 +529,7 @@ impl RenderOnce for AgentGraphView {
                     .rounded(Theme::RADIUS_MD)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.elevated)
+                    .bg(theme.raised)
                     .child(
                         div()
                             .flex()
@@ -504,7 +545,7 @@ impl RenderOnce for AgentGraphView {
                             .gap(Theme::SPACE_1)
                             .pt(Theme::SPACE_2)
                             .border_t_1()
-                            .border_color(theme.divider)
+                            .border_color(theme.border_subtle)
                             .child(
                                 div()
                                     .flex()
@@ -522,7 +563,7 @@ impl RenderOnce for AgentGraphView {
                             .gap(Theme::SPACE_1)
                             .pt(Theme::SPACE_2)
                             .border_t_1()
-                            .border_color(theme.divider)
+                            .border_color(theme.border_subtle)
                             .child(
                                 div()
                                     .flex()

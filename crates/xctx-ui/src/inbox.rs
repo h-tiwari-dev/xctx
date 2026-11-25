@@ -313,7 +313,7 @@ impl InboxPanel {
                     .children(actions),
             );
         if has_detail {
-            let hover = theme.surface_hover;
+            let hover = theme.raised;
             header = header.cursor_pointer().hover(move |style| style.bg(hover));
             if let Some(handler) = self.on_toggle.clone() {
                 let id = entry.id.clone();
@@ -380,7 +380,7 @@ impl RenderOnce for InboxPanel {
                     .rounded(Theme::RADIUS_MD)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.elevated)
+                    .bg(theme.raised)
                     .child(body),
             )
     }

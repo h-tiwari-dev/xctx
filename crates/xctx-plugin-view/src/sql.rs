@@ -150,7 +150,7 @@ fn cell(text: SharedString, header: bool, theme: &Theme) -> gpui::Div {
         .px(Theme::SPACE_1)
         .truncate()
         .border_r_1()
-        .border_color(theme.divider)
+        .border_color(theme.border_subtle)
         .child(text);
     if header {
         cell = cell
@@ -293,7 +293,7 @@ impl RenderOnce for SqlPaneView {
                             .rounded(Theme::RADIUS_SM)
                             .border_1()
                             .border_color(theme.border)
-                            .bg(theme.bg)
+                            .bg(theme.chrome)
                             .font_family("Menlo")
                             .text_size(Theme::TEXT_XS)
                             .child(head)
@@ -332,7 +332,7 @@ impl RenderOnce for SqlPaneView {
                     .gap(Theme::SPACE_2)
                     .pt(Theme::SPACE_1)
                     .border_t_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.border_subtle)
                     .child(write)
                     .children(pending)
                     .child(

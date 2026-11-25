@@ -57,6 +57,8 @@ pub struct PaneView {
     pub title: SharedString,
     /// The pane's role, shown as a badge before the title.
     pub kind: Option<PaneKind>,
+    /// Optional agent identity colour, drawn as a 2px bar on the left of the pane header.
+    pub agent_color: Option<gpui::Hsla>,
     content: AnyElement,
 }
 
@@ -67,6 +69,7 @@ impl PaneView {
             id,
             title: title.into(),
             kind: None,
+            agent_color: None,
             content: content.into_any_element(),
         }
     }
@@ -74,6 +77,12 @@ impl PaneView {
     /// Show `kind` as the pane's role badge.
     pub fn kind(mut self, kind: PaneKind) -> Self {
         self.kind = Some(kind);
+        self
+    }
+
+    /// Draw a 2px identity bar in `color` on the left edge of the pane header.
+    pub fn agent_color(mut self, color: gpui::Hsla) -> Self {
+        self.agent_color = Some(color);
         self
     }
 }
@@ -161,9 +170,14 @@ impl SplitView {
     ) -> AnyElement {
         let id = pane.id;
         let focused = pane.focused;
-        let (title, kind, content) = match view {
-            Some(view) => (view.title, view.kind, view.content),
-            None => (SharedString::default(), None, div().into_any_element()),
+        let (title, kind, agent_color, content) = match view {
+            Some(view) => (view.title, view.kind, view.agent_color, view.content),
+            None => (
+                SharedString::default(),
+                None,
+                None,
+                div().into_any_element(),
+            ),
         };
         let zoom = self.on_zoom.clone().map(|on_zoom| {
             Button::new(("pane-zoom", id.0), if zoomed { "⤡" } else { "⤢" })
@@ -183,17 +197,14 @@ impl SplitView {
             .flex_none()
             .items_center()
             .h(Theme::PANE_HEADER_HEIGHT)
-            .pl(Theme::SPACE_2)
+            .when(agent_color.is_none(), |header| header.pl(Theme::SPACE_2))
             .pr(Theme::SPACE_0_5)
             .gap(Theme::SPACE_1 + px(2.0))
-            .bg(if focused {
-                theme.elevated
-            } else {
-                theme.surface
-            })
+            .bg(if focused { theme.raised } else { theme.surface })
             .border_b_1()
-            .border_color(theme.divider)
+            .border_color(theme.border_subtle)
             .text_size(Theme::TEXT_XS)
+            .children(agent_color.map(|color| div().flex_none().w(px(2.0)).h_full().bg(color)))
             .children(
                 kind.map(|kind| Badge::new(pane_kind_label(kind)).tone(Tone::for_pane_kind(kind))),
             )
@@ -390,7 +401,7 @@ impl Element for SplitView {
         cx: &mut App,
     ) {
         let theme = prepaint.theme;
-        window.paint_quad(fill(bounds, theme.bg));
+        window.paint_quad(fill(bounds, theme.chrome));
         for pane in &mut prepaint.panes {
             pane.element.paint(window, cx);
         }
@@ -431,7 +442,7 @@ impl Element for SplitView {
                 window.set_window_cursor_style(cursor);
             }
             if hovered || dragging == Some(divider.divider.split_id) {
-                window.paint_quad(fill(divider.bounds, theme.divider_hover));
+                window.paint_quad(fill(divider.bounds, theme.accent));
             }
         }
 

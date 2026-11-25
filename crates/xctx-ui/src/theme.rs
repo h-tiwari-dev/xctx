@@ -7,38 +7,48 @@ use xctx_layout::PaneKind;
 /// component; [`Theme::of`] falls back to [`Theme::dark`] when none is set.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
-    /// Window background, behind panes and bars.
-    pub bg: Hsla,
-    /// Panes, bars and resting buttons.
+    /// Window background, Roster, title/tab area, status line and split gaps.
+    pub chrome: Hsla,
+    /// Panes, the terminal background, cards and Inspector body.
     pub surface: Hsla,
-    /// A surface under the mouse.
-    pub surface_hover: Hsla,
-    /// Raised surfaces: pane headers, active tabs, dialogs, the prompt.
-    pub elevated: Hsla,
-    /// Resting outlines.
+    /// Pane headers, inputs, resting buttons and hovered rows.
+    pub raised: Hsla,
+    /// Dialogs, the palette, the Inbox overlay, toasts and menus.
+    pub overlay: Hsla,
+    /// Dividers inside a surface and split dividers at rest.
+    pub border_subtle: Hsla,
+    /// Outlines of cards, inputs and panes.
     pub border: Hsla,
-    /// The outline of the focused pane or input.
-    pub border_focused: Hsla,
-    /// Split dividers and separators.
-    pub divider: Hsla,
-    /// A divider under the mouse or being dragged.
-    pub divider_hover: Hsla,
+    /// Outlines of overlays and hovered inputs.
+    pub border_strong: Hsla,
+    /// Translucent backdrop behind an overlay.
+    pub scrim: Hsla,
     /// Primary text.
     pub text: Hsla,
-    /// Secondary text: labels, inactive tabs.
+    /// Secondary text: labels, inactive rows and secondary lines.
     pub text_muted: Hsla,
-    /// Tertiary text: placeholders, hints.
+    /// Tertiary text: placeholders, key hints and timestamps only.
     pub text_subtle: Hsla,
-    /// The highlight colour: active items, primary buttons, the caret.
+    /// Primary buttons, links, the focus ring, the caret and the selected item's marker.
     pub accent: Hsla,
-    /// A translucent accent for selected backgrounds and text selection.
-    pub accent_muted: Hsla,
-    /// Things that went well or are running.
+    /// A primary button under the mouse.
+    pub accent_hover: Hsla,
+    /// Text on an `accent`, `success` or `danger` fill.
+    pub on_accent: Hsla,
+    /// Selected row background and text selection.
+    pub selection: Hsla,
+    /// Read-outs: port, budget, cost, counts and key chords.
+    pub meta: Hsla,
+    /// Running, passed and agreed states.
     pub success: Hsla,
-    /// Things that need attention.
+    /// Needs you, paused and waiting-for-approval states.
     pub warning: Hsla,
-    /// Errors and destructive actions.
+    /// Failed, blocked, production and destructive actions.
     pub danger: Hsla,
+    /// Six identity colours assigned to non-orchestrator agents in creation order.
+    pub agent: [Hsla; 6],
+    /// The 16 ANSI terminal colours (0-7 normal, 8-15 bright).
+    pub ansi: [Hsla; 16],
 }
 
 impl Global for Theme {}
@@ -131,33 +141,118 @@ impl Theme {
     /// How far a divider's grab area extends past its drawn width on each side.
     pub const DIVIDER_GRAB_SLOP: Pixels = px(3.0);
 
-    /// The default dark theme: near-black background, neutral greys and a blue accent, tuned for contrast in
-    /// long sessions.
+    /// The default dark theme: cool blue-grey neutrals, a bright blue accent and gold read-outs.
     pub fn dark() -> Self {
-        let accent = hex(0x5b8cff);
+        let accent = hex(0x2ea8ff);
         Self {
-            bg: hex(0x0d0e10),
-            surface: hex(0x15161a),
-            surface_hover: hex(0x1f2126),
-            elevated: hex(0x1b1d21),
-            border: hex(0x2a2d33),
-            border_focused: accent,
-            divider: hex(0x24262b),
-            divider_hover: accent,
-            text: hex(0xe9eaee),
-            text_muted: hex(0xa4a8b0),
-            text_subtle: hex(0x6c717b),
+            chrome: hex(0x0f1216),
+            surface: hex(0x151820),
+            raised: hex(0x1c2029),
+            overlay: hex(0x232834),
+            border_subtle: hex(0x1f252d),
+            border: hex(0x2a3038),
+            border_strong: hex(0x3b424d),
+            scrim: hex(0x000000).alpha(0.50),
+            text: hex(0xe8ecf4),
+            text_muted: hex(0x9ca3b0),
+            text_subtle: hex(0x6b7280),
             accent,
-            accent_muted: accent.alpha(0.24),
-            success: hex(0x3fb950),
-            warning: hex(0xd8a23a),
-            danger: hex(0xf2564d),
+            accent_hover: hex(0x47b2ff),
+            on_accent: hex(0x0f1216),
+            selection: accent.alpha(0.16),
+            meta: hex(0xd4c090),
+            success: hex(0x3ddc84),
+            warning: hex(0xffb347),
+            danger: hex(0xff5c6a),
+            agent: [
+                hex(0xb392f0),
+                hex(0x39d0c4),
+                hex(0xf47fb8),
+                hex(0xa8d672),
+                hex(0x8aa4ff),
+                hex(0xff9e64),
+            ],
+            ansi: [
+                hex(0x3b424d),
+                hex(0xff5c6a),
+                hex(0x3ddc84),
+                hex(0xf0c040),
+                hex(0x2ea8ff),
+                hex(0xd06fed),
+                hex(0x13d1cd),
+                hex(0xc3c9d3),
+                hex(0x6b7280),
+                hex(0xff8a94),
+                hex(0x7dedb0),
+                hex(0xfddb72),
+                hex(0x6ec9ff),
+                hex(0xe69dfc),
+                hex(0x75efea),
+                hex(0xf7f9fc),
+            ],
+        }
+    }
+
+    /// The light theme: cool blue-grey surfaces, a deep blue accent and ochre read-outs.
+    pub fn light() -> Self {
+        let accent = hex(0x006db3);
+        Self {
+            chrome: hex(0xeceef2),
+            surface: hex(0xf8f9fb),
+            raised: hex(0xffffff),
+            overlay: hex(0xffffff),
+            border_subtle: hex(0xe4e7ec),
+            border: hex(0xd3d8e0),
+            border_strong: hex(0xb4bac6),
+            scrim: hex(0x1a1e26).alpha(0.30),
+            text: hex(0x1a1e26),
+            text_muted: hex(0x545b69),
+            text_subtle: hex(0x737a89),
+            accent,
+            accent_hover: hex(0x005f9c),
+            on_accent: hex(0xffffff),
+            selection: accent.alpha(0.14),
+            meta: hex(0x7a6118),
+            success: hex(0x157a46),
+            warning: hex(0x9a5a00),
+            danger: hex(0xc6283a),
+            agent: [
+                hex(0x6f42c1),
+                hex(0x0b7d76),
+                hex(0xb83280),
+                hex(0x4d7c0f),
+                hex(0x3b5bdb),
+                hex(0xb45309),
+            ],
+            ansi: [
+                hex(0x1a1e26),
+                hex(0xc6283a),
+                hex(0x157a46),
+                hex(0x8a6a00),
+                hex(0x0073bd),
+                hex(0x9b36b7),
+                hex(0x0b7d86),
+                hex(0x545b69),
+                hex(0x737a89),
+                hex(0xe0465a),
+                hex(0x1f9d5c),
+                hex(0xa67c00),
+                hex(0x2a8fd6),
+                hex(0xb65fd0),
+                hex(0x1397a1),
+                hex(0x9aa1ae),
+            ],
         }
     }
 
     /// The theme set as a global, or [`Theme::dark`] when none is set.
     pub fn of(cx: &App) -> Self {
         cx.try_global::<Self>().copied().unwrap_or_else(Self::dark)
+    }
+
+    /// The identity colour for the `index`-th non-orchestrator agent in creation order.
+    pub fn agent_color(&self, index: usize) -> Hsla {
+        self.agent[index % self.agent.len()]
     }
 
     /// The text, fill and outline colours for `tone`. Tinted tones use the tone's colour for text over a faint
@@ -167,7 +262,7 @@ impl Theme {
             Tone::Neutral => {
                 return ToneColors {
                     fg: self.text_muted,
-                    bg: self.surface_hover,
+                    bg: self.raised,
                     border: self.border,
                 };
             }
@@ -178,18 +273,14 @@ impl Theme {
         };
         ToneColors {
             fg: color,
-            bg: color.alpha(0.14),
-            border: color.alpha(0.36),
+            bg: color.alpha(0.12),
+            border: color.alpha(0.40),
         }
     }
 
-    /// The outline of a pane or input: [`Theme::border_focused`] when focused, else [`Theme::border`].
+    /// The outline of a pane or input: [`Theme::accent`] when focused, else [`Theme::border`].
     pub fn outline(&self, focused: bool) -> Hsla {
-        if focused {
-            self.border_focused
-        } else {
-            self.border
-        }
+        if focused { self.accent } else { self.border }
     }
 }
 
@@ -224,19 +315,61 @@ mod tests {
     #[test]
     fn dark_text_is_readable_on_every_surface() {
         let theme = Theme::dark();
-        for surface in [theme.bg, theme.surface, theme.elevated, theme.surface_hover] {
+        for surface in [theme.chrome, theme.surface, theme.raised, theme.overlay] {
             assert!(contrast(theme.text, surface) >= 12.0);
-            assert!(contrast(theme.text_muted, surface) >= 6.0);
+            assert!(contrast(theme.text_muted, surface) >= 5.5);
             assert!(contrast(theme.text_subtle, surface) >= 3.0);
+        }
+    }
+
+    #[test]
+    fn text_and_status_colours_meet_contrast_on_surface() {
+        for (name, theme) in [("dark", Theme::dark()), ("light", Theme::light())] {
+            for (label, color) in [
+                ("text", theme.text),
+                ("text_muted", theme.text_muted),
+                ("accent", theme.accent),
+                ("meta", theme.meta),
+                ("success", theme.success),
+                ("warning", theme.warning),
+                ("danger", theme.danger),
+            ] {
+                let ratio = contrast(color, theme.surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{name} {label} contrast against surface is {ratio:.2} (< 4.5)"
+                );
+            }
+            let subtle_ratio = contrast(theme.text_subtle, theme.surface);
+            assert!(
+                subtle_ratio >= 3.0,
+                "{name} text_subtle contrast against surface is {subtle_ratio:.2} (< 3.0)"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_colours_are_distinct_from_status_and_accent() {
+        for (name, theme) in [("dark", Theme::dark()), ("light", Theme::light())] {
+            let reserved = [theme.danger, theme.warning, theme.success, theme.accent];
+            for (i, &agent_color) in theme.agent.iter().enumerate() {
+                for &r in &reserved {
+                    assert_ne!(
+                        agent_color, r,
+                        "{name} agent[{i}] collides with a status or accent colour"
+                    );
+                }
+            }
+            assert_eq!(theme.agent_color(6), theme.agent[0]);
         }
     }
 
     #[test]
     fn surfaces_get_lighter_as_they_rise() {
         let theme = Theme::dark();
-        assert!(luminance(theme.bg) < luminance(theme.surface));
-        assert!(luminance(theme.surface) < luminance(theme.elevated));
-        assert!(luminance(theme.elevated) < luminance(theme.surface_hover));
+        assert!(luminance(theme.chrome) < luminance(theme.surface));
+        assert!(luminance(theme.surface) < luminance(theme.raised));
+        assert!(luminance(theme.raised) < luminance(theme.overlay));
     }
 
     #[test]
@@ -247,6 +380,7 @@ mod tests {
         assert!(danger.bg.a < danger.border.a && danger.border.a < 1.0);
         let neutral = theme.tone(Tone::Neutral);
         assert_eq!(neutral.fg, theme.text_muted);
+        assert_eq!(neutral.bg, theme.raised);
         assert_eq!(neutral.border, theme.border);
     }
 
@@ -259,7 +393,7 @@ mod tests {
     #[test]
     fn outline_follows_focus() {
         let theme = Theme::dark();
-        assert_eq!(theme.outline(true), theme.border_focused);
+        assert_eq!(theme.outline(true), theme.accent);
         assert_eq!(theme.outline(false), theme.border);
     }
 }

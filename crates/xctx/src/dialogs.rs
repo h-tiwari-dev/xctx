@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, Context, Entity, Focusable, FontWeight, IntoElement, ParentElement, Styled, Window,
-    div, hsla, prelude::*,
+    div, prelude::*,
 };
 use xctx_core::{ShipOptions, SpaceId, Store, git};
 use xctx_ui::{Button, ButtonVariant, PromptEvent, PromptInput, Theme};
@@ -527,7 +527,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(hsla(0.0, 0.0, 0.0, 0.55))
+                .bg(theme.scrim)
                 .occlude()
                 .child(body)
                 .into_any_element(),

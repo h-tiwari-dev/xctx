@@ -210,7 +210,7 @@ impl RenderOnce for PluginMenu {
                     .gap(Theme::SPACE_2)
                     .py(Theme::SPACE_1)
                     .border_b_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.border_subtle)
                     .child(
                         div()
                             .flex()
@@ -343,7 +343,7 @@ impl RenderOnce for PluginMenu {
             .rounded(Theme::RADIUS_LG)
             .border_1()
             .border_color(theme.border)
-            .bg(theme.elevated)
+            .bg(theme.overlay)
             .child(
                 div()
                     .flex()

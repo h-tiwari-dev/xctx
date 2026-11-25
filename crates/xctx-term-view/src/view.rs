@@ -144,6 +144,14 @@ impl TerminalView {
         }))
     }
 
+    /// Replace the colours this terminal draws with and repaint.
+    pub fn set_theme(&mut self, theme: TerminalTheme, cx: &mut Context<Self>) {
+        if self.theme != theme {
+            self.theme = theme;
+            cx.notify();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         session: Arc<TerminalSession>,

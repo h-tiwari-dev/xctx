@@ -169,9 +169,9 @@ impl AttemptStrip {
 
 fn chip_shell(id: SharedString, active: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     let (bg, border) = if active {
-        (theme.accent_muted, theme.accent.alpha(0.55))
+        (theme.selection, theme.accent.alpha(0.55))
     } else {
-        (theme.elevated, theme.border)
+        (theme.raised, theme.border)
     };
     div()
         .id(id)
@@ -208,7 +208,7 @@ impl RenderOnce for AttemptStrip {
             })
             .child(if space_active { "▸ Space" } else { "Space" });
         if let Some(handler) = self.on_select.clone() {
-            let hover = theme.surface_hover;
+            let hover = theme.raised;
             space = space
                 .cursor_pointer()
                 .hover(move |style| style.bg(hover))
@@ -257,7 +257,7 @@ impl RenderOnce for AttemptStrip {
                     });
                 }
                 if let Some(handler) = self.on_select.clone().filter(|_| chip.state.can_select()) {
-                    let hover = theme.surface_hover;
+                    let hover = theme.raised;
                     element = element
                         .cursor_pointer()
                         .hover(move |style| style.bg(hover))
@@ -293,7 +293,7 @@ impl RenderOnce for AttemptStrip {
             .px(Theme::SPACE_2)
             .py(Theme::SPACE_1)
             .border_b_1()
-            .border_color(theme.divider)
+            .border_color(theme.border_subtle)
             .bg(theme.surface)
             .child(
                 div()

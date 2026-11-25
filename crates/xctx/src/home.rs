@@ -488,7 +488,7 @@ impl Workspace {
                 card(&theme)
                     .id(("space-card", index))
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.surface_hover))
+                    .hover(|style| style.bg(theme.raised))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.show_space(&id, window, cx)),
                     )
@@ -642,7 +642,7 @@ fn row(theme: &Theme) -> Div {
         .px(Theme::SPACE_3)
         .py(Theme::SPACE_2)
         .rounded(Theme::RADIUS_MD)
-        .bg(theme.elevated)
+        .bg(theme.raised)
 }
 
 fn notice(message: String, color: gpui::Hsla, theme: &Theme) -> Div {

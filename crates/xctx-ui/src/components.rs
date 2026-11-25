@@ -39,21 +39,13 @@ pub struct ButtonColors {
     pub border: Hsla,
 }
 
-/// Raise a colour's lightness by `amount` (0 to 1), keeping hue, saturation and alpha.
-fn lighten(color: Hsla, amount: f32) -> Hsla {
-    Hsla {
-        l: (color.l + amount).clamp(0.0, 1.0),
-        ..color
-    }
-}
-
 impl ButtonVariant {
     /// The colours of this variant in `theme`. A `selected` button (a toggled pill, the current tab) shows the
     /// accent whatever its variant.
     pub fn colors(self, theme: &Theme, selected: bool) -> ButtonColors {
         if selected {
             return ButtonColors {
-                bg: theme.accent_muted,
+                bg: theme.selection,
                 bg_hover: theme.accent.alpha(0.32),
                 fg: theme.text,
                 border: theme.accent.alpha(0.55),
@@ -62,19 +54,19 @@ impl ButtonVariant {
         match self {
             Self::Primary => ButtonColors {
                 bg: theme.accent,
-                bg_hover: lighten(theme.accent, 0.06),
-                fg: theme.bg,
+                bg_hover: theme.accent_hover,
+                fg: theme.on_accent,
                 border: theme.accent,
             },
             Self::Secondary => ButtonColors {
-                bg: theme.elevated,
-                bg_hover: theme.surface_hover,
+                bg: theme.raised,
+                bg_hover: theme.border_subtle,
                 fg: theme.text,
                 border: theme.border,
             },
             Self::Ghost => ButtonColors {
                 bg: transparent_black(),
-                bg_hover: theme.surface_hover,
+                bg_hover: theme.raised,
                 fg: theme.text_muted,
                 border: transparent_black(),
             },
@@ -388,7 +380,7 @@ mod tests {
         for variant in VARIANTS {
             assert_eq!(variant.colors(&theme, true), selected);
         }
-        assert_eq!(selected.bg, theme.accent_muted);
+        assert_eq!(selected.bg, theme.selection);
     }
 
     #[test]
@@ -396,23 +388,10 @@ mod tests {
         let theme = Theme::dark();
         let primary = ButtonVariant::Primary.colors(&theme, false);
         assert_eq!(primary.bg, theme.accent);
-        assert!(primary.bg_hover.l > primary.bg.l);
+        assert_eq!(primary.bg_hover, theme.accent_hover);
+        assert_eq!(primary.fg, theme.on_accent);
         assert_eq!(ButtonVariant::Danger.colors(&theme, false).fg, theme.danger);
         assert_eq!(ButtonVariant::Ghost.colors(&theme, false).bg.a, 0.0);
-    }
-
-    #[test]
-    fn lighten_clamps_and_keeps_alpha() {
-        let color = Hsla {
-            h: 0.5,
-            s: 0.5,
-            l: 0.97,
-            a: 0.4,
-        };
-        let lighter = lighten(color, 0.1);
-        assert_eq!(lighter.l, 1.0);
-        assert_eq!(lighter.a, 0.4);
-        assert_eq!(lighter.h, 0.5);
     }
 
     #[test]
