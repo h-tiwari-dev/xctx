@@ -1,0 +1,12 @@
+# omp (oh-my-pi), the agent xctx runs by default. omp cannot create a session under an id xctx chooses (it has no
+# `--session-id`), so xctx cannot open or fork its sessions, and attempts are not offered for it; pick the `pi`
+# runner for a space or lane that needs attempts.
+name = "omp"
+description = "omp coding agent: a task and resume, without named sessions or forks (no attempts)"
+program = "omp"
+
+# The first message follows `--`: `omp -- <task>`.
+task = { style = "after-double-dash" }
+
+# Resume the worktree's most recent session.
+resume = ["--continue"]

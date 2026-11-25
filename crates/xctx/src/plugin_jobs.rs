@@ -426,6 +426,7 @@ impl Workspace {
                             view,
                             title: None,
                             exited: None,
+                            after_agent: false,
                             _subscription: subscription,
                         }
                     }
@@ -1041,8 +1042,8 @@ impl Workspace {
     // ---------------------------------------------------------------------------------------------------------
     // Runners
 
-    /// The runner chosen for agent `agent` of `space` (its lane's, else the space's), `None` for `pi`. Fails
-    /// when the chosen runner is not installed.
+    /// The runner chosen for agent `agent` of `space` (its lane's, else the space's), `None` for the default
+    /// ([`xctx_plugin::DEFAULT_RUNNER`]). Fails when the chosen runner is not installed.
     pub(crate) fn lane_runner(
         &mut self,
         space: &Space,
@@ -1071,7 +1072,7 @@ impl Workspace {
     }
 
     /// The runner agent pane `pane` of `space` runs (see [`Workspace::lane_runner`]), with a notice when the one
-    /// chosen is not installed and `pi` runs instead.
+    /// chosen is not installed and the default runner runs instead.
     pub(crate) fn pane_runner(
         &mut self,
         space: &Space,
@@ -1091,7 +1092,11 @@ impl Workspace {
             Ok(runner) => (runner, None),
             Err(e) => (
                 None,
-                Some(format!("{e}; the {} agent runs pi", pane.role.repo)),
+                Some(format!(
+                    "{e}; the {} agent runs {}",
+                    pane.role.repo,
+                    xctx_plugin::DEFAULT_RUNNER
+                )),
             ),
         }
     }
@@ -1126,14 +1131,14 @@ impl Workspace {
     }
 }
 
-/// Why a writer running the runner named `chosen` (its lane's, else its space's; `None` for `pi`, which forks)
-/// cannot be forked into attempts, if it cannot: the runner is not installed, or its own "cannot fork
-/// sessions" message.
+/// Why a writer running the runner named `chosen` (its lane's, else its space's; `None` for the default,
+/// [`xctx_plugin::DEFAULT_RUNNER`]) cannot be forked into attempts, if it cannot: the runner is not installed, or
+/// its own "cannot fork sessions" message.
 pub(crate) fn runner_fork_refusal(
     chosen: Option<&str>,
     runners: &xctx_plugin::RunnerRegistry,
 ) -> Option<String> {
-    let name = chosen?;
+    let name = chosen.unwrap_or(xctx_plugin::DEFAULT_RUNNER);
     match runners.get(name) {
         None => Some(format!("the runner {name} is not installed")),
         Some(runner) if !runner.manifest.can_fork() => Some(
@@ -1150,9 +1155,9 @@ pub(crate) fn runner_fork_refusal(
 /// The plugin panes' side: what they show and what they do. The panes (`plugin_panes.rs`) read these before a
 /// frame and call them from their buttons; the Plugins menu (`plugin_menu_dialog.rs`) lists the plugins.
 impl Workspace {
-    /// Choose the runner of space `id` (`agent` `None`) or of one of its lanes, `None` for the default (`pi`,
-    /// or the space's). The change applies the next time the agent's pane starts. Refused for a runner that is
-    /// not installed.
+    /// Choose the runner of space `id` (`agent` `None`) or of one of its lanes, `None` for the default (the
+    /// space's for a lane, else [`xctx_plugin::DEFAULT_RUNNER`]). The change applies the next time the agent's
+    /// pane starts. Refused for a runner that is not installed.
     #[allow(dead_code)] // No caller yet: the runner picker and its control method are still to come.
     pub(crate) fn set_runner(
         &mut self,
@@ -1412,5 +1417,19 @@ mod tests {
         assert!(restored_write(&g, "sql.write", &args, Some(4)).is_none());
         let (g, args) = gate("not json");
         assert!(restored_write(&g, "sql.write", &args, None).is_none());
+    }
+
+    #[test]
+    fn writers_on_the_default_runner_cannot_fork_but_pi_writers_can() {
+        let runners = xctx_plugin::RunnerRegistry::with_builtins();
+        assert_eq!(
+            runner_fork_refusal(None, &runners).as_deref(),
+            Some("runner omp cannot fork sessions, so attempts are not available")
+        );
+        assert_eq!(runner_fork_refusal(Some("pi"), &runners), None);
+        assert_eq!(
+            runner_fork_refusal(Some("codex"), &runners).as_deref(),
+            Some("the runner codex is not installed")
+        );
     }
 }

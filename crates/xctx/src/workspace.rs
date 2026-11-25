@@ -22,7 +22,6 @@ use crate::attempt_ui::shown_worktree;
 use crate::attempts::SpaceAttempts;
 use crate::control::{Control, PendingDraft, PendingMaskedRead};
 use crate::dialogs::Dialog;
-use crate::home::HomeDraft;
 use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
@@ -70,12 +69,7 @@ pub(crate) struct Workspace {
     pub(crate) index: RepoIndex,
     pub(crate) scanning: bool,
     scan_generation: u64,
-    /// A task typed while the index was being built, drafted once it is.
-    pub(crate) pending_task: Option<String>,
-    pub(crate) draft: HomeDraft,
-    pub(crate) task_prompt: Entity<PromptInput>,
     pub(crate) root_input: Entity<PromptInput>,
-    pub(crate) repo_input: Entity<PromptInput>,
     pub(crate) view: View,
     /// Open space tabs, by space; a space's terminals start when it is first shown.
     pub(crate) tabs: HashMap<SpaceId, SpaceTab>,
@@ -168,41 +162,18 @@ impl Workspace {
             .map(|store| store.dir().to_path_buf())
             .or_else(|| xctx_core::store::data_dir().ok());
         let (inbox, inbox_error) = Workspace::open_inbox();
-        let task_prompt = cx.new(|cx| {
-            PromptInput::new(cx)
-                .placeholder("What do you want to do? e.g. add rate limiting to checkout")
-        });
         let root_input =
             cx.new(|cx| PromptInput::new(cx).placeholder("A folder with your repos, e.g. ~/code"));
-        let repo_input =
-            cx.new(|cx| PromptInput::new(cx).placeholder("Path to another repo to add"));
         let plan_repo_input = cx.new(|cx| {
             PromptInput::new(cx).placeholder("Add a repo to the plan: an indexed name or a path")
         });
         let subscriptions = vec![
-            cx.subscribe_in(
-                &task_prompt,
-                window,
-                |this, _, event: &PromptEvent, window, cx| match event {
-                    PromptEvent::Submit(task) => this.submit_task(task.clone(), cx),
-                    PromptEvent::Cancel => this.cancel_draft(window, cx),
-                },
-            ),
             cx.subscribe_in(
                 &root_input,
                 window,
                 |this, _, event: &PromptEvent, _, cx| {
                     if let PromptEvent::Submit(path) = event {
                         this.add_root(path.clone(), cx);
-                    }
-                },
-            ),
-            cx.subscribe_in(
-                &repo_input,
-                window,
-                |this, _, event: &PromptEvent, _, cx| {
-                    if let PromptEvent::Submit(path) = event {
-                        this.add_repo_path(path.clone(), cx);
                     }
                 },
             ),
@@ -241,11 +212,7 @@ impl Workspace {
             index: RepoIndex::default(),
             scanning: false,
             scan_generation: 0,
-            pending_task: None,
-            draft: HomeDraft::default(),
-            task_prompt,
             root_input,
-            repo_input,
             view: View::Home,
             tabs: HashMap::new(),
             dialog: None,
@@ -307,8 +274,7 @@ impl Workspace {
         workspace.refresh_spaces();
         workspace.check_mise_at_startup(cx);
         workspace.rescan(cx);
-        let prompt_focus = workspace.task_prompt.focus_handle(cx);
-        prompt_focus.focus(window, cx);
+        workspace.focus_home(window, cx);
         workspace
     }
 
@@ -443,9 +409,6 @@ impl Workspace {
                 this.index = index;
                 this.scanning = false;
                 this.flush_control_drafts(cx);
-                if let Some(task) = this.pending_task.take() {
-                    this.submit_task(task, cx);
-                }
                 cx.notify();
             });
         })
@@ -457,9 +420,16 @@ impl Workspace {
     pub(crate) fn show_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.view = View::Home;
         self.close_idle_dialog();
-        let focus = self.task_prompt.focus_handle(cx);
-        focus.focus(window, cx);
+        self.focus_home(window, cx);
         cx.notify();
+    }
+
+    /// Give keyboard focus to Home's input: the Parent Agent's terminal, else the window.
+    pub(crate) fn focus_home(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.parent.view {
+            Some(view) => view.focus_handle(cx).focus(window, cx),
+            None => self.focus_handle.focus(window, cx),
+        }
     }
 
     /// Show the space's tab, starting its terminals if this is the first time.
@@ -728,8 +698,11 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &LaunchDraft, window, cx| {
-                if this.view == View::Home && this.draft.get().is_some() {
-                    this.launch_draft(window, cx);
+                if this.view == View::Home
+                    && this.dialog.is_none()
+                    && this.reviewed_plan().is_some()
+                {
+                    this.approve_plan(window, cx);
                 } else {
                     cx.propagate();
                 }

@@ -1,5 +1,5 @@
-# pi, the agent xctx runs by default. These arguments are exactly the ones xctx built for pi before runners
-# existed, so every session it named keeps opening and forking the same way.
+# pi, the runner for spaces and lanes that need attempts: it names and forks sessions. These arguments are exactly
+# the ones xctx built for pi before runners existed, so every session it named keeps opening and forking the same way.
 name = "pi"
 description = "pi coding agent: named sessions, resume, and forks (so attempts are available)"
 program = "pi"

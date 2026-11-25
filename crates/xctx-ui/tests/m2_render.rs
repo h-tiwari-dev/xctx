@@ -278,33 +278,25 @@ fn a_launching_plan_ignores_everything_but_later(cx: &mut TestAppContext) {
 
 struct DrawerHost {
     status: AgentStatus,
-    open: bool,
     log: Log,
 }
 
 impl Render for DrawerHost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let (toggle, restart) = (self.log.clone(), self.log.clone());
+        let restart = self.log.clone();
         div().size_full().p_4().child(
             ParentAgentDrawer::new(self.status.clone())
-                .open(self.open)
                 .body(div().debug_selector(|| "parent-body".into()).size_full())
-                .on_toggle(move |_, _| log(&toggle, "toggle"))
                 .on_restart(move |_, _| log(&restart, "restart")),
         )
     }
 }
 
-fn drawer(
-    cx: &mut TestAppContext,
-    status: AgentStatus,
-    open: bool,
-) -> (Log, &mut VisualTestContext) {
+fn drawer(cx: &mut TestAppContext, status: AgentStatus) -> (Log, &mut VisualTestContext) {
     let events: Log = Rc::default();
     let host_log = events.clone();
     let (_host, cx) = cx.add_window_view(move |_, _| DrawerHost {
         status,
-        open,
         log: host_log,
     });
     cx.run_until_parked();
@@ -312,35 +304,22 @@ fn drawer(
 }
 
 #[gpui::test]
-fn a_running_agent_shows_its_terminal_when_open_and_offers_no_restart(cx: &mut TestAppContext) {
-    let (events, cx) = drawer(cx, AgentStatus::Running, true);
+fn a_running_agent_shows_its_terminal_and_offers_no_restart(cx: &mut TestAppContext) {
+    let (_events, cx) = drawer(cx, AgentStatus::Running);
     assert!(cx.debug_bounds("parent-body").is_some());
     assert!(cx.debug_bounds("parent-restart").is_none());
-    assert!(click(cx, "parent-toggle"));
-    assert_eq!(*events.borrow(), ["toggle"]);
-}
-
-#[gpui::test]
-fn a_closed_drawer_hides_the_terminal(cx: &mut TestAppContext) {
-    let (_events, cx) = drawer(cx, AgentStatus::Running, false);
-    assert!(cx.debug_bounds("parent-body").is_none());
-    assert!(cx.debug_bounds("parent-toggle").is_some());
 }
 
 #[gpui::test]
 fn a_stopped_agent_can_be_restarted(cx: &mut TestAppContext) {
-    let (events, cx) = drawer(cx, AgentStatus::Exited(Some(1)), true);
+    let (events, cx) = drawer(cx, AgentStatus::Exited(Some(1)));
     assert!(click(cx, "parent-restart"));
     assert_eq!(*events.borrow(), ["restart"]);
 }
 
 #[gpui::test]
 fn an_unavailable_agent_says_why_instead_of_a_terminal(cx: &mut TestAppContext) {
-    let (_events, cx) = drawer(
-        cx,
-        AgentStatus::Unavailable("pi was not found".into()),
-        true,
-    );
+    let (_events, cx) = drawer(cx, AgentStatus::Unavailable("omp was not found".into()));
     assert!(cx.debug_bounds("parent-body").is_none());
     assert!(cx.debug_bounds("parent-restart").is_some());
 }

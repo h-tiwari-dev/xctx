@@ -475,6 +475,7 @@ impl Workspace {
                     view,
                     title: None,
                     exited: None,
+                    after_agent: false,
                     _subscription: subscription,
                 }
             }

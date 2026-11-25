@@ -1218,7 +1218,8 @@ impl Workspace {
         })
     }
 
-    /// `space.draft`: draft a space and post it to the Inbox as a Plan Gate. Never launches.
+    /// `space.draft`: draft a space, post it to the Inbox as a Plan Gate, and show it on Home under the Parent
+    /// Agent when no other plan is shown there. Never launches.
     fn control_draft(
         &mut self,
         params: &SpaceDraftParams,
@@ -1236,16 +1237,17 @@ impl Workspace {
         let id = inbox
             .post(body, None, Source::Agent)
             .map_err(|e| RpcError::internal(format!("could not post to the Inbox: {e}")))?;
-        let message = if draft.repos.is_empty() {
-            format!(
-                "\"{}\" is waiting in the Inbox; no repo matched, add one before approving",
+        let shown = self.offer_plan(id.clone());
+        let message = match (shown, draft.repos.is_empty()) {
+            (true, true) => format!(
+                "\"{}\" is drafted on Home; no repo matched, add one before launching",
                 draft.title
-            )
-        } else {
-            format!(
-                "\"{}\" is waiting in the Inbox for your approval",
+            ),
+            (true, false) => format!("\"{}\" is drafted on Home; ⌘↵ launches it", draft.title),
+            (false, _) => format!(
+                "\"{}\" is waiting in the Inbox; launch or set aside the plan on Home first",
                 draft.title
-            )
+            ),
         };
         self.info(message, cx);
         cx.notify();

@@ -78,9 +78,9 @@ impl Fixture {
         make_repo(&web, "web frontend\n")?;
         let bin = root.join("bin");
         fs::create_dir_all(&bin)?;
-        let pi = bin.join("pi");
-        fs::write(&pi, "#!/bin/sh\n")?;
-        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755))?;
+        let omp = bin.join("omp");
+        fs::write(&omp, "#!/bin/sh\n")?;
+        fs::set_permissions(&omp, fs::Permissions::from_mode(0o755))?;
         let search = ProgramSearch {
             path: vec![bin],
             home: Some(root.join("home")),
@@ -138,7 +138,7 @@ fn a_space_lives_from_draft_to_discard() -> TestResult {
     assert_eq!(agents.len(), 2);
     assert!(store.load_layout(&space.id)?.is_some());
 
-    // The programs launch starts: pi with the task in each repo's worktree, shells beside them.
+    // The programs launch starts: omp with the task in each repo's worktree, shells beside them.
     for pane in &launched.panes {
         let start = AgentStart::Task(space.task.clone());
         let launch = pane_launch(&space, &pane.role, &start, &fixture.search);
@@ -162,7 +162,7 @@ fn a_space_lives_from_draft_to_discard() -> TestResult {
             PaneKind::Agent => {
                 assert_eq!(
                     launch.config.program,
-                    fixture.root.join("bin/pi").to_string_lossy()
+                    fixture.root.join("bin/omp").to_string_lossy()
                 );
                 assert_eq!(launch.config.args, ["--".to_owned(), space.task.clone()]);
             }

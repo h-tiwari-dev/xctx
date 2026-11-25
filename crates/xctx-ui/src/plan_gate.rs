@@ -1,5 +1,5 @@
-//! The Plan Gate card: a proposed space, which the user edits and then approves (launching it) or rejects.
-//! Nothing runs until Approve.
+//! The Plan Gate card: a proposed space, which the user edits and then launches (approving it) or rejects.
+//! Nothing runs until Launch.
 
 use std::rc::Rc;
 
@@ -41,11 +41,11 @@ pub struct PlanGateView {
 }
 
 /// What the card says while there is no repo to launch in.
-pub const PLAN_NEEDS_REPO: &str = "Add a repo before approving; the plan has none.";
+pub const PLAN_NEEDS_REPO: &str = "Add a repo before launching; the plan has none.";
 
 /// The line under the buttons.
 pub const PLAN_GATE_HINT: &str =
-    "Nothing runs until you approve. Each repo gets its own worktree on space/<slug>.";
+    "Nothing runs until you launch. Each repo gets its own worktree on space/<slug>.";
 
 type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 type ShapeHandler = Rc<dyn Fn(Shape, &mut Window, &mut App)>;
@@ -106,7 +106,7 @@ impl PlanGateCard {
         self
     }
 
-    /// Call `handler` when Approve & launch is clicked.
+    /// Call `handler` when Launch is clicked.
     pub fn on_approve(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_approve = Some(Rc::new(handler));
         self
@@ -235,7 +235,7 @@ impl RenderOnce for PlanGateCard {
                 )
         });
 
-        let mut approve = Button::new("plan-approve", "Approve & launch")
+        let mut approve = Button::new("plan-approve", "Launch ⌘↵")
             .variant(ButtonVariant::Primary)
             .size(ButtonSize::Large)
             .disabled(!can_approve)

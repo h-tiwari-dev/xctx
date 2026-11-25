@@ -7,9 +7,9 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
 **Milestone 2 (complete):** xctx is now an agent-drivable harness (all 4 waves implemented, reviewed, and hardened):
 
 - **Control socket and `xctx-ctl`.** Agents and scripts can list spaces, read and change layouts on open spaces, draft spaces and post to the Inbox. Every pane gets `XCTX_CONTROL_SOCKET` and has `xctx-ctl` on its `PATH`.
-- **Parent Agent on Home.** A `pi` session in a drawer running outside the data directory, told its advisory no-code role and given only its read and bash tools. It drafts spaces through `xctx-ctl space.draft` and cannot launch anything.
+- **Parent Agent on Home.** An `omp` session in a drawer running outside the data directory, told its advisory no-code role and given only its read and bash tools. It drafts spaces through `xctx-ctl space.draft` and cannot launch anything.
 - **Inbox on Home.** The status bar shows how many items are pending. The Inbox holds four kinds of item:
-  - **Plan Gates.** Review opens a card where you change the shape, drop or add repos, then Approve & launch or Reject.
+  - **Plan Gates.** A new draft opens as a card on Home under the Parent Agent (or Review opens it from the Inbox), where you change the shape, drop or add repos, then Launch (⌘↵) or Reject.
   - **Missing mise variables.** Each comes with mise's own help text. Set value writes `{ value = ..., redact = true }` into the space's git-ignored `mise.<slug>.toml`.
   - **Notices** from agents (bounded cap).
   - **Space widenings** are shown, but approving them is not supported yet.
@@ -26,6 +26,8 @@ write waits for approval in the Inbox. A plugin's events can start or stop the s
 [`docs/m5.md`](docs/m5.md).
 
 No further milestone is planned yet; see [`docs/roadmap.md`](docs/roadmap.md).
+
+**Agents.** Agent panes run `omp` by default (the built-in `omp` runner: a task, and `omp --continue` on reopen). omp cannot create a session under an id xctx chooses, so spaces on the default runner get no Fork or attempts; for those, set `"runner": "pi"` on the space (or on one agent) in `spaces/<slug>/graph.json` in the data directory. When an agent exits on its own (you quit it), its pane opens your login shell in the same worktree, with the space's environment; the agent starts again the next time the space opens.
 
 ## Prerequisites
 
@@ -77,8 +79,8 @@ mise run ctl -- --compact inbox.list all=true      # put options after --
 - `xctx-ctl` prints the result as JSON. Exit status: `0` ok, `1` the window refused the request, `2` bad arguments, `3` no window is running.
 - In a pane of xctx, `xctx-ctl` is already on `PATH`, and `XCTX_CONTROL_SOCKET` points at its window.
 - A request about a space that is not open yet opens its tab first, which starts its panes. `layout.get` is the exception: it reads the saved layout and starts nothing.
-- The Parent Agent runs in `parent-agent/` inside the data directory and resumes its session there (`pi --continue`). Its model and billing are whatever your `pi` is set up to use.
-- Nothing on the socket can approve or launch. `space.draft` posts a Plan Gate to the Inbox, and the space launches only when you approve it in the window.
+- The Parent Agent runs in `<data dir>-parent-agent` beside the data directory and resumes its session there (`omp --continue`). Its model and billing are whatever your `omp` is set up to use.
+- Nothing on the socket can approve or launch. `space.draft` posts a Plan Gate to the Inbox and shows it on Home under the Parent Agent, and the space launches only when you press Launch (⌘↵) in the window.
 
 ### Trying it without touching your spaces
 

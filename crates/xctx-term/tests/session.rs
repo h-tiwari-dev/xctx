@@ -92,6 +92,8 @@ fn exit_status_and_event_are_reported() {
     let (session, events) = spawn(sh("exit 3"));
     assert!(session.wait_for_exit(TIMEOUT));
     assert!(!session.is_alive());
+    // It ended on its own: nobody asked it to stop.
+    assert!(!session.is_shutting_down());
     let status = session.exit_status().expect("status collected");
     assert_eq!(status.code(), Some(3));
 
@@ -223,6 +225,7 @@ fn shutdown_and_wait_returns_once_a_cooperative_program_exits() {
         "waited past the exit"
     );
     assert!(!session.is_alive());
+    assert!(session.is_shutting_down());
     assert!(process_is_gone(pid), "program not reaped");
 }
 

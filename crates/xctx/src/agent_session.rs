@@ -236,8 +236,10 @@ impl AgentSession {
     }
 }
 
-/// The `pi` arguments for an agent pane started as `start` in `session`. A task (or an attempt's instruction)
-/// follows `--` as the first message.
+/// The `pi` arguments xctx built for an agent pane started as `start` in `session` before runners existed. A task
+/// (or an attempt's instruction) follows `--` as the first message. Kept for tests: the built-in `pi` runner must
+/// build exactly these.
+#[cfg(test)]
 pub fn agent_args(start: &AgentStart, session: &AgentSession) -> Vec<String> {
     let mut args = match session {
         AgentSession::Unnamed => match start {
