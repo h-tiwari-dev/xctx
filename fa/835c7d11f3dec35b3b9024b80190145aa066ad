@@ -1,0 +1,22 @@
+crates/xctx-ui/src/bin/gallery.rs
+  h_5a0a1d6be5b4d2 55,94,314,340-364,423,709,740
+crates/xctx-ui/src/frame_overlay.rs
+  h_5a0a1d6be5b4d2 373
+crates/xctx-ui/src/overlay.rs
+  h_5a0a1d6be5b4d2 11,213,220,222
+crates/xctx-ui/src/toast.rs
+  h_5a0a1d6be5b4d2 426,473
+crates/xctx/src/main.rs
+  h_5a0a1d6be5b4d2 36,42-72,74-81,83-90,92-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "fa835c7d11f3dec35b3b9024b80190145aa066ad",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
