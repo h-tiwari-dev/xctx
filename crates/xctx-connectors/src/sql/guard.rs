@@ -3,8 +3,10 @@
 //! The first guard is the tool's own read-only mode (`sqlite3 -readonly -safe`, or psql with
 //! `default_transaction_read_only=on`); this check catches mistakes early and with a clear message, and keeps
 //! the command-line tools' own commands (sqlite's `.shell`, psql's `\!`) out of reach. It reads the statement
-//! the way the database would: quoted strings, quoted identifiers, dollar-quoted bodies and comments are skipped,
-//! so a `;` or a keyword inside them does not count.
+//! the way the database would: quoted strings, dollar-quoted bodies and comments are skipped, so a `;` or a
+//! keyword inside them does not count (block comments nest in PostgreSQL but not in SQLite). A quoted identifier
+//! is a name, not a keyword, except that one used as a function (`"pg_read_file"(...)`) is checked against the
+//! deny lists like an unquoted one.
 
 use crate::error::{ConnectorError, Result};
 
@@ -21,7 +23,8 @@ pub enum SqlDialect {
 const SQLITE_READ_START: &[&str] = &["SELECT", "WITH", "EXPLAIN", "PRAGMA", "VALUES"];
 const POSTGRES_READ_START: &[&str] = &["SELECT", "WITH", "EXPLAIN", "SHOW", "TABLE", "VALUES"];
 
-/// PRAGMAs that only read, when called without `=`.
+/// PRAGMAs that only read, when called without `=` and without an argument (with an argument, some of them,
+/// such as `user_version(5)` or `journal_mode(WAL)`, set a value).
 const READ_PRAGMAS: &[&str] = &[
     "TABLE_INFO",
     "TABLE_XINFO",
@@ -48,6 +51,21 @@ const READ_PRAGMAS: &[&str] = &[
     "ENCODING",
     "JOURNAL_MODE",
     "FOREIGN_KEYS",
+];
+
+/// The [`READ_PRAGMAS`] that may take an argument, because the argument only says what to read
+/// (`table_info(users)`, `foreign_key_check(orders)`, `integrity_check(10)`).
+const ARG_PRAGMAS: &[&str] = &[
+    "TABLE_INFO",
+    "TABLE_XINFO",
+    "TABLE_LIST",
+    "INDEX_LIST",
+    "INDEX_INFO",
+    "INDEX_XINFO",
+    "FOREIGN_KEY_LIST",
+    "FOREIGN_KEY_CHECK",
+    "INTEGRITY_CHECK",
+    "QUICK_CHECK",
 ];
 
 /// Words that are never part of a read, wherever they appear (a data-changing `WITH`, `EXPLAIN ANALYZE`,
@@ -99,16 +117,35 @@ const FORBIDDEN_ALWAYS: &[&str] = &[
     "PG_STAT_FILE",
     "LO_IMPORT",
     "LO_EXPORT",
-    "DBLINK",
-    "DBLINK_EXEC",
 ];
+
+/// Prefixes of words refused in reads and writes alike: whole families of functions that reach files, large
+/// objects or other databases (`dblink_connect`, `dblink_send_query`, `lo_import`, `pg_ls_dir`,
+/// `pg_read_file`, `pg_file_write`, `pg_stat_file`), and `COPY`.
+const FORBIDDEN_PREFIXES: &[&str] = &[
+    "DBLINK",
+    "LO_",
+    "PG_LS_",
+    "PG_READ_",
+    "PG_FILE",
+    "PG_STAT_FILE",
+    "COPY",
+];
+
+/// True for a word (or the content of a quoted name) refused in every statement.
+fn forbidden_always(word: &str) -> bool {
+    FORBIDDEN_ALWAYS.contains(&word) || FORBIDDEN_PREFIXES.iter().any(|p| word.starts_with(p))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
     /// An unquoted word, upper-cased.
     Word(String),
-    /// A string, a quoted identifier or a number.
+    /// A string or a number.
     Lit,
+    /// A quoted identifier (`"name"`, and for SQLite `` `name` `` and `[name]`): its content, unescaped and
+    /// upper-cased, so a quoted function name such as `"pg_read_file"(...)` is checked like an unquoted one.
+    Ident(String),
     /// Any other character.
     Punct(u8),
 }
@@ -154,6 +191,14 @@ fn lex(sql: &str, dialect: SqlDialect) -> Result<Lexed> {
                     i += 1;
                 }
             }
+            // PostgreSQL nests block comments; SQLite ends one at the first `*/`.
+            b'/' if b.get(i + 1) == Some(&b'*') && dialect == SqlDialect::Sqlite => {
+                let close = b[i + 2..]
+                    .windows(2)
+                    .position(|w| w == b"*/")
+                    .ok_or_else(|| refuse("a /* comment is not closed"))?;
+                i += 2 + close + 2;
+            }
             b'/' if b.get(i + 1) == Some(&b'*') => {
                 let mut depth = 0;
                 loop {
@@ -186,15 +231,27 @@ fn lex(sql: &str, dialect: SqlDialect) -> Result<Lexed> {
                 }
                 push(&mut toks, Tok::Lit, start, i)?;
             }
+            b'&' if dialect == SqlDialect::Postgres
+                && matches!(toks.last(), Some(Tok::Word(w)) if w == "U")
+                && start > 0
+                && matches!(b[start - 1], b'u' | b'U')
+                && matches!(b.get(i + 1), Some(b'"' | b'\'')) =>
+            {
+                return Err(refuse(
+                    "U&'...' and U&\"...\" (names and strings with unicode escapes) are not allowed",
+                ));
+            }
             b'"' => {
                 i = close_quote(b, i + 1, b'"', false)
                     .ok_or_else(|| refuse("a quoted name is not closed"))?;
-                push(&mut toks, Tok::Lit, start, i)?;
+                let name = quoted_name(&sql[start + 1..i - 1], "\"\"", "\"");
+                push(&mut toks, Tok::Ident(name), start, i)?;
             }
             b'`' if dialect == SqlDialect::Sqlite => {
                 i = close_quote(b, i + 1, b'`', false)
                     .ok_or_else(|| refuse("a quoted name is not closed"))?;
-                push(&mut toks, Tok::Lit, start, i)?;
+                let name = quoted_name(&sql[start + 1..i - 1], "``", "`");
+                push(&mut toks, Tok::Ident(name), start, i)?;
             }
             b'[' if dialect == SqlDialect::Sqlite => {
                 i = b[i..]
@@ -202,7 +259,8 @@ fn lex(sql: &str, dialect: SqlDialect) -> Result<Lexed> {
                     .position(|&x| x == b']')
                     .map(|p| i + p + 1)
                     .ok_or_else(|| refuse("a [quoted name] is not closed"))?;
-                push(&mut toks, Tok::Lit, start, i)?;
+                let name = quoted_name(&sql[start + 1..i - 1], "]]", "]");
+                push(&mut toks, Tok::Ident(name), start, i)?;
             }
             b'$' if dialect == SqlDialect::Postgres && dollar_tag(b, i).is_some() => {
                 let tag_end = dollar_tag(b, i).unwrap_or(i + 1);
@@ -245,6 +303,11 @@ fn lex(sql: &str, dialect: SqlDialect) -> Result<Lexed> {
         }
     }
     Ok(Lexed { toks, span })
+}
+
+/// The content of a quoted name with its doubled quote unescaped, upper-cased.
+fn quoted_name(inner: &str, doubled: &str, quote: &str) -> String {
+    inner.replace(doubled, quote).to_ascii_uppercase()
 }
 
 /// The index just past the closing `quote` of a quoted run starting at `i`; a doubled quote is an escaped one.
@@ -294,12 +357,21 @@ fn checked(sql: &str, dialect: SqlDialect) -> Result<(Lexed, &str)> {
             "a statement must start with an SQL keyword (the tools' own dot and backslash commands are not allowed)",
         ));
     }
-    if let Some(w) = words(&lexed).find(|w| FORBIDDEN_ALWAYS.contains(w)) {
+    if let Some(w) = names(&lexed).find(|w| forbidden_always(w)) {
         return Err(refuse(format!(
             "{w} is not allowed: it reaches outside the database"
         )));
     }
     Ok((lexed, &sql[start..end]))
+}
+
+/// The unquoted words, and the quoted names used as functions (followed by `(`), of a statement.
+fn names(lexed: &Lexed) -> impl Iterator<Item = &str> {
+    lexed.toks.iter().enumerate().filter_map(|(i, t)| match t {
+        Tok::Word(w) => Some(w.as_str()),
+        Tok::Ident(name) if lexed.toks.get(i + 1) == Some(&Tok::Punct(b'(')) => Some(name.as_str()),
+        _ => None,
+    })
 }
 
 fn words(lexed: &Lexed) -> impl Iterator<Item = &str> {
@@ -315,8 +387,9 @@ fn words(lexed: &Lexed) -> impl Iterator<Item = &str> {
 /// Allowed: `SELECT`, `WITH`, `EXPLAIN` and `VALUES`; for SQLite, the read-only `PRAGMA`s (such as
 /// `table_info(x)`) without `=`; for PostgreSQL, `SHOW` and `TABLE`. Refused: several statements, any
 /// statement that writes (also inside `WITH`, or as `EXPLAIN ANALYZE`, `SELECT INTO`), `ATTACH`, `COPY`,
-/// functions that reach files or other databases (`readfile`, `pg_read_file`, `dblink`, ...), and the tools'
-/// own commands (`.shell`, `\!`).
+/// functions that reach files, large objects or other databases (`readfile`, `pg_read_*`, `pg_ls_*`, `lo_*`,
+/// `dblink*`, ...), also when the function name is quoted (`"pg_read_file"(...)`), PostgreSQL's `U&` escapes,
+/// `PRAGMA`s that set a value (`journal_mode(WAL)`), and the tools' own commands (`.shell`, `\!`).
 pub fn check_read_statement(sql: &str, dialect: SqlDialect) -> Result<String> {
     let (lexed, statement) = checked(sql, dialect)?;
     let first = match lexed.toks.first() {
@@ -335,7 +408,7 @@ pub fn check_read_statement(sql: &str, dialect: SqlDialect) -> Result<String> {
     }
     if first == "PRAGMA" {
         check_read_pragma(&lexed.toks)?;
-    } else if let Some(w) = words(&lexed).find(|w| FORBIDDEN_IN_READ.contains(w)) {
+    } else if let Some(w) = names(&lexed).find(|w| FORBIDDEN_IN_READ.contains(w)) {
         return Err(refuse(format!(
             "{w} is not allowed in sql.read (writes go through sql.write and the Inbox)"
         )));
@@ -343,15 +416,19 @@ pub fn check_read_statement(sql: &str, dialect: SqlDialect) -> Result<String> {
     Ok(statement.to_owned())
 }
 
-/// `PRAGMA [schema.]name` or `PRAGMA [schema.]name(arg)`, with `name` in [`READ_PRAGMAS`].
+/// `PRAGMA [schema.]name` with `name` in [`READ_PRAGMAS`], or `PRAGMA [schema.]name(arg)` with `name` in
+/// [`ARG_PRAGMAS`].
 fn check_read_pragma(toks: &[Tok]) -> Result<()> {
     let bad = || {
-        refuse("only read-only PRAGMAs such as table_info(name), without =, may run in sql.read")
+        refuse(
+            "only read-only PRAGMAs such as table_info(name) or user_version, without = or a value to set, \
+             may run in sql.read",
+        )
     };
     let rest = &toks[1..];
     let (name, after) = match rest {
         [
-            Tok::Word(_) | Tok::Lit,
+            Tok::Word(_) | Tok::Ident(_),
             Tok::Punct(b'.'),
             Tok::Word(name),
             after @ ..,
@@ -364,7 +441,11 @@ fn check_read_pragma(toks: &[Tok]) -> Result<()> {
     }
     match after {
         [] => Ok(()),
-        [Tok::Punct(b'('), Tok::Word(_) | Tok::Lit, Tok::Punct(b')')] => Ok(()),
+        [
+            Tok::Punct(b'('),
+            Tok::Word(_) | Tok::Lit | Tok::Ident(_),
+            Tok::Punct(b')'),
+        ] if ARG_PRAGMAS.contains(&name.as_str()) => Ok(()),
         _ => Err(bad()),
     }
 }
@@ -480,6 +561,79 @@ mod tests {
             "SELECT nextval('s')",
         ] {
             read_refused(sql, Postgres);
+        }
+    }
+
+    #[test]
+    fn function_families_and_quoted_function_names_are_refused() {
+        for d in [Sqlite, Postgres] {
+            for sql in [
+                "SELECT \"pg_read_file\"('/etc/passwd')",
+                "SELECT dblink_connect('c','x'), dblink_send_query('c','DROP TABLE t')",
+                "SELECT \"PG_LS_DIR\"('/')",
+                "SELECT lo_from_bytea(0, 'x')",
+                "SELECT lo_put(1, 0, 'x')",
+                "SELECT pg_ls_logdir()",
+                "SELECT pg_read_server_files()",
+                "SELECT pg_file_write('/tmp/x', 'y', false)",
+                "SELECT pg_stat_file('/etc/passwd')",
+                "SELECT \"dblink\"('x', 'y')",
+                "SELECT \"Pg_Read_Binary_File\"('x')",
+                "COPY t TO STDOUT",
+            ] {
+                read_refused(sql, d);
+                assert!(check_write_statement(sql, d).is_err(), "{d:?}: {sql}");
+            }
+        }
+        for sql in ["SELECT `readfile`('x')", "SELECT [writefile]('x', 'y')"] {
+            read_refused(sql, Sqlite);
+        }
+        // Reads may not change settings, however the function is named.
+        read_refused(
+            "SELECT pg_catalog.\"set_config\"('default_transaction_read_only', 'off', false)",
+            Postgres,
+        );
+        read_refused("SELECT U&\"\\0070g_read_file\"('/etc/passwd')", Postgres);
+        read_refused("SELECT U&'\\0041'", Postgres);
+        // Quoted names that are only names stay usable.
+        read_ok("SELECT \"delete\", \"copy\" FROM \"into\"", Postgres);
+        read_ok("SELECT menu&1 FROM t", Postgres);
+    }
+
+    #[test]
+    fn sqlite_comments_do_not_nest_but_postgres_ones_do() {
+        let sql = "SELECT 1 /* /* */ ; DELETE FROM t; -- */";
+        read_refused(sql, Sqlite);
+        assert!(check_write_statement(sql, Sqlite).is_err());
+        assert_eq!(read_ok(sql, Postgres), "SELECT 1");
+        assert_eq!(read_ok("SELECT 1 /* a /* b */", Sqlite), "SELECT 1");
+        read_refused("SELECT 1 /* a /* b */", Postgres);
+    }
+
+    #[test]
+    fn pragmas_take_an_argument_only_when_it_names_what_to_read() {
+        for sql in [
+            "PRAGMA table_info(users)",
+            "PRAGMA main.table_xinfo(users)",
+            "PRAGMA index_list('users')",
+            "PRAGMA foreign_key_check(orders)",
+            "PRAGMA integrity_check(10)",
+            "PRAGMA \"main\".index_info(\"idx\")",
+            "PRAGMA journal_mode",
+            "PRAGMA user_version",
+        ] {
+            read_ok(sql, Sqlite);
+        }
+        for sql in [
+            "PRAGMA journal_mode(WAL)",
+            "PRAGMA user_version(5)",
+            "PRAGMA application_id(7)",
+            "PRAGMA main.foreign_keys(0)",
+            "PRAGMA page_size(1024)",
+            "PRAGMA encoding('UTF-16')",
+            "PRAGMA user_version = 5",
+        ] {
+            read_refused(sql, Sqlite);
         }
     }
 

@@ -6513,6 +6513,7 @@ dependencies = [
 name = "xctx-connectors"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "regex",
  "serde",
  "serde_json",
@@ -6599,6 +6600,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "toml 1.2.2+spec-1.1.0",

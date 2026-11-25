@@ -309,6 +309,12 @@ fn download(url: &str, path: &PathBuf, figma: &Figma, ctx: &BuiltinContext) -> R
             "the image is on {host}, which is not an allowed host"
         )));
     }
+    let https = url::Url::parse(url).is_ok_and(|u| u.scheme() == "https");
+    if !https && !rest::is_loopback(&host) {
+        return Err(ConnectorError::Refused(format!(
+            "the image URL {url} is not https"
+        )));
+    }
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)

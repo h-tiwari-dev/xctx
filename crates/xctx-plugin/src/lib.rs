@@ -37,7 +37,7 @@ pub use manifest::{
     Effect, EventMatcher, EventSpec, LoopAction, MANIFEST_FILE, Manifest, PaneSpec, ParamKind,
     ParamSpec, Pattern, Scope, SqlEngine, ToolAction, ToolSpec,
 };
-pub use registry::{LoadProblem, Plugin, REPO_PLUGINS_DIR, Registry, Source};
+pub use registry::{LoadProblem, Plugin, REPO_PLUGINS_DIR, Registry, Source, manifest_hash};
 pub use run::{ToolOutput, run_plan};
 pub use runner::{
     ArgsTemplate, BUILTIN_RUNNERS, Capability, DEFAULT_RUNNER, RUNNER_FILE, Runner, RunnerError,

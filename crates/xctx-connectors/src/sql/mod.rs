@@ -4,10 +4,12 @@
 //!   opens the file read-only, so a write fails even if the text guard were bypassed; `-safe` turns off
 //!   `ATTACH`, dot-commands that reach the system, and functions such as `writefile` and `load_extension`; and
 //!   `-init /dev/null` keeps the user's `~/.sqliterc` out.
-//! - PostgreSQL: `psql -X --no-password -v ON_ERROR_STOP=1 -P pager=off --csv -d <url> -c <statement>`, with
-//!   `PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=<ms>'` for reads. The URL comes from
-//!   the database setting or `DATABASE_URL`; its password is passed in `PGPASSWORD`, never on the command line.
-//!   `-X` keeps the user's `~/.psqlrc` out.
+//! - PostgreSQL: `psql -X --no-password -v ON_ERROR_STOP=1 -P pager=off --csv -d <url> -c <statement>`. The
+//!   session settings go in the URL's own `options` parameter (`statement_timeout`,
+//!   `standard_conforming_strings=on`, and for reads `default_transaction_read_only=on`), and a read first runs
+//!   `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`; a URL that sets `options`, `service` or another
+//!   parameter that changes the session is refused. The URL comes from the database setting or `DATABASE_URL`;
+//!   its password is passed in `PGPASSWORD`, never on the command line. `-X` keeps the user's `~/.psqlrc` out.
 //!
 //! [`check_read_statement`] and [`check_write_statement`] are the second guard, on the text.
 
@@ -40,8 +42,8 @@ const PSQL: &str = "psql";
 pub struct Database {
     /// The engine, which picks the command-line tool.
     pub engine: SqlEngine,
-    /// For SQLite, the database file: relative to the worktree unless absolute; a relative path may not leave
-    /// the worktree. For PostgreSQL, a `postgres://` URL, or empty to use `DATABASE_URL` from the space's
+    /// For SQLite, the database file, relative to the worktree and inside it; absolute (or outside it) only when
+    /// [`crate::BuiltinContext::user_paths`] is true. For PostgreSQL, a `postgres://` URL, or empty to use `DATABASE_URL` from the space's
     /// secrets or env.
     pub location: String,
 }
@@ -243,7 +245,57 @@ fn sqlite_command(path: &Path, statement: &str, mode: Mode) -> Command {
     }
 }
 
+/// Query parameters a postgres URL may carry: where and how to connect. Anything else is refused, above all
+/// `options` (which could turn read-only off), `service` and `servicefile` (which load settings, `options`
+/// among them, from a file), `password` (which belongs in the URL's user part, so it can be moved off the
+/// command line) and `dbname` (which libpq may read as a whole connection string).
+const URL_PARAMS: &[&str] = &[
+    "host",
+    "hostaddr",
+    "port",
+    "user",
+    "application_name",
+    "fallback_application_name",
+    "client_encoding",
+    "connect_timeout",
+    "keepalives",
+    "keepalives_idle",
+    "keepalives_interval",
+    "keepalives_count",
+    "tcp_user_timeout",
+    "target_session_attrs",
+    "load_balance_hosts",
+    "sslmode",
+    "sslnegotiation",
+    "sslcompression",
+    "sslcert",
+    "sslkey",
+    "sslrootcert",
+    "sslcrl",
+    "sslcrldir",
+    "sslsni",
+    "requirepeer",
+    "ssl_min_protocol_version",
+    "ssl_max_protocol_version",
+    "gssencmode",
+    "krbsrvname",
+    "gsslib",
+    "gssdelegation",
+    "channel_binding",
+    "require_auth",
+];
+
+/// The statement every read runs first, in the same session, so it stays read-only whatever the server or the
+/// role defaults to.
+const READ_ONLY_SESSION: &str = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY";
+
 /// The psql command for `url`, and the password taken out of the URL.
+///
+/// The session settings travel in the URL's own `options` parameter, which libpq ranks above `PGOPTIONS`, a
+/// service file and the server's and role's defaults: `statement_timeout` and `standard_conforming_strings=on`
+/// (so backslashes in strings mean what the guard read them as) always, and `default_transaction_read_only=on`
+/// for reads, which also run [`READ_ONLY_SESSION`] as a separate `-c` before the statement. A URL that sets
+/// `options`, `service` or any parameter outside [`URL_PARAMS`] is refused.
 fn psql_command(
     url: &str,
     statement: &str,
@@ -259,10 +311,39 @@ fn psql_command(
     if !matches!(parsed.scheme(), "postgres" | "postgresql") {
         return Err(bad("it is not a postgres:// URL"));
     }
+    if parsed.fragment().is_some() {
+        return Err(bad("it has a #fragment"));
+    }
     let password = parsed.password().map(percent_decode);
     parsed
         .set_password(None)
         .map_err(|_| bad("its password cannot be separated"))?;
+
+    // Keep the allowed parameters as they were written (libpq decodes only %XX, not `+`), then add `options`.
+    let mut query: Vec<String> = Vec::new();
+    for pair in parsed.query().unwrap_or("").split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = percent_decode(pair.split_once('=').map_or(pair, |(k, _)| k));
+        if !URL_PARAMS.contains(&key.as_str()) {
+            return Err(bad(&format!(
+                "it sets `{key}`, which xctx does not pass on (it could change how the session runs)"
+            )));
+        }
+        query.push(pair.to_owned());
+    }
+    let timeout_ms = timeout.as_millis().max(1);
+    let mut options = String::new();
+    if mode == Mode::Read {
+        options.push_str("-c default_transaction_read_only=on ");
+    }
+    options.push_str(&format!(
+        "-c statement_timeout={timeout_ms} -c standard_conforming_strings=on"
+    ));
+    query.push(format!("options={}", percent_encode(&options)));
+    parsed.set_query(Some(&query.join("&")));
+
     let mut argv: Vec<String> = [
         PSQL,
         "-X",
@@ -281,16 +362,14 @@ fn psql_command(
     }
     argv.push("-d".to_owned());
     argv.push(parsed.to_string());
+    if mode == Mode::Read {
+        argv.push("-c".to_owned());
+        argv.push(READ_ONLY_SESSION.to_owned());
+    }
     argv.push("-c".to_owned());
     argv.push(statement.to_owned());
 
-    let timeout_ms = timeout.as_millis().max(1);
-    let mut options = format!("-c statement_timeout={timeout_ms}");
-    if mode == Mode::Read {
-        options = format!("-c default_transaction_read_only=on {options}");
-    }
     let mut env = BTreeMap::from([
-        ("PGOPTIONS".to_owned(), options),
         ("PGCONNECT_TIMEOUT".to_owned(), "10".to_owned()),
         ("PGAPPNAME".to_owned(), "xctx".to_owned()),
     ]);
@@ -298,6 +377,19 @@ fn psql_command(
         env.insert("PGPASSWORD".to_owned(), p.clone());
     }
     Ok((Command { argv, env }, password))
+}
+
+/// `s` with every byte other than an unreserved URL character written as `%XX`.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn percent_decode(s: &str) -> String {
@@ -775,17 +867,18 @@ mod tests {
                 "--csv",
                 "-q",
                 "-d",
-                "postgres://app@db.local:5433/app_dev?sslmode=disable",
+                "postgres://app@db.local:5433/app_dev?sslmode=disable&options=\
+                 -c%20default_transaction_read_only%3Don%20-c%20statement_timeout%3D30000\
+                 %20-c%20standard_conforming_strings%3Don",
+                "-c",
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
                 "-c",
                 "SELECT 1"
             ]
         );
         assert!(!cmd.argv.iter().any(|a| a.contains("cret")));
         assert_eq!(cmd.env["PGPASSWORD"], "s@cret-pw");
-        assert_eq!(
-            cmd.env["PGOPTIONS"],
-            "-c default_transaction_read_only=on -c statement_timeout=30000"
-        );
+        assert!(!cmd.env.contains_key("PGOPTIONS"));
 
         let (cmd, _) = psql_command(
             "postgresql://localhost/app",
@@ -794,7 +887,17 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        assert_eq!(cmd.env["PGOPTIONS"], "-c statement_timeout=5000");
+        assert_eq!(
+            cmd.argv[cmd.argv.len() - 4..],
+            [
+                "-d",
+                "postgresql://localhost/app?options=-c%20statement_timeout%3D5000\
+                 %20-c%20standard_conforming_strings%3Don",
+                "-c",
+                "UPDATE t SET a = 1"
+            ]
+        );
+        assert!(!cmd.argv.iter().any(|a| a.contains("READ ONLY")));
         assert!(!cmd.argv.contains(&"-q".to_owned()));
         assert!(!cmd.env.contains_key("PGPASSWORD"));
 
@@ -804,6 +907,40 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn postgres_urls_cannot_change_how_the_session_runs() {
+        for url in [
+            "postgres://u@h/db?options=-c%20default_transaction_read_only%3Doff",
+            "postgres://u@h/db?sslmode=require&options=-c+default_transaction_read_only=off",
+            "postgres://u@h/db?%6Fptions=x",
+            "postgres://u@h/db?service=prod",
+            "postgres://u@h/db?servicefile=/tmp/evil",
+            "postgres://u@h/db?password=x",
+            "postgres://u@h/db?dbname=postgres://u@h/x%3Foptions%3Dx",
+            "postgres://u@h/db?unknown=1",
+            "postgres://u@h/db#x",
+        ] {
+            for mode in [Mode::Read, Mode::Write] {
+                let err =
+                    psql_command(url, "SELECT 1", mode, Duration::from_secs(1)).expect_err(url);
+                assert!(matches!(err, ConnectorError::NotConfigured(_)), "{url}");
+            }
+        }
+        let (cmd, _) = psql_command(
+            "postgres://u@h/db?sslmode=verify-full&sslrootcert=/a+b.pem&application_name=x",
+            "SELECT 1",
+            Mode::Read,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let url = &cmd.argv[cmd.argv.iter().position(|a| a == "-d").unwrap() + 1];
+        assert!(
+            url.starts_with("postgres://u@h/db?sslmode=verify-full&sslrootcert=/a+b.pem&application_name=x&options="),
+            "{url}"
+        );
+        assert_eq!(url.matches("options=").count(), 1);
     }
 
     #[test]

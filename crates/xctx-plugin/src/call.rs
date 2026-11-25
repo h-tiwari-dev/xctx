@@ -4,7 +4,8 @@
 //! Placeholders fill whole argv elements only, and no shell is ever involved, so an argument can never become
 //! more than the one element it was put in: `"; rm -rf /"`, spaces, newlines and `{other}` stay literal text. A
 //! `strings` parameter, whose placeholder is a whole element, becomes one element per item. An element naming an
-//! optional parameter the call left out is dropped.
+//! optional parameter the call left out is dropped. A value that would start an element with `-` (and so be read
+//! as an option by the program) is refused unless the parameter sets `allow_dash`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -282,6 +283,18 @@ fn check_args(spec: &ToolSpec, args: &Map<String, Value>) -> Result<BTreeMap<Str
                 ArgValue::One(s.clone())
             }
             (ParamKind::Integer, Value::Number(n)) => match n.as_i64() {
+                Some(i) if param.min.is_some_and(|min| i < min) => {
+                    return Err(bad(&format!(
+                        "must be at least {}",
+                        param.min.unwrap_or_default()
+                    )));
+                }
+                Some(i) if param.max.is_some_and(|max| i > max) => {
+                    return Err(bad(&format!(
+                        "must be at most {}",
+                        param.max.unwrap_or_default()
+                    )));
+                }
                 Some(i) => ArgValue::One(i.to_string()),
                 None => return Err(bad("expected a whole number")),
             },
@@ -333,6 +346,30 @@ fn context_value(var: CtxVar, ctx: &CallContext) -> Result<String> {
     }
 }
 
+/// Refuse a value starting with `-` at the start of an argv element, unless its parameter allows it or is an
+/// integer.
+fn check_dash(spec: &ToolSpec, name: &str, value: Option<&ArgValue>) -> Result<()> {
+    let Some(param) = spec.param(name) else {
+        return Ok(());
+    };
+    if param.allow_dash || param.kind == ParamKind::Integer {
+        return Ok(());
+    }
+    let dashed = match value {
+        Some(ArgValue::One(s)) => s.starts_with('-'),
+        Some(ArgValue::Many(list)) => list.iter().any(|s| s.starts_with('-')),
+        None => false,
+    };
+    if dashed {
+        return Err(PluginError::BadParam {
+            tool: spec.name.clone(),
+            param: name.to_owned(),
+            message: "must not start with `-`: the program would read it as an option".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn fill_argv(
     spec: &ToolSpec,
     template: &[String],
@@ -346,6 +383,9 @@ fn fill_argv(
             field: element.clone(),
             message,
         })?;
+        if let Some(Piece::Param(name)) = pieces.first() {
+            check_dash(spec, name, values.get(name))?;
+        }
         if let [Piece::Param(name)] = pieces.as_slice() {
             match values.get(name) {
                 Some(ArgValue::Many(list)) => argv.extend(list.iter().cloned()),

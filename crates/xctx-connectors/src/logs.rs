@@ -254,7 +254,8 @@ impl LogBuffer {
 pub enum LogSource {
     /// A logs pane's buffer, filled from its command.
     Buffer(LogBuffer),
-    /// A file, relative to the worktree unless absolute. Only its last 8 MiB are read. Lines are timed by the
+    /// A regular file (not a FIFO or a device), relative to the worktree and inside it; absolute only when
+    /// [`BuiltinContext::user_paths`] is true. Only its last 8 MiB are read. Lines are timed by the
     /// timestamp they carry (ISO 8601 near the start, or a JSON `time`/`timestamp`/`ts` field; without a zone
     /// it is taken as UTC); a line without one takes the previous line's.
     File(String),
@@ -361,6 +362,7 @@ pub(crate) fn query_at(
 
     let json = json!({
         "source": label,
+        "truncated": false,
         "lines": shown.iter().map(|(l, lv)| json!({
             "at_ms": l.at_ms,
             "level": lv.map(Level::name),
@@ -382,9 +384,22 @@ pub(crate) fn query_at(
 }
 
 fn read_file(path: &std::path::Path) -> Result<Vec<LogLine>> {
+    use std::os::unix::fs::OpenOptionsExt;
     let io = |e: std::io::Error| ConnectorError::Io(format!("reading {}: {e}", path.display()));
-    let mut file = File::open(path).map_err(io)?;
-    let len = file.metadata().map_err(io)?.len();
+    // Opened without blocking, so a FIFO (which would wait for a writer forever) is seen and refused below.
+    let mut file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(io)?;
+    let meta = file.metadata().map_err(io)?;
+    if !meta.is_file() {
+        return Err(ConnectorError::Refused(format!(
+            "{} is not a regular file, so logs.query does not read it",
+            path.display()
+        )));
+    }
+    let len = meta.len();
     let seeked = len > MAX_FILE_BYTES;
     if seeked {
         file.seek(SeekFrom::Start(len - MAX_FILE_BYTES))
@@ -726,6 +741,50 @@ mod tests {
             query_at(&Map::new(), &ctx, now),
             Err(ConnectorError::NotConfigured(_))
         ));
+    }
+
+    #[test]
+    fn only_regular_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.log");
+        let c = std::ffi::CString::new(fifo.display().to_string()).unwrap();
+        // SAFETY: mkfifo only reads the NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let mut ctx = BuiltinContext::new(dir.path());
+        ctx.logs = Some(LogSource::File("pipe.log".to_owned()));
+        let start = std::time::Instant::now();
+        assert!(matches!(
+            query_at(&Map::new(), &ctx, 0),
+            Err(ConnectorError::Refused(_))
+        ));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        ctx.logs = Some(LogSource::File("folder".to_owned()));
+        assert!(query_at(&Map::new(), &ctx, 0).is_err());
+    }
+
+    #[test]
+    fn the_json_of_many_lines_is_capped() {
+        let b = LogBuffer::new(5_000);
+        for i in 0..5_000 {
+            b.push(format!("INFO line {i:05} {}", "x".repeat(100)));
+        }
+        let mut ctx = BuiltinContext::new("/nonexistent");
+        ctx.logs = Some(LogSource::Buffer(b));
+        ctx.max_output_bytes = 32 * 1024;
+        let out = crate::run_builtin("logs.query", &args(json!({"limit": 5000})), &ctx).unwrap();
+        let len = serde_json::to_string(&out.json).unwrap().len();
+        assert!(len <= 32 * 1024, "{len}");
+        assert_eq!(out.json["truncated"], true);
+        let lines = texts(&out);
+        assert!(lines.len() > 100, "{}", lines.len());
+        assert_eq!(out.json["returned"], lines.len());
+        assert_eq!(out.json["matched"], 5000);
+        assert!(lines.last().unwrap().starts_with("INFO line 04999"));
+        assert!(out.text.len() <= 32 * 1024);
+
+        let out = crate::run_builtin("logs.query", &args(json!({"limit": 3})), &ctx).unwrap();
+        assert_eq!(out.json["truncated"], false);
     }
 
     #[test]

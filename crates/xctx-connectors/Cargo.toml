@@ -5,6 +5,7 @@ edition.workspace = true
 description = "The built-in plugin tools that run inside the app without a window: logs.query, sql.read and sql.write (through sqlite3 and psql), and the Jira and Figma connectors"
 
 [dependencies]
+libc = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

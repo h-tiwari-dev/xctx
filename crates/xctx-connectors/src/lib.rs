@@ -9,6 +9,10 @@
 //! [`BuiltinContext::approved`] is true. The app sets it only after the user approved the call in an Inbox
 //! gate; nothing on the control socket may set it.
 //!
+//! **Paths.** A log file or sqlite database must be relative to the worktree and stay in it, unless
+//! [`BuiltinContext::user_paths`] says the user chose it. Jira and Figma base URLs must be `https`, except on
+//! loopback.
+//!
 //! **Masking.** The returned text, JSON, event details and error messages are masked with the context's
 //! redactor and with the tokens the connectors used, so they can be shown as they are.
 
@@ -98,6 +102,10 @@ pub struct BuiltinContext {
     /// A folder `frame.export` downloads the image into (the space's artifacts). Without it, only the URL is
     /// returned.
     pub scratch_dir: Option<PathBuf>,
+    /// True only when the paths in [`BuiltinContext::logs`] and [`BuiltinContext::database`] came from the user
+    /// (a mount the user made or approved), not from an agent. Only then may they be absolute and point outside
+    /// the worktree; otherwise they must be relative and stay inside it. False by default.
+    pub user_paths: bool,
 }
 
 impl BuiltinContext {
@@ -118,6 +126,7 @@ impl BuiltinContext {
             logs: None,
             database: None,
             scratch_dir: None,
+            user_paths: false,
         }
     }
 
@@ -131,21 +140,32 @@ impl BuiltinContext {
     }
 
     /// `path` resolved against the worktree. A relative path that leaves the worktree (through `..` or a
-    /// symlink) is refused; an absolute path is taken as given, since the user or the app chose it.
+    /// symlink) is refused. An absolute path is taken as given only when [`BuiltinContext::user_paths`] says the
+    /// user chose it; otherwise it is refused.
     pub(crate) fn resolve_path(&self, path: &str) -> Result<PathBuf> {
         let given = Path::new(path);
         if path.trim().is_empty() {
             return Err(ConnectorError::BadArgs("the path is empty".to_owned()));
         }
+        let outside = if self.user_paths {
+            "give an absolute path to use a file outside it"
+        } else {
+            "only the user can mount a file outside it"
+        };
         if given.is_absolute() {
-            return Ok(given.to_path_buf());
+            if self.user_paths {
+                return Ok(given.to_path_buf());
+            }
+            return Err(ConnectorError::Refused(format!(
+                "{path} is an absolute path; it must be relative to the worktree ({outside})"
+            )));
         }
         if given
             .components()
             .any(|c| matches!(c, Component::ParentDir))
         {
             return Err(ConnectorError::Refused(format!(
-                "{path} leaves the worktree; give an absolute path to use a file outside it"
+                "{path} leaves the worktree; {outside}"
             )));
         }
         let joined = self.worktree.join(given);
@@ -153,7 +173,7 @@ impl BuiltinContext {
             && !real.starts_with(&root)
         {
             return Err(ConnectorError::Refused(format!(
-                "{path} points outside the worktree; give an absolute path to use a file outside it"
+                "{path} points outside the worktree; {outside}"
             )));
         }
         Ok(joined)
@@ -172,7 +192,9 @@ pub struct BuiltinEvent {
 /// What a built-in call produced.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BuiltinOutput {
-    /// The structured result, masked; its shape is documented per built-in.
+    /// The structured result, masked; its shape is documented per built-in. Serialized, it is at most
+    /// [`BuiltinContext::max_output_bytes`]: when it would be longer, rows are dropped from the end (log lines
+    /// from the start, keeping the newest) and `truncated` is set to true.
     pub json: Value,
     /// A plain-text rendering for agents and panes, masked, at most [`BuiltinContext::max_output_bytes`].
     pub text: String,
@@ -204,6 +226,7 @@ pub fn run_builtin(
     match result {
         Ok(mut out) => {
             masker.redact_json(&mut out.json);
+            cap_json(&mut out.json, ctx.max_output_bytes);
             out.text = cap_text(masker.redact(&out.text).into_owned(), ctx.max_output_bytes);
             for event in &mut out.events {
                 event.detail = masker.redact(&event.detail).into_owned();
@@ -275,6 +298,91 @@ fn require_approval(name: &str, ctx: &BuiltinContext) -> Result<()> {
     }
 }
 
+/// The lists [`cap_json`] shortens, with the count kept next to each, and whether the oldest entries go first
+/// (`logs.query` returns the newest lines last, so those are kept).
+const CAPPED_LISTS: &[(&str, Option<&str>, bool)] = &[
+    ("lines", Some("returned"), true),
+    ("rows", Some("row_count"), false),
+    ("comments", None, true),
+    ("children", None, false),
+    ("texts", None, false),
+    ("styles", None, false),
+];
+
+/// The shortest a string is cut to when cutting lists was not enough.
+const MIN_CAPPED_STRING: usize = 64;
+
+fn json_len(value: &Value) -> usize {
+    serde_json::to_string(value).map_or(usize::MAX, |s| s.len())
+}
+
+/// Make the serialized `json` at most `cap` bytes, when it is an object: drop entries of its lists (rows from
+/// the end, log lines and comments from the start, see [`CAPPED_LISTS`]), then cut its longest strings, and set
+/// `truncated: true` when anything was dropped.
+pub(crate) fn cap_json(json: &mut Value, cap: usize) {
+    if json_len(json) <= cap {
+        return;
+    }
+    let Value::Object(map) = json else { return };
+    map.insert("truncated".to_owned(), Value::Bool(true));
+    for (list, count, oldest_first) in CAPPED_LISTS {
+        let Some(Value::Array(items)) = map.get(*list) else {
+            continue;
+        };
+        let all = items.clone();
+        let keep = |n: usize| -> Vec<Value> {
+            if *oldest_first {
+                all[all.len() - n..].to_vec()
+            } else {
+                all[..n].to_vec()
+            }
+        };
+        // The most entries that fit: binary search on how many are kept.
+        let (mut lo, mut hi) = (0, all.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            map.insert((*list).to_owned(), Value::Array(keep(mid)));
+            if json_len(&Value::Object(map.clone())) <= cap {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        map.insert((*list).to_owned(), Value::Array(keep(lo)));
+        if let Some(count) = count
+            && map.contains_key(*count)
+        {
+            map.insert((*count).to_owned(), Value::from(lo));
+        }
+        if json_len(&Value::Object(map.clone())) <= cap {
+            return;
+        }
+    }
+    let mut longest = cap;
+    while json_len(&Value::Object(map.clone())) > cap && longest > MIN_CAPPED_STRING {
+        longest /= 2;
+        for v in map.values_mut() {
+            cut_strings(v, longest.max(MIN_CAPPED_STRING));
+        }
+    }
+}
+
+fn cut_strings(value: &mut Value, max: usize) {
+    match value {
+        Value::String(s) if s.len() > max => {
+            let mut end = max;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            s.push('…');
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| cut_strings(v, max)),
+        Value::Object(map) => map.values_mut().for_each(|v| cut_strings(v, max)),
+        _ => {}
+    }
+}
+
 /// `text` cut to at most `cap` bytes on a character boundary, with a note when cut.
 pub(crate) fn cap_text(mut text: String, cap: usize) -> String {
     const NOTE: &str = "\n[output truncated]";
@@ -326,15 +434,58 @@ mod tests {
         let ctx = BuiltinContext::new(dir.path());
         assert!(ctx.resolve_path("../x").is_err());
         assert_eq!(ctx.resolve_path("a/b").unwrap(), dir.path().join("a/b"));
-        assert_eq!(
-            ctx.resolve_path("/etc/hosts").unwrap(),
-            Path::new("/etc/hosts")
-        );
         std::os::unix::fs::symlink("/etc", dir.path().join("out")).unwrap();
         assert!(matches!(
             ctx.resolve_path("out/hosts"),
             Err(ConnectorError::Refused(_))
         ));
+    }
+
+    #[test]
+    fn absolute_paths_only_when_the_user_gave_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = BuiltinContext::new(dir.path());
+        assert!(!ctx.user_paths);
+        assert!(matches!(
+            ctx.resolve_path("/etc/hosts"),
+            Err(ConnectorError::Refused(_))
+        ));
+        let inside = dir.path().join("a.log").display().to_string();
+        assert!(matches!(
+            ctx.resolve_path(&inside),
+            Err(ConnectorError::Refused(_))
+        ));
+        ctx.user_paths = true;
+        assert_eq!(
+            ctx.resolve_path("/etc/hosts").unwrap(),
+            Path::new("/etc/hosts")
+        );
+        assert!(ctx.resolve_path("../x").is_err());
+    }
+
+    #[test]
+    fn json_is_capped_by_dropping_entries() {
+        let mut v = serde_json::json!({
+            "rows": (0..1000).map(|i| serde_json::json!([i, "x".repeat(20)])).collect::<Vec<_>>(),
+            "row_count": 1000,
+            "truncated": false,
+        });
+        cap_json(&mut v, 2000);
+        assert!(json_len(&v) <= 2000, "{}", json_len(&v));
+        assert_eq!(v["truncated"], true);
+        let rows = v["rows"].as_array().unwrap();
+        assert!(rows.len() > 10);
+        assert_eq!(rows[0][0], 0, "rows are dropped from the end");
+        assert_eq!(v["row_count"], rows.len());
+
+        let mut v = serde_json::json!({"description": "d".repeat(10_000), "comments": []});
+        cap_json(&mut v, 1000);
+        assert!(json_len(&v) <= 1000);
+        assert_eq!(v["truncated"], true);
+
+        let mut small = serde_json::json!({"rows": [1, 2], "truncated": false});
+        cap_json(&mut small, 1000);
+        assert_eq!(small["truncated"], false);
     }
 
     #[test]

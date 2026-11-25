@@ -1,25 +1,38 @@
-//! Running a planned tool call as a child process: no shell, its own process group (killed whole on timeout),
-//! capped output, and secrets masked.
+//! Running a planned tool call as a child process: no shell, its own process group, capped output, and secrets
+//! masked.
+//!
+//! The tool runs in a new process group. Once its output is drained (both pipes closed, or the deadline and a
+//! short grace passed) the whole group is killed, so anything it left running (`cmd &`, `nohup cmd`) ends with
+//! the call. The tool itself is reaped only after that kill: while it is an unreaped zombie its pid, and so
+//! the group's id, cannot be reused, so the kill never reaches an unrelated process. Output is read on the
+//! calling thread with `poll`, so no reader thread outlives the call.
+//!
+//! A process that leaves the group (`setsid`, `setpgid`) escapes the kill; if it holds the output open, the
+//! read stops at the deadline plus the grace and its pipes are closed on our side.
 
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use xctx_core::Redactor;
 
 use crate::call::{CallPlan, Invocation};
 use crate::error::{PluginError, Result};
 
-/// Bytes read past the cap before masking, so a secret straddling the cap is still masked whole.
+/// Bytes read past the cap, so a secret of up to this length straddling the cap is still seen whole.
 const MASK_MARGIN: usize = 64 * 1024;
+
+/// The window first searched for a secret straddling the cut (secrets are rarely longer); a longer one is
+/// still found by a second search over [`MASK_MARGIN`].
+const SECRET_WINDOW: usize = 4 * 1024;
 
 /// How often the child is polled.
 const POLL: Duration = Duration::from_millis(10);
 
-/// How long to wait for the output pipes to close after the child was killed.
+/// How long to wait for the output pipes to close after the group was killed.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// What a tool run produced.
@@ -90,85 +103,61 @@ pub fn run_plan(plan: &CallPlan, timeout: Duration, max_output_bytes: usize) -> 
             program: program.clone(),
             source,
         })?;
-    let pgid = child.id() as libc::pid_t;
-    let kill_group = || {
-        // SAFETY: killpg only sends a signal; the group is the child's own (process_group(0) above).
-        unsafe {
-            libc::killpg(pgid, libc::SIGKILL);
-        }
-    };
+    let pid = child.id() as libc::pid_t;
 
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
     let keep = max_output_bytes.saturating_add(MASK_MARGIN);
-    let (tx, rx) = mpsc::channel::<(bool, Captured)>();
-    let mut readers = 0;
-    if let Some(out) = child.stdout.take() {
-        readers += 1;
-        spawn_reader(out, keep, true, tx.clone());
-    }
-    if let Some(err) = child.stderr.take() {
-        readers += 1;
-        spawn_reader(err, keep, false, tx.clone());
-    }
-    drop(tx);
+    let mut stdout = Captured::default();
+    let mut stderr = Captured::default();
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(e) => {
-                kill_group();
-                let _ = child.wait();
-                return Err(run_err(format!("waiting for it failed: {e}")));
-            }
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            kill_group();
-            match child.wait() {
-                Ok(status) => break status,
+    let mut exited = false;
+    let mut killed_at: Option<Instant> = None;
+    loop {
+        if !exited {
+            match exited_unreaped(pid) {
+                Ok(done) => exited = done,
                 Err(e) => {
-                    return Err(run_err(format!(
-                        "waiting for it after the timeout failed: {e}"
-                    )));
+                    kill_group(pid);
+                    let _ = child.wait();
+                    return Err(run_err(format!("waiting for it failed: {e}")));
                 }
             }
         }
-        thread::sleep(POLL);
-    };
-
-    // The pipes stay open while anything the tool started still holds them: wait for that until the deadline,
-    // then kill the group.
-    let mut stdout = Captured::default();
-    let mut stderr = Captured::default();
-    let mut killed_leftovers = timed_out;
-    while readers > 0 {
-        let wait = if killed_leftovers {
-            DRAIN_GRACE
-        } else {
-            deadline.saturating_duration_since(Instant::now())
-        };
-        match rx.recv_timeout(wait) {
-            Ok((is_stdout, captured)) => {
-                readers -= 1;
-                if is_stdout {
-                    stdout = captured;
-                } else {
-                    stderr = captured;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) if !killed_leftovers => {
+        if exited && stdout_pipe.is_none() && stderr_pipe.is_none() {
+            break;
+        }
+        let now = Instant::now();
+        match killed_at {
+            // Still running, or something it started still holds its output: kill the group.
+            None if now >= deadline => {
                 timed_out = true;
-                killed_leftovers = true;
-                kill_group();
+                kill_group(pid);
+                killed_at = Some(now);
             }
-            Err(_) => break,
+            // What still holds the output left the group; stop reading.
+            Some(at) if now >= at + DRAIN_GRACE => break,
+            _ => {}
         }
+        read_ready(
+            &mut stdout_pipe,
+            &mut stdout,
+            &mut stderr_pipe,
+            &mut stderr,
+            keep,
+        );
     }
 
-    let (stdout, cut_out) = stdout.finish(plan, max_output_bytes);
-    let (stderr, cut_err) = stderr.finish(plan, max_output_bytes);
+    // Whatever the tool left running goes with it; then reap it.
+    kill_group(pid);
+    drop(stdout_pipe);
+    drop(stderr_pipe);
+    let status = reap(&mut child).map_err(|e| run_err(format!("waiting for it failed: {e}")))?;
+
+    let (stdout, cut_out) = stdout.finish(&plan.redactor, max_output_bytes);
+    let (stderr, cut_err) = stderr.finish(&plan.redactor, max_output_bytes);
     Ok(ToolOutput {
         status: status.code(),
         stdout,
@@ -178,7 +167,101 @@ pub fn run_plan(plan: &CallPlan, timeout: Duration, max_output_bytes: usize) -> 
     })
 }
 
-/// What a reader kept of one stream.
+/// SIGKILL the tool's process group, and the tool itself in case it left the group. Only called while the
+/// tool is not reaped yet, so `pid` (and the group id, which is the same) still belong to it.
+fn kill_group(pid: libc::pid_t) {
+    // SAFETY: kill and killpg only send a signal; `pid` is our unreaped child and the leader of its own group
+    // (`process_group(0)`), so neither id can have been reused.
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// True once the child `pid` has exited, without reaping it (`WNOWAIT`).
+fn exited_unreaped(pid: libc::pid_t) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: an all-zero siginfo_t is a valid value; waitid only writes into it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable siginfo_t, and `pid` is our own child.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: waitid filled `info` (or left it zeroed when nothing exited).
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Reap the child, which was killed or has exited.
+fn reap(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    child.wait()
+}
+
+/// Wait up to [`POLL`] for output on the open pipes and read what came; a pipe that reached its end (or
+/// failed) is closed and set to None.
+fn read_ready(
+    out_pipe: &mut Option<ChildStdout>,
+    out: &mut Captured,
+    err_pipe: &mut Option<ChildStderr>,
+    err: &mut Captured,
+    keep: usize,
+) {
+    let mut fds: Vec<libc::pollfd> = Vec::with_capacity(2);
+    for fd in [
+        out_pipe.as_ref().map(|p| p.as_raw_fd()),
+        err_pipe.as_ref().map(|p| p.as_raw_fd()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        fds.push(libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    if fds.is_empty() {
+        std::thread::sleep(POLL);
+        return;
+    }
+    let timeout_ms = POLL.as_millis() as libc::c_int;
+    // SAFETY: `fds` is a valid array of `fds.len()` pollfd structs for the duration of the call.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    if rc <= 0 {
+        return;
+    }
+    let ready = |fd: libc::c_int| {
+        fds.iter().any(|p| {
+            p.fd == fd
+                && p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        })
+    };
+    if out_pipe.as_ref().is_some_and(|p| ready(p.as_raw_fd()))
+        && let Some(p) = out_pipe
+        && !out.read_from(p, keep)
+    {
+        *out_pipe = None;
+    }
+    if err_pipe.as_ref().is_some_and(|p| ready(p.as_raw_fd()))
+        && let Some(p) = err_pipe
+        && !err.read_from(p, keep)
+    {
+        *err_pipe = None;
+    }
+}
+
+/// What was kept of one stream.
 #[derive(Default)]
 struct Captured {
     bytes: Vec<u8>,
@@ -186,44 +269,108 @@ struct Captured {
 }
 
 impl Captured {
-    /// The masked text, cut to `cap` bytes on a character boundary, and whether anything was cut.
-    fn finish(self, plan: &CallPlan, cap: usize) -> (String, bool) {
-        let text = String::from_utf8_lossy(&self.bytes);
-        let mut masked = plan.redactor.redact(&text).into_owned();
-        let mut cut = self.total > cap;
-        if masked.len() > cap {
-            let mut end = cap;
-            while !masked.is_char_boundary(end) {
-                end -= 1;
+    /// Read once from a pipe that is ready. False when it reached its end or failed.
+    fn read_from(&mut self, pipe: &mut impl Read, keep: usize) -> bool {
+        let mut chunk = [0u8; 8192];
+        match pipe.read(&mut chunk) {
+            Ok(0) => false,
+            Ok(n) => {
+                self.total = self.total.saturating_add(n);
+                let room = keep.saturating_sub(self.bytes.len());
+                self.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                true
             }
-            masked.truncate(end);
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The masked text, at most `cap` bytes, and whether anything was cut.
+    ///
+    /// When more was read than kept, the raw text is first cut where no secret straddles the cut (see
+    /// [`safe_cut`]), so no prefix of a secret is left unmasked at the end; only then is it masked and cut to
+    /// `cap` (a cut there can only fall in text that is already masked or in no secret).
+    fn finish(self, redactor: &Redactor, cap: usize) -> (String, bool) {
+        let text = String::from_utf8_lossy(&self.bytes);
+        let raw_cut = self.total > self.bytes.len();
+        let text = if raw_cut {
+            &text[..safe_cut(&text, redactor)]
+        } else {
+            &text[..]
+        };
+        let mut masked = redactor.redact(text).into_owned();
+        let mut cut = raw_cut;
+        if masked.len() > cap {
+            masked.truncate(floor_boundary(&masked, cap));
             cut = true;
         }
         (masked, cut)
     }
 }
 
-fn spawn_reader(
-    mut pipe: impl Read + Send + 'static,
-    keep: usize,
-    is_stdout: bool,
-    tx: mpsc::Sender<(bool, Captured)>,
-) {
-    thread::spawn(move || {
-        let mut captured = Captured::default();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    captured.total = captured.total.saturating_add(n);
-                    let room = keep.saturating_sub(captured.bytes.len());
-                    captured.bytes.extend_from_slice(&chunk[..n.min(room)]);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
+/// The largest char boundary of `s` at or below `i`.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The smallest char boundary of `s` at or above `i`.
+fn ceil_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// True when a secret's whole occurrence in `text` within `window` bytes of `k` crosses `k`: masking the two
+/// sides apart then differs from masking them together.
+fn straddles(text: &str, k: usize, window: usize, redactor: &Redactor) -> bool {
+    let from = floor_boundary(text, k.saturating_sub(window));
+    let to = ceil_boundary(text, k.saturating_add(window));
+    let whole = redactor.redact(&text[from..to]);
+    let apart = format!(
+        "{}{}",
+        redactor.redact(&text[from..k]),
+        redactor.redact(&text[k..to])
+    );
+    whole != apart
+}
+
+/// Where to cut `text`, which ends where reading stopped (maybe inside a secret): at least [`MASK_MARGIN`]
+/// before its end, so every secret of up to that length near the cut is seen whole, and where no secret
+/// straddles the cut. 0 when no such place is found.
+fn safe_cut(text: &str, redactor: &Redactor) -> usize {
+    let mut k = floor_boundary(text, text.len().saturating_sub(MASK_MARGIN));
+    if redactor.is_empty() {
+        return k;
+    }
+    for _ in 0..(2 * MASK_MARGIN / SECRET_WINDOW) {
+        // Step back over a usual (short) secret one character at a time.
+        let mut steps = 0;
+        while k > 0 && steps < SECRET_WINDOW && straddles(text, k, SECRET_WINDOW, redactor) {
+            k = floor_boundary(text, k - 1);
+            steps += 1;
         }
-        let _ = tx.send((is_stdout, captured));
-    });
+        if k == 0 {
+            return 0;
+        }
+        // Inside a long secret (or a run of them): jump back a window and look again.
+        if steps == SECRET_WINDOW || straddles(text, k, MASK_MARGIN, redactor) {
+            k = floor_boundary(text, k.saturating_sub(SECRET_WINDOW));
+            continue;
+        }
+        return k;
+    }
+    0
 }
