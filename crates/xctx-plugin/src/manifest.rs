@@ -18,7 +18,7 @@
 //! description = "GET /health"
 //! effect = "read"                       # read | write
 //! run = ["curl", "-s", "http://localhost:{PORT}/{path}"]   # or: builtin = "http.send"
-//! params = [{ name = "path", type = "string", required = true }]
+//! params = [{ name = "path", type = "string", required = true }]   # integers may set min and max
 //!
 //! [[events]]
 //! name = "api.down"
@@ -28,6 +28,13 @@
 //!
 //! In `run`, `{name}` is a parameter, `{PORT}`, `{WORKTREE}` and `{SPACE}` come from the space, and `{{`/`}}` are
 //! literal braces. Placeholders never add or split argv elements (see [`crate::plan_call`]).
+//!
+//! **Option injection.** No shell is involved, but the program still reads its own options: a value such as
+//! `--output=/etc/x` put in a whole element is an option to it, not a file name. So a `string`, `path` or
+//! `strings` value may not start with `-` where an argv element starts with its placeholder (`"{file}"`,
+//! `"{file}.txt"`), unless the parameter sets `allow_dash = true` (as `shell.run`'s `args` does). Integers are
+//! exempt (`-3` is a number). Put a placeholder after a fixed prefix (`"--file={file}"`) or after `"--"` when
+//! the program supports it, so a value can never be read as an option.
 
 use std::path::Path;
 
@@ -171,6 +178,12 @@ impl ToolSpec {
             if !p.description.is_empty() {
                 schema["description"] = Value::String(p.description.clone());
             }
+            if let Some(min) = p.min {
+                schema["minimum"] = json!(min);
+            }
+            if let Some(max) = p.max {
+                schema["maximum"] = json!(max);
+            }
             properties.insert(p.name.clone(), schema);
         }
         let required: Vec<&str> = self
@@ -200,6 +213,13 @@ pub struct ParamSpec {
     pub required: bool,
     /// What it is, for agents.
     pub description: String,
+    /// Whether a value may start with `-` where an argv element starts with this parameter's placeholder, so it
+    /// can be an option to the program (`allow_dash` in the manifest, default false). Integers always may.
+    pub allow_dash: bool,
+    /// For an integer, the smallest value a call may pass (`min` in the manifest).
+    pub min: Option<i64>,
+    /// For an integer, the largest value a call may pass (`max` in the manifest).
+    pub max: Option<i64>,
 }
 
 /// The type of a tool parameter.
@@ -469,6 +489,10 @@ struct RawParam {
     required: bool,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    allow_dash: bool,
+    min: Option<i64>,
+    max: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -617,11 +641,28 @@ impl RawManifest {
                 if params.iter().any(|q| q.name == p.name) {
                     return Err(check.err(pfield, format!("a second parameter named {:?}", p.name)));
                 }
+                if (p.min.is_some() || p.max.is_some()) && p.kind != ParamKind::Integer {
+                    return Err(check.err(
+                        format!("{field}.params[{j}]"),
+                        "`min` and `max` apply only to an integer",
+                    ));
+                }
+                if let (Some(min), Some(max)) = (p.min, p.max)
+                    && min > max
+                {
+                    return Err(check.err(
+                        format!("{field}.params[{j}]"),
+                        format!("`min` {min} is above `max` {max}"),
+                    ));
+                }
                 params.push(ParamSpec {
                     name: p.name,
                     kind: p.kind,
                     required: p.required,
                     description: p.description,
+                    allow_dash: p.allow_dash,
+                    min: p.min,
+                    max: p.max,
                 });
             }
             let action = match (raw.run, raw.builtin) {
@@ -905,6 +946,18 @@ kind = "terminal"
                 "name = \"a.b\"\neffect = \"read\"\nrun = [\"ls\"]\nparams = [{ name = \"x\", type = \"string\" }, { name = \"x\", type = \"path\" }]"
             )),
             "tools[0].params[1].name"
+        );
+        assert_eq!(
+            invalid_field(&tool(
+                "name = \"a.b\"\neffect = \"read\"\nrun = [\"ls\"]\nparams = [{ name = \"x\", type = \"string\", min = 1 }]"
+            )),
+            "tools[0].params[0]"
+        );
+        assert_eq!(
+            invalid_field(&tool(
+                "name = \"a.b\"\neffect = \"read\"\nrun = [\"ls\"]\nparams = [{ name = \"x\", type = \"integer\", min = 5, max = 1 }]"
+            )),
+            "tools[0].params[0]"
         );
         let two = format!(
             "{MINIMAL}\n[[tools]]\nname = \"a.b\"\neffect = \"read\"\nbuiltin = \"x\"\n[[tools]]\nname = \"a.b\"\neffect = \"write\"\nbuiltin = \"y\"\n"

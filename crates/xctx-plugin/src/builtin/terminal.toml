@@ -10,10 +10,11 @@ run = []
 
 [[tools]]
 name = "shell.run"
-description = "Run one program with its arguments in the space's worktree, with its MISE_ENV and PORT, a timeout and capped output. No shell: pass the program and each argument separately."
-effect = "read"
+# It runs any program, so it can change anything the user can: a write, which the user approves in the Inbox.
+description = "Run one program with its arguments in the space's worktree, with its MISE_ENV and PORT, a timeout and capped output. It can run anything, so each call waits for the user's approval in the Inbox. No shell: pass the program and each argument separately."
+effect = "write"
 run = ["{command}", "{args}"]
 params = [
   { name = "command", type = "path", required = true, description = "The program to run, such as `cargo` or `./bin/check`" },
-  { name = "args", type = "strings", description = "Its arguments, one per element" },
+  { name = "args", type = "strings", allow_dash = true, description = "Its arguments, one per element" },
 ]

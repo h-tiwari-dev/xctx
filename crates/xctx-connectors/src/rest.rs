@@ -28,12 +28,28 @@ pub(crate) fn options(base_url: &str, ctx: &BuiltinContext) -> Result<SendOption
     Ok(options)
 }
 
-/// A base URL setting without its trailing slashes, which must be `http` or `https`.
+/// A base URL setting without its trailing slashes. It must be `https`, so the token is never sent in the
+/// clear, except to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), which may use `http`.
 pub(crate) fn base_url(raw: &str) -> Result<String> {
     let base = raw.trim().trim_end_matches('/').to_owned();
-    xctx_http::host_of(&base)
+    let host = xctx_http::host_of(&base)
         .map_err(|e| ConnectorError::NotConfigured(format!("base URL {base}: {e}")))?;
+    let https = url::Url::parse(&base).is_ok_and(|u| u.scheme() == "https");
+    if !https && !is_loopback(&host) {
+        return Err(ConnectorError::NotConfigured(format!(
+            "base URL {base}: must be https:// (http is allowed only for localhost)"
+        )));
+    }
     Ok(base)
+}
+
+/// True for `localhost` and loopback addresses.
+pub(crate) fn is_loopback(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Send `request` and return the parsed JSON body of a 2xx answer (`null` for an empty body). Other statuses
@@ -328,6 +344,34 @@ pub(crate) fn text_to_adf(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_urls_must_be_https_except_on_loopback() {
+        assert_eq!(
+            base_url(" https://acme.atlassian.net/ ").unwrap(),
+            "https://acme.atlassian.net"
+        );
+        for ok in [
+            "http://localhost:8080",
+            "http://127.0.0.1:9",
+            "http://127.1.2.3",
+            "http://[::1]:80",
+        ] {
+            assert!(base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://acme.atlassian.net",
+            "http://10.0.0.1",
+            "http://localhost.evil.example",
+            "ftp://x",
+            "",
+        ] {
+            assert!(
+                matches!(base_url(bad), Err(ConnectorError::NotConfigured(_))),
+                "{bad}"
+            );
+        }
+    }
 
     #[test]
     fn base64_matches_the_standard() {

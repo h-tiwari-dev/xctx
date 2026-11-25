@@ -398,10 +398,8 @@ pub fn space_registry(user_dir: Option<&Path>, space: &Space, trust: &TrustStore
         registry.add_user_dir(dir);
     }
     for repo in &space.repos {
-        registry.add_repo(&repo.worktree, |manifest| {
-            std::fs::read(repo_manifest_path(&repo.worktree, &manifest.name)).is_ok_and(|bytes| {
-                trust.is_trusted(&repo.repo, &manifest.name, &manifest_hash(&bytes))
-            })
+        registry.add_repo(&repo.worktree, |manifest, hash| {
+            trust.is_trusted(&repo.repo, &manifest.name, hash)
         });
     }
     registry

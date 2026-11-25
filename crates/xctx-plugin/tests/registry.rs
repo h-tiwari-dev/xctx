@@ -103,7 +103,7 @@ fn clashes_are_refused_not_shadowed() {
 
     let mut registry = Registry::with_builtins();
     registry.add_user_dir(user.path());
-    registry.add_repo(repo.path(), |_| true);
+    registry.add_repo(repo.path(), |_, _| true);
 
     assert_eq!(
         registry.get("logs").map(|p| &p.source),
@@ -141,7 +141,7 @@ fn repo_plugins_need_trust_until_the_user_gives_it() {
     write_plugin(&plugins, "fresh", &manifest("fresh"));
 
     let mut registry = Registry::with_builtins();
-    registry.add_repo(repo.path(), |m| m.name == "known");
+    registry.add_repo(repo.path(), |m, _| m.name == "known");
 
     let fresh = registry.get("fresh").expect("fresh loaded");
     assert!(matches!(&fresh.source, Source::Repo { repo: r, .. } if r == repo.path()));
@@ -155,4 +155,35 @@ fn repo_plugins_need_trust_until_the_user_gives_it() {
     assert!(registry.needs_trust().is_empty());
     assert!(registry.usable("fresh").is_some());
     assert!(!registry.trust("absent"));
+}
+
+#[test]
+fn the_hash_is_of_the_bytes_that_were_parsed() {
+    let user = tempfile::tempdir().expect("tempdir");
+    let repo = tempfile::tempdir().expect("tempdir");
+    let text = manifest("probe");
+    write_plugin(&repo.path().join(".xctx/plugins"), "probe", &text);
+    write_plugin(user.path(), "mine", &manifest("mine"));
+    let want = xctx_plugin::manifest_hash(text.as_bytes());
+    assert_eq!(want.len(), 64);
+
+    let seen = std::cell::RefCell::new(Vec::new());
+    let mut registry = Registry::with_builtins();
+    registry.add_user_dir(user.path());
+    registry.add_repo(repo.path(), |m, hash| {
+        seen.borrow_mut().push((m.name.clone(), hash.to_owned()));
+        hash == want
+    });
+    assert_eq!(seen.into_inner(), [("probe".to_owned(), want.clone())]);
+    let probe = registry.get("probe").expect("loaded");
+    assert!(probe.trusted);
+    assert_eq!(probe.manifest_hash.as_deref(), Some(want.as_str()));
+    assert_eq!(
+        registry.get("mine").and_then(|p| p.manifest_hash.clone()),
+        Some(xctx_plugin::manifest_hash(manifest("mine").as_bytes()))
+    );
+    assert_eq!(
+        registry.get("logs").map(|p| p.manifest_hash.clone()),
+        Some(None)
+    );
 }

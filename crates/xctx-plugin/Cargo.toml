@@ -9,6 +9,7 @@ libc = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 toml = "1"
 xctx-core = { path = "../xctx-core" }

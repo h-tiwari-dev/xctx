@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn builtins_have_the_planned_tools_panes_and_effects() {
         let effect = |plugin: &str, tool: &str| builtin(plugin).tool(tool).map(|t| t.effect);
-        assert_eq!(effect("terminal", "shell.run"), Some(Effect::Read));
+        assert_eq!(effect("terminal", "shell.run"), Some(Effect::Write));
         assert!(matches!(
             builtin("terminal").tool("shell.run").map(|t| &t.action),
             Some(ToolAction::Run(_))
@@ -70,6 +70,20 @@ mod tests {
         for tool in ["http.send", "http.replay", "http.diff"] {
             assert_eq!(effect("api-client", tool), Some(Effect::Read), "{tool}");
         }
+        let replay = builtin("api-client");
+        let times = replay
+            .tool("http.replay")
+            .and_then(|t| t.param("times"))
+            .map(|p| (p.kind, p.required, p.min, p.max));
+        assert_eq!(
+            times,
+            Some((
+                crate::manifest::ParamKind::Integer,
+                false,
+                Some(1),
+                Some(100)
+            ))
+        );
         assert!(builtin("api-client").event("response.status").is_some());
         assert!(builtin("api-client").event("response.slow").is_some());
         assert_eq!(effect("logs", "logs.query"), Some(Effect::Read));

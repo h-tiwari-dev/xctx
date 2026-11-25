@@ -5,10 +5,14 @@
 //! reported, never silently shadowing it. A bad manifest is reported and the others still load. A repo plugin is
 //! only usable once the user trusts it (an Inbox approval the app records); until then it is listed by
 //! [`Registry::needs_trust`].
+//!
+//! A user or repo manifest is read once: the bytes that were parsed are the bytes hashed
+//! ([`Plugin::manifest_hash`]), so trust is decided on exactly what runs.
 
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::builtin::{BUILTIN_MANIFESTS, builtin_origin};
 use crate::error::{PluginError, Result};
@@ -57,6 +61,9 @@ pub struct Plugin {
     /// Whether it may be mounted and its tools called. Always true for built-in and user plugins; for a repo
     /// plugin, what the caller decided when loading it, or [`Registry::trust`] later.
     pub trusted: bool,
+    /// The [`manifest_hash`] of the exact bytes of `plugin.toml` that were parsed into
+    /// [`Plugin::manifest`], for a user or repo plugin; None for a built-in. Trust is recorded against it.
+    pub manifest_hash: Option<String>,
 }
 
 impl Plugin {
@@ -93,7 +100,7 @@ impl Registry {
         let mut registry = Registry::default();
         for (name, text) in BUILTIN_MANIFESTS {
             match Manifest::parse(text, &builtin_origin(name)) {
-                Ok(manifest) => registry.insert(manifest, Source::Builtin, true),
+                Ok(manifest) => registry.insert(manifest, Source::Builtin, true, None),
                 Err(error) => registry.problems.push(LoadProblem { path: None, error }),
             }
         }
@@ -104,7 +111,9 @@ impl Registry {
     pub fn add_user_dir(&mut self, dir: &Path) {
         for path in self.manifest_paths(dir) {
             match load_named(&path) {
-                Ok(manifest) => self.insert(manifest, Source::User { path }, true),
+                Ok((manifest, hash)) => {
+                    self.insert(manifest, Source::User { path }, true, Some(hash))
+                }
                 Err(error) => self.problems.push(LoadProblem {
                     path: Some(path),
                     error,
@@ -113,13 +122,14 @@ impl Registry {
         }
     }
 
-    /// Load `repo`'s own plugins from `<repo>/.xctx/plugins`. `trusted` says, for each, whether the user already
-    /// trusted it; the rest are listed by [`Registry::needs_trust`].
-    pub fn add_repo(&mut self, repo: &Path, trusted: impl Fn(&Manifest) -> bool) {
+    /// Load `repo`'s own plugins from `<repo>/.xctx/plugins`. `trusted` is given each manifest and the
+    /// [`manifest_hash`] of the bytes it was parsed from, and says whether the user already trusted that; the
+    /// rest are listed by [`Registry::needs_trust`].
+    pub fn add_repo(&mut self, repo: &Path, trusted: impl Fn(&Manifest, &str) -> bool) {
         for path in self.manifest_paths(&repo.join(REPO_PLUGINS_DIR)) {
             match load_named(&path) {
-                Ok(manifest) => {
-                    let is_trusted = trusted(&manifest);
+                Ok((manifest, hash)) => {
+                    let is_trusted = trusted(&manifest, &hash);
                     self.insert(
                         manifest,
                         Source::Repo {
@@ -127,6 +137,7 @@ impl Registry {
                             path,
                         },
                         is_trusted,
+                        Some(hash),
                     );
                 }
                 Err(error) => self.problems.push(LoadProblem {
@@ -173,7 +184,13 @@ impl Registry {
         &self.problems
     }
 
-    fn insert(&mut self, manifest: Manifest, source: Source, trusted: bool) {
+    fn insert(
+        &mut self,
+        manifest: Manifest,
+        source: Source,
+        trusted: bool,
+        manifest_hash: Option<String>,
+    ) {
         if let Some(existing) = self.get(&manifest.name) {
             let error = PluginError::Clash {
                 name: manifest.name.clone(),
@@ -191,6 +208,7 @@ impl Registry {
             manifest,
             source,
             trusted,
+            manifest_hash,
         });
     }
 
@@ -239,9 +257,26 @@ impl Registry {
     }
 }
 
-/// Load a manifest whose `name` must match its folder's.
-fn load_named(path: &Path) -> Result<Manifest> {
-    let manifest = Manifest::load(path)?;
+/// The SHA-256 of a manifest's bytes, in lowercase hex: what trusting a repo plugin records.
+pub fn manifest_hash(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Read a manifest once, parse it, and hash the bytes that were parsed. Its `name` must match its folder's.
+fn load_named(path: &Path) -> Result<(Manifest, String)> {
+    let bytes = std::fs::read(path).map_err(|source| PluginError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let hash = manifest_hash(&bytes);
+    let text = String::from_utf8(bytes).map_err(|e| PluginError::Syntax {
+        origin: path.display().to_string(),
+        message: format!("plugin.toml is not UTF-8: {e}"),
+    })?;
+    let manifest = Manifest::parse(&text, &path.display().to_string())?;
     let folder = path
         .parent()
         .and_then(Path::file_name)
@@ -257,5 +292,5 @@ fn load_named(path: &Path) -> Result<Manifest> {
             ),
         });
     }
-    Ok(manifest)
+    Ok((manifest, hash))
 }

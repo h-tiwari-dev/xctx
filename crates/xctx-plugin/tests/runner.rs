@@ -123,6 +123,88 @@ fn placeholder_values_stay_single_literal_arguments() {
 }
 
 #[test]
+fn values_that_would_be_options_are_refused_unless_allowed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = ctx(dir.path());
+    let m = script_manifest(
+        ", \"{file}\", \"{name}.txt\", \"--label={label}\", \"{flags}\", \"{n}\", \"{opts}\"",
+        "{ name = \"file\", type = \"path\" }, { name = \"name\", type = \"string\" }, \
+         { name = \"label\", type = \"string\" }, { name = \"flags\", type = \"strings\" }, \
+         { name = \"n\", type = \"integer\" }, { name = \"opts\", type = \"strings\", allow_dash = true }",
+        "",
+    );
+    for call in [
+        json!({ "file": "--output=/etc/passwd" }),
+        json!({ "file": "-" }),
+        json!({ "name": "-rf" }),
+        json!({ "flags": ["ok", "--exec=evil"] }),
+    ] {
+        let err = plan_call(&m, "fake.run", &args(call.clone()), &c).expect_err("refused");
+        assert!(
+            matches!(&err, PluginError::BadParam { message, .. } if message.contains("option")),
+            "{call}: {err}"
+        );
+    }
+    let plan = plan_call(
+        &m,
+        "fake.run",
+        &args(json!({ "file": "a-b", "label": "-x", "n": -3, "opts": ["-la", "--all"] })),
+        &c,
+    )
+    .expect("allowed");
+    assert_eq!(
+        argv_of(&plan)[2..],
+        ["a-b", "--label=-x", "-3", "-la", "--all"]
+    );
+
+    // shell.run's arguments may be options; its program may not.
+    let terminal = builtin("terminal");
+    let plan = plan_call(
+        &terminal,
+        "shell.run",
+        &args(json!({ "command": "ls", "args": ["-la"] })),
+        &c,
+    )
+    .expect("allowed");
+    assert_eq!(argv_of(&plan), ["ls", "-la"]);
+    assert!(
+        plan_call(
+            &terminal,
+            "shell.run",
+            &args(json!({ "command": "-la" })),
+            &c
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn integer_bounds_are_checked_when_planning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api = builtin("api-client");
+    let c = ctx(dir.path());
+    let replay = |times: i64| {
+        plan_call(
+            &api,
+            "http.replay",
+            &args(json!({ "id": "h1", "times": times })),
+            &c,
+        )
+    };
+    for bad in [0, -1, 101] {
+        assert!(
+            matches!(replay(bad), Err(PluginError::BadParam { .. })),
+            "{bad}"
+        );
+    }
+    let plan = replay(100).expect("allowed");
+    assert!(matches!(&plan.invocation, Invocation::Builtin { args, .. } if args["times"] == 100));
+    let schema = api.tool("http.replay").expect("tool").input_schema();
+    assert_eq!(schema["properties"]["times"]["minimum"], 1);
+    assert_eq!(schema["properties"]["times"]["maximum"], 100);
+}
+
+#[test]
 fn shell_run_passes_its_program_and_args_without_a_shell() {
     let dir = tempfile::tempdir().expect("tempdir");
     let m = builtin("terminal");
@@ -132,7 +214,8 @@ fn shell_run_passes_its_program_and_args_without_a_shell() {
         argv_of(&plan),
         ["/bin/echo", "a; rm -rf /", "b c", "{args}"]
     );
-    assert_eq!(plan.effect, Effect::Read);
+    // It runs any program, so it is a write: the app gates it in the Inbox.
+    assert_eq!(plan.effect, Effect::Write);
     let out = run_plan(&plan, 10 * SECOND, 1024).expect("run");
     assert_eq!(out.stdout, "a; rm -rf / b c {args}\n");
 
@@ -332,6 +415,63 @@ fn secrets_reach_the_tool_and_are_masked_in_its_output() {
     assert!(out.truncated);
     assert!(out.stdout.len() <= 12);
     assert!(!out.stdout.contains("s3cr"), "{:?}", out.stdout);
+}
+
+#[test]
+fn a_secret_repeated_across_the_cap_never_shows_a_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A long secret, masked into something much shorter, repeated well past the cap and its margin: masking
+    // what was read shrinks it below the cap, so a cut that fell inside the last secret would show its start.
+    let secret: String = (0..2000)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    write_script(
+        dir.path(),
+        "printf 'head '\ni=0; while [ $i -lt 100 ]; do printf '%s' \"$MY_TOKEN\"; i=$((i+1)); done\n",
+    );
+    let m = script_manifest("", "", "secrets = [\"MY_TOKEN\"]");
+    let mut c = ctx(dir.path());
+    c.secrets.insert("MY_TOKEN".to_owned(), secret.clone());
+    c.redactor = Redactor::new([("MY_TOKEN".to_owned(), secret.clone())]);
+    let plan = plan_call(&m, "fake.run", &Map::new(), &c).expect("plan");
+    for cap in [1000, 3000, 10_000, 40_000] {
+        let out = run_plan(&plan, 30 * SECOND, cap).expect("run");
+        assert!(out.truncated, "{cap}");
+        assert!(out.stdout.len() <= cap, "{cap}");
+        assert!(out.stdout.starts_with("head "), "{cap}: {:?}", out.stdout);
+        let rest = out.stdout["head ".len()..].replace("[REDACTED:MY_TOKEN]", "");
+        assert!(
+            !rest.contains("abcd") && rest.len() < "[REDACTED:MY_TOKEN]".len(),
+            "{cap}: a part of the secret shows: {rest:?}"
+        );
+    }
+}
+
+#[test]
+fn what_the_tool_leaves_running_is_killed_when_the_call_ends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_script(dir.path(), "sleep 600 >/dev/null 2>&1 &\necho $!\n");
+    let m = script_manifest("", "", "");
+    let plan = plan_call(&m, "fake.run", &Map::new(), &ctx(dir.path())).expect("plan");
+    let start = Instant::now();
+    let out = run_plan(&plan, 30 * SECOND, 1024).expect("run");
+    assert!(start.elapsed() < 5 * SECOND, "took {:?}", start.elapsed());
+    assert!(out.success() && !out.timed_out, "{out:?}");
+    let pid: i32 = out.stdout.trim().parse().expect("the sleep's pid");
+    // Killed by the time the call returns; launchd (its new parent) reaps it a moment later.
+    let gone = |pid: i32| {
+        let status = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        let stat = String::from_utf8_lossy(&status.stdout);
+        stat.trim().is_empty() || stat.trim().starts_with('Z')
+    };
+    let deadline = Instant::now() + 5 * SECOND;
+    while !gone(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(gone(pid), "the background sleep {pid} is still running");
 }
 
 #[test]
