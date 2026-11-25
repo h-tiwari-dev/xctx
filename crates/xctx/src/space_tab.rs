@@ -995,7 +995,7 @@ impl Workspace {
         if self.tabs.contains_key(id) {
             self.persist(id, cx);
         }
-        self.stop_space_plugins(id, cx);
+        self.stop_space_plugins(id);
         self.plugin_panes.forget_space(id);
         let sessions = self
             .tabs

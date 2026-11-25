@@ -22,7 +22,6 @@ use xctx_plugin::{
 };
 use xctx_term_view::{TerminalView, TerminalViewEvent};
 
-use crate::plugin_backend::BrowserSnapshot;
 use crate::plugin_host::{
     CallJob, CallOutput, EventReport, HttpPaneData, LogsPaneData, LoopEffect, MountCheck,
     MountSettings, MountedPlugin, PendingMount, PendingWrite, Prepared, SqlPaneData, call_context,
@@ -317,11 +316,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(space) = self.active_space(id)
-            && let Some(browser) = self.plugins.stop_backend(&space, pane)
+            && self.plugins.stop_backend(&space, pane)
         {
-            cx.background_executor()
-                .spawn(async move { browser.close() })
-                .detach();
+            self.close_space_browser(id);
         }
         if let Err(e) = self.plugins.remove_mount(id, pane) {
             self.error(format!("could not record the unmount: {e}"), cx);
@@ -329,12 +326,9 @@ impl Workspace {
     }
 
     /// Stop what the plugins of `id` run, as its tab closes.
-    pub(crate) fn stop_space_plugins(&mut self, id: &SpaceId, cx: &mut Context<Self>) {
-        if let Some(browser) = self.plugins.stop_space(id) {
-            cx.background_executor()
-                .spawn(async move { browser.close() })
-                .detach();
-        }
+    pub(crate) fn stop_space_plugins(&mut self, id: &SpaceId) {
+        self.plugins.stop_space(id);
+        self.close_space_browser(id);
     }
 
     /// Start plugin pane `pane` of open space `id`: a terminal plugin's command in a terminal (no shell; the
@@ -567,8 +561,9 @@ impl Workspace {
         }
     }
 
-    /// Run `job` in the background; on the UI thread, apply what it changes in its pane, fire its events, then
-    /// call `done`.
+    /// Run `job`; on the UI thread, apply what it changes in its pane, fire its events, then call `done`. Most
+    /// calls run on the background executor; `page.*` built-ins drive the space's live browser view, which
+    /// lives on the main thread, so they run as a foreground task that awaits WebKit (see `plugin_browser.rs`).
     fn run_call_job(&mut self, mut job: CallJob, done: CallDone, cx: &mut Context<Self>) {
         // A GUI app's own PATH lacks Homebrew and the user's tools; tools get the PATH panes get.
         job.plan
@@ -582,34 +577,63 @@ impl Workspace {
         self.set_pane_busy(&id, pane, &builtin, true);
         self.plugin_panes.changed();
         cx.notify();
+        if builtin.starts_with("page.") {
+            let work = self.page_work(&job, cx);
+            cx.spawn(async move |this, cx| {
+                let result = match work {
+                    Ok(work) => work.await,
+                    Err(e) => Err(e),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.finish_call(&id, pane, &plugin, &builtin, result, done, cx)
+                });
+            })
+            .detach();
+            return;
+        }
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let result = executor.spawn(async move { job.run() }).await;
             let _ = this.update(cx, |this, cx| {
-                this.set_pane_busy(&id, pane, &builtin, false);
-                this.plugin_panes.changed();
-                let result = match result {
-                    Ok(output) => {
-                        this.plugins.apply_effect(&id, pane, &output.effect);
-                        // All of a call's events at once: at most one loop action and one notice.
-                        if !output.events.is_empty()
-                            && let Err(e) =
-                                this.fire_plugin_events(&id, &plugin, &output.events, cx)
-                        {
-                            this.error(e.message, cx);
-                        }
-                        Ok(ToolCallResult::Output(output))
-                    }
-                    Err(message) => {
-                        this.set_pane_error(&id, pane, &builtin, message.clone());
-                        Err(RpcError::conflict(message))
-                    }
-                };
-                done(this, result, cx);
-                cx.notify();
+                this.finish_call(&id, pane, &plugin, &builtin, result, done, cx)
             });
         })
         .detach();
+    }
+
+    /// A call of `plugin`'s `builtin` through `pane` of `id` ended with `result`: clear its busy mark, apply its
+    /// effect and fire its events (or show its error in the pane), then call `done`.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_call(
+        &mut self,
+        id: &SpaceId,
+        pane: Option<PaneId>,
+        plugin: &str,
+        builtin: &str,
+        result: Result<CallOutput, String>,
+        done: CallDone,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_pane_busy(id, pane, builtin, false);
+        self.plugin_panes.changed();
+        let result = match result {
+            Ok(output) => {
+                self.plugins.apply_effect(id, pane, &output.effect);
+                // All of a call's events at once: at most one loop action and one notice.
+                if !output.events.is_empty()
+                    && let Err(e) = self.fire_plugin_events(id, plugin, &output.events, cx)
+                {
+                    self.error(e.message, cx);
+                }
+                Ok(ToolCallResult::Output(output))
+            }
+            Err(message) => {
+                self.set_pane_error(id, pane, builtin, message.clone());
+                Err(RpcError::conflict(message))
+            }
+        };
+        done(self, result, cx);
+        cx.notify();
     }
 
     fn set_pane_busy(&mut self, id: &SpaceId, pane: Option<PaneId>, builtin: &str, busy: bool) {
@@ -618,6 +642,11 @@ impl Workspace {
             Some(&mut runtime.http_state.busy)
         } else if builtin.starts_with("sql.") {
             pane.map(|p| &mut runtime.sql.entry(p).or_default().busy)
+        } else if builtin.starts_with("page.") {
+            if busy {
+                runtime.web.error = None;
+            }
+            Some(&mut runtime.web.busy)
         } else {
             None
         };
@@ -644,13 +673,15 @@ impl Workspace {
             && let Some(pane) = pane
         {
             runtime.sql.entry(pane).or_default().error = Some(message);
+        } else if builtin.starts_with("page.") {
+            runtime.web.error = Some(message);
         }
     }
 
     /// Run built-in `builtin` with `args` for the first mounted pane of kind `kind` in `id` (or `pane`), as
     /// the plugin panes do (a send from the API client, a query from the database pane): checked against the
-    /// plugin's scope like any call, but not against its tool list, so a pane can replay several times or reload
-    /// a page. Errors show in the pane and the status bar.
+    /// plugin's scope like any call, but not against its tool list, so a pane can replay several times. Errors
+    /// show in the pane and the status bar.
     fn run_pane_builtin(
         &mut self,
         id: &SpaceId,
@@ -739,7 +770,7 @@ impl Workspace {
     // Events
 
     /// The open space `id`, for a plugin call, event or pane action: refused when its tab is not open, so an
-    /// agent cannot start Chrome, tails or plugin state for a space the user closed.
+    /// agent cannot start a browser, tails or plugin state for a space the user closed.
     pub(crate) fn open_space_for_plugins(&self, id: &SpaceId) -> Result<Space, RpcError> {
         if let Some(tab) = self.tabs.get(id) {
             return Ok(tab.space.clone());
@@ -1233,12 +1264,6 @@ impl Workspace {
         }
     }
 
-    /// What the browser pane of space `id` shows: where Chrome is, the page, its last screenshot (PNG bytes
-    /// with a generation counter), console and failed requests, all masked.
-    pub(crate) fn plugin_browser(&self, id: &SpaceId) -> BrowserSnapshot {
-        self.plugins.browser_data(id)
-    }
-
     /// Select exchange `exchange` in the API client of `id`.
     pub(crate) fn http_select(
         &mut self,
@@ -1339,19 +1364,6 @@ impl Workspace {
                 }
             },
         );
-    }
-
-    /// Open `url` (a path of the space's app, or a full local URL) in the browser of `id`, starting Chrome the
-    /// first time.
-    pub(crate) fn browser_open(&mut self, id: &SpaceId, url: &str, cx: &mut Context<Self>) {
-        let mut args = Map::new();
-        args.insert("path".into(), json!(url));
-        self.run_pane_builtin(id, None, "web", "page.open", args, cx);
-    }
-
-    /// Reload the page open in the browser of `id`, and take a new screenshot.
-    pub(crate) fn browser_reload(&mut self, id: &SpaceId, cx: &mut Context<Self>) {
-        self.run_pane_builtin(id, None, "web", "page.reload", Map::new(), cx);
     }
 
     /// Drop the lines of logs pane `pane` of `id`.

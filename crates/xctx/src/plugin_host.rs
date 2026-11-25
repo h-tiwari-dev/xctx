@@ -11,8 +11,10 @@
 //!   scripts it runs);
 //! - `spaces/<slug>/plugins.json`: the plugins mounted in a space, one entry per plugin pane, with the settings
 //!   chosen when mounting (a logs command, a database file, a base URL);
-//! - `spaces/<slug>/http.json`: the API client's history (see `xctx_http`);
-//! - `browser-profiles/<slug>/`: the Chrome profile of a space's browser pane.
+//! - `spaces/<slug>/http.json`: the API client's history (see `xctx_http`).
+//!
+//! The browser pane's page keeps nothing on disk: each space's live browser has its own non-persistent website
+//! data store (see `xctx_web_view`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use xctx_browser::{ConsoleEntry, NetworkError, ScreenshotOptions, UrlPolicy};
+use xctx_browser::{ConsoleEntry, NetworkError, UrlPolicy};
 use xctx_channel::{FindingSeverity, ScratchDir};
 use xctx_connectors::{BuiltinContext, Database, LogBuffer, LogLine, LogSource};
 use xctx_control::RpcError;
@@ -43,9 +45,7 @@ use xctx_plugin::{
     plan_call, run_plan_isolated,
 };
 
-use crate::plugin_backend::{
-    BrowserHandle, BrowserSnapshot, LogTail, TailEvent, TailStatus, TailTarget,
-};
+use crate::plugin_backend::{LogTail, TailEvent, TailStatus, TailTarget};
 use crate::space_graph::{SpaceGraphState, loop_approval_notice};
 
 /// The env var that moves the user's plugins folder (tests and throwaway runs); `~/.config/xctx/plugins`
@@ -63,9 +63,6 @@ pub const MOUNTS_FILE: &str = "plugins.json";
 
 /// The version of [`TRUST_FILE`] and [`MOUNTS_FILE`] this build writes.
 pub const PLUGIN_FILES_VERSION: u32 = 1;
-
-/// The folder under the data directory that holds each space's Chrome profile.
-pub const BROWSER_PROFILES_DIR: &str = "browser-profiles";
 
 /// How long a tool run (`run = [...]`) may take before it is killed.
 pub const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -421,15 +418,12 @@ pub fn save_mounts(data_dir: &Path, slug: &str, mounts: &[Mount]) -> Result<(), 
 }
 
 /// What a space's plugins keep in `data_dir` that goes when the space is shipped or discarded: its
-/// `plugins.json` and its browser profile (`browser-profiles/<slug>`). Empty for a slug that is not valid.
+/// `plugins.json`. Empty for a slug that is not valid.
 pub fn space_plugin_files(data_dir: &Path, slug: &str) -> Vec<PathBuf> {
     if check_slug(slug).is_err() {
         return Vec::new();
     }
-    vec![
-        data_dir.join("spaces").join(slug).join(MOUNTS_FILE),
-        data_dir.join(BROWSER_PROFILES_DIR).join(slug),
-    ]
+    vec![data_dir.join("spaces").join(slug).join(MOUNTS_FILE)]
 }
 
 /// Remove `paths` (files or folders) that exist, saying which could not be removed.
@@ -811,8 +805,6 @@ pub struct CallEnv {
     pub database: Option<Database>,
     /// The space's scratch directory.
     pub scratch: Option<ScratchDir>,
-    /// The space's browser.
-    pub browser: Option<BrowserHandle>,
     /// The web pane's page.
     pub web_url: Option<String>,
     /// The secrets the manifest declares.
@@ -831,7 +823,8 @@ impl CallEnv {
             .unwrap_or_else(|| format!("http://localhost:{}", self.port))
     }
 
-    fn web_base(&self) -> String {
+    /// The web pane's page, `http://localhost:{PORT}` by default: what `page.open` paths are relative to.
+    pub fn web_base(&self) -> String {
         self.web_url
             .clone()
             .unwrap_or_else(|| format!("http://localhost:{}", self.port))
@@ -847,8 +840,9 @@ impl CallEnv {
         options
     }
 
-    /// The space's port on the machine itself and the origin of the pane's URL, nothing else.
-    fn url_policy(&self) -> UrlPolicy {
+    /// What the agents' `page.*` tools may open and read: the space's port on the machine itself and the
+    /// origin of the pane's URL, nothing else.
+    pub fn url_policy(&self) -> UrlPolicy {
         let mut policy = UrlPolicy::default();
         policy.allow_local_port(self.port);
         if let Some(url) = &self.web_url {
@@ -920,7 +914,9 @@ impl CallJob {
                     let action = http_action(name, args)?;
                     run_http(&action, &self.env, &self.manifest, redactor).map_err(mask)
                 } else if name.starts_with("page.") {
-                    run_page(name, args, &self.env, redactor).map_err(mask)
+                    Err(format!(
+                        "{name} drives the browser pane's live page and runs in the window, not here"
+                    ))
                 } else {
                     run_connector(name, args, &self.plan, &self.env).map_err(mask)
                 }
@@ -1122,114 +1118,107 @@ fn status_text(status: Option<u16>) -> String {
     status.map_or_else(|| "no response".to_owned(), |s| s.to_string())
 }
 
-fn run_page(
+/// What an agent's `page.*` call asks of the space's live browser, checked: see [`page_action`]. The window
+/// runs it on the browser pane's view (`plugin_browser.rs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageAction {
+    /// Open this URL (allowed by the call's [`CallEnv::url_policy`]) and wait for it to load.
+    Open {
+        /// The URL.
+        url: String,
+    },
+    /// A PNG of the page, saved in the space's artifacts.
+    Screenshot {
+        /// The whole page rather than the viewport.
+        full_page: bool,
+    },
+    /// The page's console and failed requests.
+    Console {
+        /// Only errors (and exceptions) of the console.
+        errors_only: bool,
+    },
+    /// Reload the page and wait for it.
+    Reload,
+    /// Click the first element matching the selector.
+    Click {
+        /// The CSS selector.
+        selector: String,
+    },
+    /// Type into the first element matching the selector.
+    Type {
+        /// The CSS selector.
+        selector: String,
+        /// The text.
+        text: String,
+        /// Press Enter (and submit its form) afterwards.
+        submit: bool,
+    },
+    /// The visible text of the page, or of the first element matching the selector.
+    Text {
+        /// The CSS selector; the whole page when `None`.
+        selector: Option<String>,
+    },
+}
+
+/// The [`PageAction`] built-in `name` asks for with `args` in `env`. `page.open` joins its `path` to the pane's
+/// page and refuses a URL outside [`CallEnv::url_policy`] (the space's own app), before anything is loaded.
+pub fn page_action(
     name: &str,
     args: &Map<String, Value>,
     env: &CallEnv,
-    redactor: &Redactor,
-) -> Result<CallOutput, String> {
-    let browser = env
-        .browser
-        .as_ref()
-        .ok_or("the browser plugin is not mounted in this space")?;
-    let policy = env.url_policy();
+) -> Result<PageAction, String> {
+    let flag = |key: &str| args.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let required = |key: &str| {
+        str_arg(args, key)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{name}: {key} is required"))
+    };
     match name {
         "page.open" => {
-            let path = str_arg(args, "path").ok_or("page.open: path is required")?;
-            let url = join_url(&env.web_base(), path);
-            browser.with_page(policy, redactor, |page| page.open(&url))?;
-            let snapshot = browser.snapshot();
-            Ok(page_output(&snapshot, false, "opened"))
+            let url = join_url(&env.web_base(), &required("path")?);
+            env.url_policy()
+                .check(&url)
+                .map_err(|e| format!("page.open: {e}"))?;
+            Ok(PageAction::Open { url })
         }
-        "page.screenshot" => {
-            let full_page = args
-                .get("full_page")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            // A page that redirected or was clicked away to another site is not captured.
-            let png = browser.with_page(policy, redactor, |page| {
-                page.allowed_current_url()?;
-                page.screenshot_with(ScreenshotOptions {
-                    clip: None,
-                    full_page,
-                })
-            })?;
-            let saved = match &env.scratch {
-                Some(scratch) => {
-                    let rel = format!("screenshots/{}.png", now_millis());
-                    scratch
-                        .write_artifact(&rel, &png)
-                        .map(|p| p.display().to_string())
-                        .map_err(|e| format!("could not save the screenshot: {e}"))?
-                }
-                None => String::new(),
-            };
-            Ok(CallOutput {
-                json: json!({ "path": saved, "bytes": png.len() }),
-                text: format!("screenshot saved to {saved}"),
-                events: Vec::new(),
-                effect: PaneEffect::None,
-            })
-        }
-        "page.reload" => {
-            browser.with_page(policy, redactor, |page| page.reload())?;
-            Ok(page_output(&browser.snapshot(), false, "reloaded"))
-        }
-        "page.console" => {
-            let errors_only = args
-                .get("errors_only")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            browser.with_page(policy, redactor, |page| {
-                page.allowed_current_url()?;
-                page.pump(Duration::from_millis(200))
-            })?;
-            Ok(page_output(&browser.snapshot(), errors_only, "console"))
-        }
-        "page.click" => {
-            let selector = str_arg(args, "selector").ok_or("page.click: selector is required")?;
-            let clicked = browser.with_page(policy, redactor, |page| page.click(selector))?;
-            let text = format!(
-                "clicked <{}> {:?}, now at {}",
-                clicked.tag, clicked.text, clicked.url
-            );
-            Ok(action_output(json!(clicked), &text, redactor))
-        }
-        "page.type" => {
-            let selector = str_arg(args, "selector").ok_or("page.type: selector is required")?;
-            let typed = str_arg(args, "text").ok_or("page.type: text is required")?;
-            let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
-            let result = browser.with_page(policy, redactor, |page| {
-                page.type_text(selector, typed, submit)
-            })?;
-            let text = match &result.value {
-                Some(value) => format!("typed into {selector}: {value:?}, now at {}", result.url),
-                None => format!(
-                    "typed into {selector}; the field is gone, now at {}",
-                    result.url
-                ),
-            };
-            Ok(action_output(json!(result), &text, redactor))
-        }
-        "page.text" => {
-            let selector = str_arg(args, "selector").filter(|s| !s.trim().is_empty());
-            let read = browser.with_page(policy, redactor, |page| page.text(selector))?;
-            let mut text = read.text.clone();
-            if read.truncated {
-                text.push_str(&format!(
-                    "\n[cut at {} of {} characters]",
-                    read.text.chars().count(),
-                    read.chars
-                ));
-            }
-            Ok(action_output(json!(read), &text, redactor))
-        }
+        "page.screenshot" => Ok(PageAction::Screenshot {
+            full_page: flag("full_page"),
+        }),
+        "page.console" => Ok(PageAction::Console {
+            errors_only: flag("errors_only"),
+        }),
+        "page.reload" => Ok(PageAction::Reload),
+        "page.click" => Ok(PageAction::Click {
+            selector: required("selector")?,
+        }),
+        "page.type" => Ok(PageAction::Type {
+            selector: required("selector")?,
+            text: required("text")?,
+            submit: flag("submit"),
+        }),
+        "page.text" => Ok(PageAction::Text {
+            selector: str_arg(args, "selector")
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned),
+        }),
         other => Err(format!("{other} is not a browser built-in")),
     }
 }
 
+/// What a page shows, as `page.open`, `page.reload` and `page.console` report it (unmasked; [`page_output`]
+/// masks it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PageReading {
+    /// The page's URL.
+    pub url: String,
+    /// Its console, oldest first.
+    pub console: Vec<ConsoleEntry>,
+    /// Its failed requests, oldest first.
+    pub network_errors: Vec<NetworkError>,
+}
+
 /// The output of a page action: its JSON and text, both redacted (they hold what the page shows).
-fn action_output(mut json: Value, text: &str, redactor: &Redactor) -> CallOutput {
+pub fn action_output(mut json: Value, text: &str, redactor: &Redactor) -> CallOutput {
     redactor.redact_json(&mut json);
     CallOutput {
         json,
@@ -1239,18 +1228,31 @@ fn action_output(mut json: Value, text: &str, redactor: &Redactor) -> CallOutput
     }
 }
 
-fn page_output(snapshot: &BrowserSnapshot, errors_only: bool, what: &str) -> CallOutput {
-    let console: Vec<&ConsoleEntry> = snapshot
+/// The output of `page.open`, `page.reload` (`what` is `opened` or `reloaded`) and `page.console`
+/// (`console`, with only errors when `errors_only`): `{url, console, network_errors}`, masked.
+pub fn page_output(
+    reading: &PageReading,
+    errors_only: bool,
+    what: &str,
+    redactor: &Redactor,
+) -> CallOutput {
+    let url = xctx_http::mask_url(&reading.url, redactor);
+    let console: Vec<ConsoleEntry> = reading
         .console
         .iter()
-        .filter(|c| !errors_only || c.level == "error" || c.is_exception())
+        .filter(|c| !errors_only || c.is_error())
+        .map(|c| mask_console(c.clone(), redactor))
         .collect();
-    let network: &[NetworkError] = &snapshot.network_errors;
-    let mut text = format!("{what}: {}", snapshot.url.as_deref().unwrap_or(""));
+    let network: Vec<NetworkError> = reading
+        .network_errors
+        .iter()
+        .map(|n| mask_network(n.clone(), redactor))
+        .collect();
+    let mut text = format!("{what}: {url}");
     for c in &console {
         text.push_str(&format!("\n[{}] {}", c.level, c.text));
     }
-    for n in network {
+    for n in &network {
         text.push_str(&format!(
             "\n[network] {} {} {}",
             n.url,
@@ -1260,7 +1262,7 @@ fn page_output(snapshot: &BrowserSnapshot, errors_only: bool, what: &str) -> Cal
     }
     CallOutput {
         json: json!({
-            "url": snapshot.url,
+            "url": url,
             "console": console,
             "network_errors": network,
         }),
@@ -1268,6 +1270,79 @@ fn page_output(snapshot: &BrowserSnapshot, errors_only: bool, what: &str) -> Cal
         events: Vec::new(),
         effect: PaneEffect::None,
     }
+}
+
+/// Save `png` in the space's scratch artifacts (`screenshots/<millis>.png`) and say where: `{path, bytes}`.
+/// The path is empty when the space has no scratch directory.
+pub fn screenshot_output(env: &CallEnv, png: &[u8]) -> Result<CallOutput, String> {
+    let saved = match &env.scratch {
+        Some(scratch) => {
+            let rel = format!("screenshots/{}.png", now_millis());
+            scratch
+                .write_artifact(&rel, png)
+                .map(|p| p.display().to_string())
+                .map_err(|e| format!("could not save the screenshot: {e}"))?
+        }
+        None => String::new(),
+    };
+    Ok(CallOutput {
+        json: json!({ "path": saved, "bytes": png.len() }),
+        text: format!("screenshot saved to {saved}"),
+        events: Vec::new(),
+        effect: PaneEffect::None,
+    })
+}
+
+/// The output of `page.click`: `{tag, text, url}`, redacted.
+pub fn clicked_output(clicked: &xctx_browser::Clicked, redactor: &Redactor) -> CallOutput {
+    let text = format!(
+        "clicked <{}> {:?}, now at {}",
+        clicked.tag, clicked.text, clicked.url
+    );
+    action_output(json!(clicked), &text, redactor)
+}
+
+/// The output of `page.type` into `selector`: `{value|null, url}`, redacted.
+pub fn typed_output(
+    selector: &str,
+    typed: &xctx_browser::Typed,
+    redactor: &Redactor,
+) -> CallOutput {
+    let text = match &typed.value {
+        Some(value) => format!("typed into {selector}: {value:?}, now at {}", typed.url),
+        None => format!(
+            "typed into {selector}; the field is gone, now at {}",
+            typed.url
+        ),
+    };
+    action_output(json!(typed), &text, redactor)
+}
+
+/// The output of `page.text`: `{text, truncated, chars, url}`, redacted.
+pub fn text_output(read: &xctx_browser::PageText, redactor: &Redactor) -> CallOutput {
+    let mut text = read.text.clone();
+    if read.truncated {
+        text.push_str(&format!(
+            "\n[cut at {} of {} characters]",
+            read.text.chars().count(),
+            read.chars
+        ));
+    }
+    action_output(json!(read), &text, redactor)
+}
+
+/// A console entry with its text and location masked.
+pub fn mask_console(mut entry: ConsoleEntry, redactor: &Redactor) -> ConsoleEntry {
+    entry.text = redactor.redact(&entry.text).into_owned();
+    entry.location = entry.location.map(|l| xctx_http::mask_url(&l, redactor));
+    entry
+}
+
+/// A failed request with its URL and reason masked.
+pub fn mask_network(mut error: NetworkError, redactor: &Redactor) -> NetworkError {
+    error.url = xctx_http::mask_url(&error.url, redactor);
+    error.reason = redactor.redact(&error.reason).into_owned();
+    error
 }
 
 fn now_millis() -> u128 {
@@ -1750,6 +1825,15 @@ pub struct HttpState {
     pub error: Option<String>,
 }
 
+/// The browser pane's state in a space, beside its live view (which the window keeps).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WebState {
+    /// Agent `page.*` calls running on the page.
+    pub busy: u32,
+    /// Why the last one failed, masked.
+    pub error: Option<String>,
+}
+
 /// What a space's mounted plugins keep running.
 #[derive(Debug)]
 pub struct SpaceRuntime {
@@ -1761,8 +1845,8 @@ pub struct SpaceRuntime {
     pub logs: HashMap<PaneId, LogTail>,
     /// Each sql pane's state.
     pub sql: HashMap<PaneId, SqlState>,
-    /// The space's browser, once a web pane or a page tool needed it.
-    pub browser: Option<BrowserHandle>,
+    /// The browser pane's state.
+    pub web: WebState,
 }
 
 /// A write call waiting in the Inbox.
@@ -2764,23 +2848,9 @@ impl PluginHost {
                 http_state: HttpState::default(),
                 logs: HashMap::new(),
                 sql: HashMap::new(),
-                browser: None,
+                web: WebState::default(),
             }
         })
-    }
-
-    /// The browser of `space`, made (not started) on first use with its profile under the data directory.
-    pub fn browser(&mut self, space: &SpaceId) -> BrowserHandle {
-        let profile = match &self.data_dir {
-            Some(dir) => dir.join(BROWSER_PROFILES_DIR).join(space.as_str()),
-            None => std::env::temp_dir()
-                .join("xctx-browser-profiles")
-                .join(space.as_str()),
-        };
-        self.runtime(space)
-            .browser
-            .get_or_insert_with(|| BrowserHandle::new(profile))
-            .clone()
     }
 
     /// Start what `mount`'s pane keeps running, for a logs pane: its tail. Other kinds start nothing here (a
@@ -2853,9 +2923,9 @@ impl PluginHost {
         error
     }
 
-    /// Stop what `pane` of `space` keeps running. When no other web pane of the space is left, its browser is
-    /// returned for the caller to close in the background (closing blocks while a page action runs).
-    pub fn stop_backend(&mut self, space: &Space, pane: PaneId) -> Option<BrowserHandle> {
+    /// Stop what `pane` of `space` keeps running. Returns whether the space's browser is no longer needed (no
+    /// other web pane of the space is left), for the window to close its live view.
+    pub fn stop_backend(&mut self, space: &Space, pane: PaneId) -> bool {
         let registry = self.registry(space);
         let uses_browser = self
             .mounts(&space.id)
@@ -2868,30 +2938,24 @@ impl PluginHost {
                 })
             })
             .unwrap_or(false);
-        let runtime = self.runtimes.get_mut(&space.id)?;
-        runtime.logs.remove(&pane);
-        runtime.sql.remove(&pane);
-        if uses_browser {
-            None
-        } else {
-            runtime.browser.take()
+        if let Some(runtime) = self.runtimes.get_mut(&space.id) {
+            runtime.logs.remove(&pane);
+            runtime.sql.remove(&pane);
+            if !uses_browser {
+                runtime.web = WebState::default();
+            }
         }
+        !uses_browser
     }
 
-    /// Stop everything `space`'s plugins keep running (it closes, ships or is discarded). Returns its browser
-    /// to close in the background.
-    pub fn stop_space(&mut self, space: &SpaceId) -> Option<BrowserHandle> {
-        self.runtimes
-            .remove(space)
-            .and_then(|mut runtime| runtime.browser.take())
+    /// Stop everything `space`'s plugins keep running (it closes, ships or is discarded).
+    pub fn stop_space(&mut self, space: &SpaceId) {
+        self.runtimes.remove(space);
     }
 
-    /// Stop everything every space's plugins keep running (xctx quits). Returns the browsers to close.
-    pub fn stop_all(&mut self) -> Vec<BrowserHandle> {
-        self.runtimes
-            .drain()
-            .filter_map(|(_, mut runtime)| runtime.browser.take())
-            .collect()
+    /// Stop everything every space's plugins keep running (xctx quits).
+    pub fn stop_all(&mut self) {
+        self.runtimes.clear();
     }
 
     /// The events tails matched since the last call, without those of the same event that fired from a tail
@@ -3015,11 +3079,6 @@ impl PluginHost {
         let mount = self.mount_of(&space.id, plugin, Some(pane))?;
         let settings = pane_settings(manifest, &mount, ctx)
             .map_err(|e| RpcError::conflict(format!("{plugin}: {e}")))?;
-        let uses_browser = matches!(manifest.pane, PaneSpec::Web { .. })
-            || manifest.tools.iter().any(|t| {
-                matches!(&t.action, xctx_plugin::ToolAction::Builtin(b) if b.starts_with("page."))
-            });
-        let browser = uses_browser.then(|| self.browser(&space.id));
         let logs = self
             .runtime(&space.id)
             .logs
@@ -3040,7 +3099,6 @@ impl PluginHost {
                 space.id.as_str(),
             )
             .ok(),
-            browser,
             web_url: settings.url.clone(),
             secrets: ctx.secrets.clone(),
             pane: Some(pane),
@@ -3473,12 +3531,11 @@ impl PluginHost {
         }
     }
 
-    /// What `space`'s browser pane shows: an idle snapshot until the browser is used.
-    pub fn browser_data(&self, space: &SpaceId) -> BrowserSnapshot {
+    /// The browser pane's state in `space` (agent calls running, the last one's error).
+    pub fn web_state(&self, space: &SpaceId) -> WebState {
         self.runtimes
             .get(space)
-            .and_then(|r| r.browser.as_ref())
-            .map(BrowserHandle::snapshot)
+            .map(|r| r.web.clone())
             .unwrap_or_default()
     }
 
@@ -3921,16 +3978,15 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let files = space_plugin_files(dir.path(), "fix-retry");
         save_mounts(dir.path(), "fix-retry", &[])?;
-        std::fs::create_dir_all(
-            dir.path()
-                .join(BROWSER_PROFILES_DIR)
-                .join("fix-retry/Default"),
-        )?;
-        std::fs::create_dir_all(dir.path().join(BROWSER_PROFILES_DIR).join("other"))?;
+        save_mounts(dir.path(), "other", &[])?;
         assert!(files.iter().all(|f| f.exists()));
         remove_paths(&files)?;
         assert!(files.iter().all(|f| !f.exists()));
-        assert!(dir.path().join(BROWSER_PROFILES_DIR).join("other").exists());
+        assert!(
+            space_plugin_files(dir.path(), "other")
+                .iter()
+                .all(|f| f.exists())
+        );
         // Gone already is fine; a slug that could escape is never removed.
         remove_paths(&files)?;
         assert!(space_plugin_files(dir.path(), "../x").is_empty());
@@ -4009,5 +4065,174 @@ mod tests {
             "the files pane shows the repo's worktree, not its main checkout"
         );
         Ok(())
+    }
+
+    fn web_env(web_url: Option<&str>) -> CallEnv {
+        CallEnv {
+            data_dir: None,
+            space: SpaceId::new("fix-retry"),
+            port: 4011,
+            approved: false,
+            http: Arc::new(Mutex::new(HttpHistory::new(SpaceId::new("fix-retry")))),
+            http_base: None,
+            logs: None,
+            database: None,
+            scratch: None,
+            web_url: web_url.map(str::to_owned),
+            secrets: BTreeMap::new(),
+            pane: None,
+            user_paths: false,
+        }
+    }
+
+    fn page_args(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn page_open_stays_on_the_spaces_app() {
+        let env = web_env(None);
+        let open = |path: &str| page_action("page.open", &page_args(json!({ "path": path })), &env);
+        assert_eq!(
+            open("/login"),
+            Ok(PageAction::Open {
+                url: "http://localhost:4011/login".into()
+            })
+        );
+        assert_eq!(
+            open("http://127.0.0.1:4011/x"),
+            Ok(PageAction::Open {
+                url: "http://127.0.0.1:4011/x".into()
+            })
+        );
+        for elsewhere in ["https://google.com/", "http://localhost:4012/"] {
+            let refused = open(elsewhere);
+            assert!(
+                refused.as_ref().is_err_and(|e| e.starts_with("page.open:")),
+                "{elsewhere}: {refused:?}"
+            );
+        }
+        // Anything that is not an http(s) URL is a path of the app.
+        assert_eq!(
+            open("file:///etc/hosts"),
+            Ok(PageAction::Open {
+                url: "http://localhost:4011/file:///etc/hosts".into()
+            })
+        );
+        // A pane mounted on another page adds that origin, and paths are relative to it.
+        let staged = web_env(Some("https://staging.example.com/app"));
+        assert_eq!(
+            page_action("page.open", &page_args(json!({ "path": "/x" })), &staged),
+            Ok(PageAction::Open {
+                url: "https://staging.example.com/app/x".into()
+            })
+        );
+        assert!(page_action("page.open", &Map::new(), &env).is_err());
+    }
+
+    #[test]
+    fn page_tools_read_their_arguments() {
+        let env = web_env(None);
+        let action = |name: &str, value: Value| page_action(name, &page_args(value), &env);
+        assert_eq!(
+            action("page.click", json!({ "selector": "#go" })),
+            Ok(PageAction::Click {
+                selector: "#go".into()
+            })
+        );
+        assert_eq!(
+            action(
+                "page.type",
+                json!({ "selector": "#q", "text": "hi", "submit": true })
+            ),
+            Ok(PageAction::Type {
+                selector: "#q".into(),
+                text: "hi".into(),
+                submit: true
+            })
+        );
+        assert_eq!(
+            action("page.text", json!({ "selector": "  " })),
+            Ok(PageAction::Text { selector: None })
+        );
+        assert_eq!(
+            action("page.screenshot", json!({ "full_page": true })),
+            Ok(PageAction::Screenshot { full_page: true })
+        );
+        assert_eq!(
+            action("page.console", json!({})),
+            Ok(PageAction::Console { errors_only: false })
+        );
+        assert_eq!(action("page.reload", json!({})), Ok(PageAction::Reload));
+        assert!(action("page.click", json!({})).is_err());
+        assert!(action("page.type", json!({ "selector": "#q" })).is_err());
+        assert!(action("page.fly", json!({})).is_err());
+    }
+
+    #[test]
+    fn page_outputs_are_masked_and_keep_their_shape() {
+        let redactor = Redactor::new([("TOKEN".to_owned(), "hunter22".to_owned())]);
+        let reading = PageReading {
+            url: "http://localhost:4011/?t=hunter22".into(),
+            console: vec![
+                ConsoleEntry {
+                    level: "log".into(),
+                    text: "token hunter22".into(),
+                    location: None,
+                },
+                ConsoleEntry {
+                    level: "exception".into(),
+                    text: "boom".into(),
+                    location: Some("http://localhost:4011/app.js:1:2".into()),
+                },
+            ],
+            network_errors: vec![NetworkError {
+                url: "http://localhost:4011/api?key=hunter22".into(),
+                status: Some(500),
+                reason: "Internal Server Error".into(),
+                resource_type: Some("fetch".into()),
+            }],
+        };
+        let out = page_output(&reading, false, "opened", &redactor);
+        assert!(!out.text.contains("hunter22") && !out.json.to_string().contains("hunter22"));
+        assert!(out.json["url"].is_string());
+        assert_eq!(out.json["console"].as_array().map(Vec::len), Some(2));
+        assert_eq!(out.json["network_errors"][0]["status"], json!(500));
+        assert!(out.text.starts_with("opened: http://localhost:4011/"));
+        let errors = page_output(&reading, true, "console", &redactor);
+        assert_eq!(errors.json["console"].as_array().map(Vec::len), Some(1));
+        assert_eq!(errors.json["console"][0]["level"], json!("exception"));
+
+        let read = xctx_browser::PageText {
+            text: "secret hunter22".into(),
+            truncated: true,
+            chars: 30_000,
+            url: "http://localhost:4011/".into(),
+        };
+        let out = text_output(&read, &redactor);
+        assert!(!out.text.contains("hunter22") && !out.json.to_string().contains("hunter22"));
+        assert!(
+            out.text.contains("[cut at 15 of 30000 characters]"),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.json["truncated"], json!(true));
+        let typed = xctx_browser::Typed {
+            value: None,
+            url: "http://localhost:4011/done".into(),
+        };
+        let out = typed_output("#q", &typed, &redactor);
+        assert_eq!(out.json["value"], Value::Null);
+        assert!(out.text.contains("the field is gone"));
+        let clicked = xctx_browser::Clicked {
+            tag: "button".into(),
+            text: "Pay hunter22".into(),
+            url: "http://localhost:4011/".into(),
+        };
+        let out = clicked_output(&clicked, &redactor);
+        assert_eq!(out.json["tag"], json!("button"));
+        assert!(!out.json.to_string().contains("hunter22"));
+        let shot = screenshot_output(&web_env(None), &[1, 2, 3]);
+        assert_eq!(shot.map(|o| o.json), Ok(json!({ "path": "", "bytes": 3 })));
     }
 }

@@ -140,6 +140,8 @@ pub(crate) struct Workspace {
     pub(crate) plugin_ticker: bool,
     /// The drawn plugin panes' own state (inputs, selections, the views last built).
     pub(crate) plugin_panes: crate::plugin_panes::PluginPanes,
+    /// The open spaces' live browsers (the browser panes' pages), drawn over the window.
+    pub(crate) browsers: crate::plugin_browser::Browsers,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -217,10 +219,9 @@ impl Workspace {
                 for id in &ids {
                     this.persist(id, cx);
                 }
-                // Tails stop as they are dropped; Chrome quits unless a page action still holds it.
-                for browser in this.plugins.stop_all() {
-                    browser.close_if_idle();
-                }
+                // Tails stop as they are dropped; the live browsers are taken off the window.
+                this.plugins.stop_all();
+                this.close_all_browsers();
                 async {}
             }),
         ];
@@ -279,6 +280,7 @@ impl Workspace {
             runners: load_runners(user_runner_dir().as_deref()),
             plugin_ticker: false,
             plugin_panes: Default::default(),
+            browsers: Default::default(),
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -673,6 +675,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
+        self.browsers.attach(window);
         self.sync_plugin_panes(window, cx);
         self.refresh_plugin_panes(cx);
         let body = match self.active_tab() {
@@ -781,6 +784,8 @@ impl Render for Workspace {
                     .children(dialog),
             )
             .child(self.render_status_bar(cx))
+            // Last, so it runs after every pane placed its browser this frame: hide the browsers none placed.
+            .child(self.browsers.frame_end())
     }
 }
 

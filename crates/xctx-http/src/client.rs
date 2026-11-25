@@ -35,7 +35,7 @@ pub struct SendOptions {
     /// - `host:port` (`[::1]:3000` for IPv6): that host on that port, `http` or `https`;
     /// - `host` (`::1` or `[::1]` for IPv6): that host on every port. Meant for remote API hosts; use
     ///   [`SendOptions::allow_local_port`] for the machine itself, so other local services (other spaces'
-    ///   apps, Chrome's DevTools port) stay out of reach.
+    ///   apps) stay out of reach.
     ///
     /// Hosts compare without regard to case. Empty allows nothing. Add entries with the `allow_*` methods,
     /// which normalise them.

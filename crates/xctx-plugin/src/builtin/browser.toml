@@ -1,7 +1,8 @@
-# Browser: a page of the space's app in Chrome, with its screenshot, console and network errors in the pane.
+# Browser: a live WebKit page in the pane, which the user browses and the agents' page tools drive (only on the
+# space's own app), with its console and network errors in the pane.
 name = "browser"
 version = "1.0.0"
-description = "Open the space's app in Chrome and see its screenshot, console and network errors"
+description = "A live browser in the pane: the space's app (or any site you browse to), its console and network errors, driven by agents on the app"
 
 [pane]
 kind = "web"
@@ -36,7 +37,7 @@ params = [
 
 [[tools]]
 name = "page.click"
-description = "Click the first element matching a CSS selector on the open page (a real mouse click at its centre)"
+description = "Click the first element matching a CSS selector on the open page (pointer and mouse events at its centre, then a click)"
 effect = "read"
 builtin = "page.click"
 params = [

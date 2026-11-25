@@ -25,6 +25,7 @@ xctx-plugin = { path = "../xctx-plugin" }
 xctx-plugin-view = { path = "../xctx-plugin-view" }
 xctx-term = { path = "../xctx-term" }
 xctx-term-view = { path = "../xctx-term-view" }
+xctx-web-view = { path = "../xctx-web-view" }
 xctx-ui = { path = "../xctx-ui" }
 
 [dev-dependencies]

@@ -1,4 +1,5 @@
-//! Which pages the browser may open.
+//! Which pages the agents' `page.*` tools may open and read, which pages the user's browsing may open, and
+//! what the pane's URL bar opens for what the user typed.
 
 use url::{Host, Url};
 
@@ -7,14 +8,20 @@ use crate::error::{BrowserError, Result};
 /// The names of the machine itself: [`UrlPolicy::allow_local_port`] allows each of them on one port.
 pub const LOCAL_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
-/// The origins the browser may navigate to, checked by [`crate::Page::open`] before anything is sent, and by
-/// the app against [`crate::Page::current_url`] before it captures a page.
+/// The schemes the user's own navigation in the live browser may load: web pages, and the documents a page
+/// makes itself.
+const USER_SCHEMES: &[&str] = &["http", "https", "about", "data", "blob"];
+
+/// The origins the agents' `page.*` tools may use: `page.open` refuses any other URL ([`UrlPolicy::check`])
+/// and the other tools refuse to read, capture or act on a page that is anywhere else
+/// ([`UrlPolicy::check_current`]), so nothing the user browses to reaches an agent.
 ///
-/// The default allows nothing. The app allows the space's app with [`UrlPolicy::allow_local_port`] (the
-/// space's `PORT` on the machine itself, no other local port: other spaces' apps and Chrome's own DevTools
-/// port stay out of reach) and a space's configured base URLs with [`UrlPolicy::allow_url_origin`]. Only
-/// `http` and `https` URLs pass. The check covers the URL the caller asks for; pages the site itself loads
-/// (scripts, redirects, fetches) are not filtered, which is why the current URL must be checked again.
+/// The user's own browsing in the pane is not limited by it. The default allows nothing. The app allows the
+/// space's app with [`UrlPolicy::allow_local_port`] (the space's `PORT` on the machine itself, no other local
+/// port: other spaces' apps stay out of reach) and the pane's configured page with
+/// [`UrlPolicy::allow_url_origin`]. Only `http` and `https` URLs pass. The check covers the URL the caller
+/// asks for; pages the site itself loads (scripts, redirects, fetches) are not filtered, which is why the
+/// current URL is checked again after every action.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UrlPolicy {
     /// The allowed origins. Each entry is `scheme://host:port` (that origin only), `host:port` (`[::1]:3000`
@@ -130,6 +137,64 @@ impl UrlPolicy {
             });
         }
         Ok(parsed)
+    }
+
+    /// The page URL `current` (as the browser reports it; `None` before anything was opened) if the tools may
+    /// read and act on it: an allowed URL, or a blank page. Otherwise [`BrowserError::OtherSite`], which
+    /// does not say where the page is: the user's browsing stays theirs.
+    pub fn check_current(&self, current: Option<&str>) -> Result<String> {
+        match current.map(str::trim).filter(|u| !u.is_empty()) {
+            None => Ok("about:blank".to_owned()),
+            Some("about:blank") => Ok("about:blank".to_owned()),
+            Some(url) if self.allows_url(url) => Ok(url.to_owned()),
+            Some(_) => Err(BrowserError::OtherSite),
+        }
+    }
+}
+
+/// Whether the user's own navigation in the live browser (typed, clicked, or started by the page) may load
+/// `url`: any `http` or `https` page, and `about:`, `data:` and `blob:` documents. Other schemes (`file:`,
+/// custom app schemes) are refused with why. The agents' tools are limited further by [`UrlPolicy`].
+pub fn user_may_open(url: &str) -> Result<()> {
+    let parsed = parse(url)?;
+    if USER_SCHEMES.contains(&parsed.scheme()) {
+        Ok(())
+    } else {
+        Err(BrowserError::UnsupportedScheme(parsed.scheme().to_owned()))
+    }
+}
+
+/// The URL the pane's URL bar opens for what the user typed: a path (`/login`) on `base` (the pane's page,
+/// `http://localhost:{PORT}`), `base` itself for nothing, a URL with a scheme as it is, and a bare host with
+/// `http://` for the machine itself (`localhost:3000/x`) and `https://` for anything else (`google.com`).
+pub fn typed_url(typed: &str, base: &str) -> String {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return base.to_owned();
+    }
+    if typed.starts_with('/') {
+        return Url::parse(base)
+            .and_then(|b| b.join(typed))
+            .map(String::from)
+            .unwrap_or_else(|_| format!("{}{typed}", base.trim_end_matches('/')));
+    }
+    let lower = typed.to_ascii_lowercase();
+    if lower.contains("://")
+        || ["about:", "data:", "blob:"]
+            .iter()
+            .any(|s| lower.starts_with(s))
+    {
+        return typed.to_owned();
+    }
+    let host = lower.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    if LOCAL_HOSTS.contains(&host) {
+        format!("http://{typed}")
+    } else {
+        format!("https://{typed}")
     }
 }
 
@@ -364,5 +429,81 @@ mod tests {
         let before = policy.allowed_hosts.len();
         policy.allow_host("FE80::1");
         assert_eq!(policy.allowed_hosts.len(), before);
+    }
+
+    #[test]
+    fn the_tools_act_only_on_the_apps_pages_or_a_blank_one() {
+        let policy = local(3000);
+        assert_eq!(policy.check_current(None), Ok("about:blank".to_owned()));
+        assert_eq!(
+            policy.check_current(Some("about:blank")),
+            Ok("about:blank".to_owned())
+        );
+        assert_eq!(
+            policy.check_current(Some("http://localhost:3000/login?next=/")),
+            Ok("http://localhost:3000/login?next=/".to_owned())
+        );
+        for elsewhere in [
+            "https://www.google.com/search?q=secret",
+            "http://localhost:3001/",
+            "data:text/html,hi",
+            "file:///etc/hosts",
+        ] {
+            let refused = policy.check_current(Some(elsewhere));
+            assert_eq!(refused, Err(BrowserError::OtherSite), "{elsewhere}");
+            let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(!message.contains("google") && !message.contains("secret"));
+            assert!(message.contains("page.open"), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_user_may_browse_any_web_page_but_not_other_schemes() {
+        for url in [
+            "https://www.google.com/",
+            "http://example.com:8080/x",
+            "http://localhost:3001/",
+            "about:blank",
+            "data:text/html,hi",
+            "blob:http://localhost:3000/1234",
+        ] {
+            assert_eq!(user_may_open(url), Ok(()), "{url}");
+        }
+        assert_eq!(
+            user_may_open("file:///etc/passwd"),
+            Err(BrowserError::UnsupportedScheme("file".into()))
+        );
+        assert!(user_may_open("javascript:alert(1)").is_err());
+        assert!(user_may_open("zoommtg://join").is_err());
+        assert!(matches!(
+            user_may_open("not a url"),
+            Err(BrowserError::InvalidUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn typed_urls_get_a_scheme_or_the_apps_origin() {
+        let base = "http://localhost:3000";
+        assert_eq!(typed_url("", base), base);
+        assert_eq!(typed_url("  ", base), base);
+        assert_eq!(typed_url("/login", base), "http://localhost:3000/login");
+        assert_eq!(
+            typed_url("/a?b=1", "http://localhost:3000/app/"),
+            "http://localhost:3000/a?b=1"
+        );
+        assert_eq!(typed_url("google.com", base), "https://google.com");
+        assert_eq!(
+            typed_url(" Example.com/path?q=1 ", base),
+            "https://Example.com/path?q=1"
+        );
+        assert_eq!(
+            typed_url("localhost:3000/x", base),
+            "http://localhost:3000/x"
+        );
+        assert_eq!(typed_url("127.0.0.1:8080", base), "http://127.0.0.1:8080");
+        assert_eq!(typed_url("[::1]:5173/", base), "http://[::1]:5173/");
+        assert_eq!(typed_url("http://google.com", base), "http://google.com");
+        assert_eq!(typed_url("HTTPS://x.dev/", base), "HTTPS://x.dev/");
+        assert_eq!(typed_url("about:blank", base), "about:blank");
     }
 }

@@ -3,7 +3,8 @@
 //!
 //! The app plans a call with `xctx_plugin::plan_call`; when the plan is an `Invocation::Builtin` whose name is
 //! one of [`BUILTINS`], it builds a [`BuiltinContext`] for the space and calls [`run_builtin`] from a background
-//! thread (everything here blocks). `http.*` and `page.*` built-ins live in `xctx-http` and `xctx-browser`.
+//! thread (everything here blocks). `http.*` built-ins live in `xctx-http`; `page.*` built-ins drive the browser
+//! pane's live page in the window (`xctx-web-view`, with its scripts in `xctx-browser`).
 //!
 //! **Writes.** `sql.write` and `issue.comment` are write tools: they run only when
 //! [`BuiltinContext::approved`] is true. The app sets it only after the user approved the call in an Inbox

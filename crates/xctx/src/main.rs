@@ -20,6 +20,7 @@ mod lifecycle_tests;
 mod parent_agent;
 mod persist;
 mod plugin_backend;
+mod plugin_browser;
 mod plugin_host;
 mod plugin_jobs;
 mod plugin_menu_dialog;

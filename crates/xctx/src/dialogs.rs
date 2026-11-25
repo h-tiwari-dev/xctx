@@ -449,17 +449,15 @@ impl Workspace {
 
     /// The space `id` was shipped or discarded: drop its agent graph, attempts and plugins from memory, and in the
     /// background remove its scratch directory (best effort: a leftover directory under `/tmp` harms nothing), its
-    /// plugins' files (`spaces/<slug>/plugins.json` and its browser profile `browser-profiles/<slug>`), and the
+    /// plugins' files (`spaces/<slug>/plugins.json`), and the
     /// backups adopting attempts kept in its `repos` (`refs/xctx/pre-adopt/<slug>/*`), saying which could not be
     /// removed.
     fn space_ended(&mut self, id: &SpaceId, repos: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.graphs.forget(id);
         self.attempts.forget(id);
         self.unsaved_adoptions.remove(id);
-        if let Some(browser) = self.plugins.stop_space(id) {
-            // Normally closed with the tab already; close it before its profile goes.
-            browser.close_if_idle();
-        }
+        // Normally stopped with the tab already.
+        self.stop_space_plugins(id);
         let plugin_files = self.plugins.forget_space(id);
         let slug = id.as_str().to_owned();
         let executor = cx.background_executor().clone();

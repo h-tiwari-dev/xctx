@@ -1,9 +1,10 @@
-//! What keeps a mounted plugin pane going without a window: the tail behind a logs pane (a command or a file,
-//! into a bounded [`LogBuffer`]) and the Chrome behind a browser pane.
+//! What keeps a mounted logs pane going without a window: the tail behind it (a command or a file, into a
+//! bounded [`LogBuffer`]).
 //!
-//! Both run on their own threads or are driven from the background executor, and hand what the UI needs to
-//! the workspace through shared state: the buffer itself, a dirty flag the workspace polls to redraw, and a
-//! channel of the plugin events matched in the tailed lines. Nothing here is run inside a shell.
+//! A tail runs on its own thread and hands what the UI needs to the workspace through shared state: the buffer
+//! itself, a dirty flag the workspace polls to redraw, and a channel of the plugin events matched in the tailed
+//! lines. Nothing here is run inside a shell. (The browser pane's live page lives in the window: see
+//! `plugin_browser.rs`.)
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -17,9 +18,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
-use xctx_browser::{
-    Browser, ConsoleEntry, LaunchOptions, NetworkError, Page, UrlPolicy, find_chrome,
-};
 use xctx_connectors::LogBuffer;
 use xctx_core::{Redactor, SpaceId};
 use xctx_layout::PaneId;
@@ -27,9 +25,6 @@ use xctx_plugin::{Manifest, match_events};
 
 /// How often a tailed file is read for new lines.
 pub const FILE_POLL: Duration = Duration::from_millis(300);
-
-/// The viewport, in pixels, of the headless Chrome behind a space's browser pane: what its screenshots show.
-pub const BROWSER_VIEWPORT: (u32, u32) = (1280, 800);
 
 /// How much of a tailed file's end is read when the tail starts.
 pub const FILE_TAIL_START_BYTES: u64 = 64 * 1024;
@@ -329,278 +324,6 @@ fn follow_file(path: &Path, buffer: &LogBuffer, target: &TailTarget, stop: &Atom
         }
         thread::sleep(FILE_POLL);
     }
-}
-
-// -------------------------------------------------------------------------------------------------------------
-// Browser
-
-/// Where a space's browser is, for its pane.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum BrowserPhase {
-    /// Chrome has not been started yet; it starts on the first open.
-    #[default]
-    Idle,
-    /// No Chrome or Chromium was found (set `XCTX_CHROME` to one).
-    ChromeNotFound,
-    /// Chrome is starting or a page is loading.
-    Connecting,
-    /// A page is open.
-    Ready,
-    /// Chrome failed or the connection dropped, with why (masked).
-    Failed(String),
-}
-
-/// What a browser pane shows, updated after each page action. Cheap to read from the UI thread.
-#[derive(Clone, Debug, Default)]
-pub struct BrowserSnapshot {
-    /// Where the browser is.
-    pub phase: BrowserPhase,
-    /// The page open, masked.
-    pub url: Option<String>,
-    /// The latest screenshot as PNG bytes.
-    pub screenshot: Option<Arc<Vec<u8>>>,
-    /// Counts up with every new screenshot, so the pane rebuilds its image only when it changed.
-    pub screenshot_generation: u64,
-    /// The page's console, masked, oldest first.
-    pub console: Vec<ConsoleEntry>,
-    /// The page's failed requests, masked, oldest first.
-    pub network_errors: Vec<NetworkError>,
-    /// Why the last action failed, masked.
-    pub error: Option<String>,
-}
-
-/// The Chrome of one space, started on first use with its own profile under the data directory. Headless: it has
-/// no window of its own, so the page is only seen inside xctx, in the browser pane (its screenshot, console and
-/// failed requests). Closed (Chrome quit) when the browser plugin is unmounted, the space closes, or xctx quits.
-pub struct BrowserSession {
-    profile_dir: PathBuf,
-    browser: Option<Browser>,
-    page: Option<Page>,
-}
-
-impl std::fmt::Debug for BrowserSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BrowserSession")
-            .field("profile_dir", &self.profile_dir)
-            .field("running", &self.browser.is_some())
-            .finish()
-    }
-}
-
-/// A space's browser: the session (held by one background action at a time) and its snapshot (read by the UI).
-#[derive(Clone, Debug)]
-pub struct BrowserHandle {
-    session: Arc<Mutex<BrowserSession>>,
-    snapshot: Arc<Mutex<BrowserSnapshot>>,
-}
-
-impl BrowserHandle {
-    /// A browser whose Chrome will use the profile in `profile_dir`; nothing is started yet.
-    pub fn new(profile_dir: PathBuf) -> BrowserHandle {
-        BrowserHandle {
-            session: Arc::new(Mutex::new(BrowserSession {
-                profile_dir,
-                browser: None,
-                page: None,
-            })),
-            snapshot: Arc::new(Mutex::new(BrowserSnapshot::default())),
-        }
-    }
-
-    /// What the pane shows now.
-    pub fn snapshot(&self) -> BrowserSnapshot {
-        lock(&self.snapshot).clone()
-    }
-
-    fn update(&self, change: impl FnOnce(&mut BrowserSnapshot)) {
-        change(&mut lock(&self.snapshot));
-    }
-
-    /// Run `action` on the space's page, starting Chrome and opening a tab first when needed, then refresh the
-    /// snapshot (screenshot, console, failed requests). Blocks: call it from the background. Errors are masked.
-    ///
-    /// Only a broken DevTools connection ([`xctx_browser::BrowserError::is_transport`]) resets the browser; a page
-    /// that failed to load, took too long or was refused keeps Chrome and its page, and the error is reported.
-    /// The snapshot is refreshed only while the page is on an allowed origin
-    /// ([`Page::allowed_current_url`]): a page that redirected or was clicked away to another site is not
-    /// captured, and that is an error.
-    pub fn with_page<T>(
-        &self,
-        policy: UrlPolicy,
-        redactor: &Redactor,
-        action: impl FnOnce(&mut Page) -> xctx_browser::Result<T>,
-    ) -> Result<T, String> {
-        let mut session = lock(&self.session);
-        self.update(|s| {
-            s.phase = BrowserPhase::Connecting;
-            s.error = None;
-        });
-        let failure = |e: xctx_browser::BrowserError| {
-            if e.is_transport() {
-                PageFailure::Transport(e.to_string())
-            } else {
-                PageFailure::Page(e.to_string())
-            }
-        };
-        let result = (|| {
-            if session.browser.is_none() {
-                let chrome = find_chrome().map_err(|e| PageFailure::NotFound(e.to_string()))?;
-                // No window of its own: the page is only ever seen through the space's browser pane, so it stays
-                // inside xctx. The size is the viewport screenshots are taken at.
-                let options = LaunchOptions {
-                    headless: true,
-                    window_size: Some(BROWSER_VIEWPORT),
-                    ..LaunchOptions::new(chrome, session.profile_dir.clone())
-                };
-                session.browser = Some(
-                    Browser::launch(options).map_err(|e| PageFailure::Transport(e.to_string()))?,
-                );
-                session.page = None;
-            }
-            if session.page.is_none() {
-                let Some(browser) = session.browser.as_mut() else {
-                    return Err(PageFailure::Transport("Chrome is not running".to_owned()));
-                };
-                session.page = Some(browser.new_page(policy.clone()).map_err(failure)?);
-            }
-            let Some(page) = session.page.as_mut() else {
-                return Err(PageFailure::Transport("no page is open".to_owned()));
-            };
-            page.set_policy(policy);
-            let value = action(page).map_err(failure)?;
-            let url = match page.allowed_current_url() {
-                Ok(url) => url,
-                Err(e) if e.is_transport() => return Err(PageFailure::Transport(e.to_string())),
-                Err(e) => {
-                    let at = page.current_url().unwrap_or_default();
-                    return Err(PageFailure::LeftPolicy {
-                        url: at,
-                        why: e.to_string(),
-                    });
-                }
-            };
-            let png = page.screenshot().ok();
-            let console = page.console().unwrap_or_default();
-            let network = page.network_errors().unwrap_or_default();
-            Ok((value, url, png, console, network))
-        })();
-        match result {
-            Ok((value, url, png, console, network)) => {
-                self.update(|s| {
-                    s.phase = BrowserPhase::Ready;
-                    s.url = Some(xctx_http::mask_url(&url, redactor));
-                    if let Some(png) = png {
-                        s.screenshot = Some(Arc::new(png));
-                        s.screenshot_generation += 1;
-                    }
-                    s.console = console
-                        .into_iter()
-                        .map(|c| mask_console(c, redactor))
-                        .collect();
-                    s.network_errors = network
-                        .into_iter()
-                        .map(|n| mask_network(n, redactor))
-                        .collect();
-                });
-                Ok(value)
-            }
-            Err(failure) => {
-                let message = redactor.redact(&failure.message()).into_owned();
-                if matches!(failure, PageFailure::Transport(_)) {
-                    // A broken connection is not reused: the next action starts over.
-                    session.page = None;
-                    session.browser = None;
-                }
-                self.update(|s| {
-                    match &failure {
-                        PageFailure::NotFound(_) => s.phase = BrowserPhase::ChromeNotFound,
-                        PageFailure::Transport(_) => {
-                            s.phase = BrowserPhase::Failed(message.clone())
-                        }
-                        PageFailure::Page(_) => s.phase = BrowserPhase::Ready,
-                        PageFailure::LeftPolicy { url, .. } => {
-                            // Nothing of a page outside the allowed origins is kept or shown.
-                            s.phase = BrowserPhase::Ready;
-                            s.url = Some(xctx_http::mask_url(url, redactor));
-                            s.screenshot = None;
-                            s.screenshot_generation += 1;
-                            s.console.clear();
-                            s.network_errors.clear();
-                        }
-                    }
-                    s.error = Some(message.clone());
-                });
-                Err(message)
-            }
-        }
-    }
-
-    /// Quit Chrome now unless a page action holds the session (as xctx quits, it must not wait for one).
-    pub fn close_if_idle(&self) {
-        if let Ok(mut session) = self.session.try_lock() {
-            session.page = None;
-            if let Some(browser) = session.browser.take() {
-                let _ = browser.close();
-            }
-        }
-    }
-
-    /// Quit Chrome, if it was started. Blocks for as long as a running action holds the session.
-    pub fn close(&self) {
-        let mut session = lock(&self.session);
-        session.page = None;
-        if let Some(browser) = session.browser.take() {
-            let _ = browser.close();
-        }
-        self.update(|s| s.phase = BrowserPhase::Idle);
-    }
-}
-
-/// Why a page action failed, which decides whether the browser is kept.
-#[derive(Debug)]
-enum PageFailure {
-    /// No Chrome was found.
-    NotFound(String),
-    /// The DevTools connection broke, or Chrome could not start: reset the browser.
-    Transport(String),
-    /// The page failed (navigation, timeout, a refused URL): keep Chrome and the page.
-    Page(String),
-    /// The page is on `url`, which the policy does not allow: keep Chrome, show nothing of the page.
-    LeftPolicy {
-        /// Where the page is.
-        url: String,
-        /// The policy's refusal.
-        why: String,
-    },
-}
-
-impl PageFailure {
-    fn message(&self) -> String {
-        match self {
-            PageFailure::NotFound(m) | PageFailure::Transport(m) | PageFailure::Page(m) => {
-                m.clone()
-            }
-            PageFailure::LeftPolicy { why, .. } => {
-                format!(
-                    "the page left the allowed origins ({why}); its screenshot and console are not shown"
-                )
-            }
-        }
-    }
-}
-
-/// A console entry with its text masked.
-pub fn mask_console(mut entry: ConsoleEntry, redactor: &Redactor) -> ConsoleEntry {
-    entry.text = redactor.redact(&entry.text).into_owned();
-    entry.location = entry.location.map(|l| redactor.redact(&l).into_owned());
-    entry
-}
-
-/// A failed request with its URL and reason masked.
-pub fn mask_network(mut error: NetworkError, redactor: &Redactor) -> NetworkError {
-    error.url = redactor.redact(&error.url).into_owned();
-    error.reason = redactor.redact(&error.reason).into_owned();
-    error
 }
 
 #[cfg(test)]

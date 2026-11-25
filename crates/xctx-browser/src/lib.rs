@@ -1,53 +1,32 @@
-//! A minimal Chrome DevTools protocol client behind the browser plugin: find Chrome, start it with a
-//! dedicated profile (or attach to one already running), open a page of the space's app, take a screenshot,
-//! and collect its console and failed requests.
+//! The browser plugin's page logic, without a window: what the live browser view (`xctx-web-view`, a
+//! `WKWebView` in the space's browser pane) runs in the page and what it reads back.
 //!
-//! Everything blocks (a plain socket for the `/json/*` endpoints and a `tungstenite` websocket for the
-//! protocol, no async runtime); the app calls it from a background thread. Each [`Page`] has its own
-//! connection and reads its events whenever it waits for an answer, keeping only bounded lists of what it
-//! needs. Pages open only URLs their [`UrlPolicy`] allows (nothing by default; the app allows the space's
-//! port on the machine itself and its base URLs), and [`Page::allowed_current_url`] checks where a page went
-//! since. [`BrowserError::is_transport`] tells a broken connection (reset Chrome) from a failed page action.
+//! - [`UrlPolicy`]: which pages the agents' `page.*` tools may open and read (the space's own app). The user
+//!   browses freely in the pane; the tools refuse a page outside the policy.
+//! - [`script`]: the scripts the tools run in the page (click, type, read text), each built with its values
+//!   encoded as JSON string literals so nothing from a selector or a text is ever spliced into code, and the
+//!   parsing of what they return.
+//! - [`log`]: the console messages and failed requests the capture script ([`log::capture_script`]) reports,
+//!   parsed ([`log::parse_message`]) into bounded lists ([`PageLog`]).
+//! - [`typed_url`]: what the pane's URL bar opens for what the user typed.
 //!
-//! ```no_run
-//! # fn main() -> xctx_browser::Result<()> {
-//! use xctx_browser::{Browser, LaunchOptions, UrlPolicy, find_chrome};
-//! let mut options = LaunchOptions::new(find_chrome()?, "/path/to/xctx/browser-profile");
-//! options.headless = true;
-//! let mut browser = Browser::launch(options)?;
-//! let mut policy = UrlPolicy::default();
-//! policy.allow_local_port(3000);
-//! let mut page = browser.new_page(policy)?;
-//! page.open("http://localhost:3000/")?;
-//! page.allowed_current_url()?;
-//! let png = page.screenshot()?;
-//! let console = page.console()?;
-//! let failed = page.network_errors()?;
-//! # let _ = (png, console, failed);
-//! browser.close()
-//! # }
-//! ```
+//! Everything here is plain data and strings, tested without WebKit.
 
 #![warn(missing_docs)]
 
-pub mod browser;
-pub mod cdp;
-pub mod chrome;
 pub mod error;
-mod http;
-pub mod page;
+pub mod log;
 pub mod policy;
+pub mod script;
 
-pub use browser::{
-    ACTIVE_PORT_FILE, ActivePort, Browser, DEFAULT_LAUNCH_TIMEOUT, LaunchOptions, TargetInfo,
-    VersionInfo, parse_active_port,
-};
-pub use cdp::{Event, MAX_MESSAGE_BYTES};
-pub use chrome::{CHROME_APPS, CHROME_ENV, find_chrome};
 pub use error::{BrowserError, Result};
-pub use page::{
-    BoundedLog, Clicked, Clip, ConsoleEntry, DEFAULT_PAGE_TIMEOUT, MAX_CONSOLE_ENTRIES,
-    MAX_ENTRY_CHARS, MAX_NETWORK_ERRORS, MAX_PAGE_TEXT_CHARS, NetworkError, Page, PageText,
-    ScreenshotOptions, Typed,
+pub use log::{
+    BoundedLog, ConsoleEntry, MAX_CONSOLE_ENTRIES, MAX_ENTRY_CHARS, MAX_NETWORK_ERRORS,
+    MESSAGE_HANDLER, NetworkError, PageLog, PageMessage, capture_script, parse_message,
 };
-pub use policy::{LOCAL_HOSTS, UrlPolicy};
+pub use policy::{LOCAL_HOSTS, UrlPolicy, typed_url, user_may_open};
+pub use script::{
+    CLICKED_TEXT_CHARS, Clicked, MAX_PAGE_TEXT_CHARS, PageText, Typed, cap_text, click_script,
+    click_target, element_script, evaluation_script, js_string, page_text, parse_evaluation,
+    read_value_script, text_script, type_script, typed_value,
+};

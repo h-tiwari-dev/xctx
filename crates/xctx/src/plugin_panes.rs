@@ -17,23 +17,25 @@ use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
     ScrollHandle, SharedString, Styled, Subscription, WeakEntity, Window, div, prelude::*,
 };
-use xctx_core::SpaceId;
+use xctx_browser::{ConsoleEntry, NetworkError, typed_url};
+use xctx_core::{Redactor, SpaceId};
 use xctx_http::{Exchange, ExchangeDiff, HeaderChange, Outcome, Request};
 use xctx_layout::{PaneId, PaneKind};
 use xctx_plugin_view::{
-    BrowserPaneView, BrowserStatus, BrowserView, ConsoleRow, FileMark, FileRow, FileRowKind,
-    FilesPaneView, FilesPreview, FilesView, HttpDiffView, HttpPaneView, HttpResponseView, HttpRow,
-    HttpView, LOG_LINE_CHARS, LOG_LINE_LIMIT, LogLevel, LogLine, LogsPaneView, LogsView,
-    NetworkErrorRow, PreviewBody, SQL_ROW_LIMIT, Screenshot, SqlPaneView, SqlResultView, SqlView,
-    detect_level, level_passes,
+    BrowserPaneView, BrowserView, ConsoleRow, FileMark, FileRow, FileRowKind, FilesPaneView,
+    FilesPreview, FilesView, HttpDiffView, HttpPaneView, HttpResponseView, HttpRow, HttpView,
+    LOG_LINE_CHARS, LOG_LINE_LIMIT, LogLevel, LogLine, LogsPaneView, LogsView, NetworkErrorRow,
+    PreviewBody, SQL_ROW_LIMIT, SqlPaneView, SqlResultView, SqlView, detect_level, level_passes,
 };
 use xctx_ui::{PromptEvent, PromptInput, Theme, cut_line};
+use xctx_web_view::{PageStatus, WebView};
 
-use crate::plugin_backend::{BrowserPhase, BrowserSnapshot, TailStatus};
+use crate::plugin_backend::TailStatus;
+use crate::plugin_browser::page_area;
 use crate::plugin_host::{
     FILES_PREVIEW_BYTES, FILES_PREVIEW_LINES, FilePreview, FileTree, GitChange, HttpPaneData,
-    LogsPaneData, PreviewText, SqlPaneData, TreeRow, TreeRowKind, file_diff, git_status,
-    list_folder, read_preview,
+    LogsPaneData, PreviewText, SqlPaneData, TreeRow, TreeRowKind, WebState, file_diff, git_status,
+    list_folder, mask_console, mask_network, read_preview,
 };
 use crate::workspace::Workspace;
 
@@ -293,17 +295,6 @@ pub(crate) fn sql_view(data: &SqlPaneData) -> SqlView {
     }
 }
 
-/// The browser pane's status for the browser's `phase`.
-pub(crate) fn browser_status(phase: &BrowserPhase) -> BrowserStatus {
-    match phase {
-        BrowserPhase::Idle => BrowserStatus::Idle,
-        BrowserPhase::ChromeNotFound => BrowserStatus::ChromeNotFound,
-        BrowserPhase::Connecting => BrowserStatus::Connecting,
-        BrowserPhase::Ready => BrowserStatus::Ready,
-        BrowserPhase::Failed(why) => BrowserStatus::Failed(why.clone().into()),
-    }
-}
-
 /// The level of a console message from its console method (`error`, `warning`, ...), or `exception`.
 pub(crate) fn console_level(method: &str) -> Option<LogLevel> {
     match method {
@@ -315,37 +306,70 @@ pub(crate) fn console_level(method: &str) -> Option<LogLevel> {
     }
 }
 
-/// The browser view of `snapshot` (masked already), without its screenshot (built once per generation by
-/// the pane): status, page, console (with where each came from), failed requests and the last error.
-pub(crate) fn browser_view(snapshot: &BrowserSnapshot) -> BrowserView {
+/// What the live page shows: its status, console and failed requests, read from the space's browser.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PageShown {
+    pub(crate) status: PageStatus,
+    pub(crate) console: Vec<ConsoleEntry>,
+    pub(crate) network_errors: Vec<NetworkError>,
+}
+
+/// The browser view of the live page `page` and the pane's `web` state, everything masked with `redactor`:
+/// the URL and title, loading and history, why the last load failed, the agent's activity and last error,
+/// the console (with where each message came from) and the failed requests.
+pub(crate) fn browser_view(
+    page: &PageShown,
+    web: &WebState,
+    console_open: bool,
+    redactor: &Redactor,
+) -> BrowserView {
+    let status = &page.status;
+    let masked = |text: &str| SharedString::from(redactor.redact(text).into_owned());
     BrowserView {
-        url: snapshot.url.clone().unwrap_or_default().into(),
-        status: browser_status(&snapshot.phase),
-        screenshot: None,
-        console: snapshot
+        url: status
+            .url
+            .as_deref()
+            .map(|u| xctx_http::mask_url(u, redactor))
+            .unwrap_or_default()
+            .into(),
+        title: status.title.as_deref().map(masked),
+        loading: status.loading.then_some(status.progress),
+        can_go_back: status.can_go_back,
+        can_go_forward: status.can_go_forward,
+        has_page: status.url.is_some(),
+        load_error: status.error.as_deref().map(masked),
+        agent_busy: web.busy > 0,
+        error: web.error.as_deref().map(masked),
+        console: page
             .console
             .iter()
-            .map(|c| ConsoleRow {
-                level: console_level(&c.level),
-                text: match &c.location {
-                    Some(at) => format!("{} ({at})", c.text).into(),
-                    None => c.text.clone().into(),
-                },
+            .map(|c| {
+                let c = mask_console(c.clone(), redactor);
+                ConsoleRow {
+                    level: console_level(&c.level),
+                    text: match &c.location {
+                        Some(at) => format!("{} ({at})", c.text).into(),
+                        None => c.text.into(),
+                    },
+                }
             })
             .collect(),
-        network_errors: snapshot
+        network_errors: page
             .network_errors
             .iter()
-            .map(|n| NetworkErrorRow {
-                url: n.url.clone().into(),
-                detail: match n.status {
-                    Some(code) if n.reason.is_empty() => code.to_string().into(),
-                    Some(code) => format!("{code} {}", n.reason).into(),
-                    None => n.reason.clone().into(),
-                },
+            .map(|n| {
+                let n = mask_network(n.clone(), redactor);
+                NetworkErrorRow {
+                    url: n.url.into(),
+                    detail: match n.status {
+                        Some(code) if n.reason.is_empty() => code.to_string().into(),
+                        Some(code) => format!("{code} {}", n.reason).into(),
+                        None => n.reason.into(),
+                    },
+                }
             })
             .collect(),
-        error: snapshot.error.clone().map(SharedString::from),
+        console_open,
     }
 }
 
@@ -497,9 +521,13 @@ pub(crate) struct SqlUi {
 /// The browser pane's own state.
 pub(crate) struct WebUi {
     url: Entity<PromptInput>,
+    /// The pane's page (`http://localhost:{PORT}` unless mounted with another), unmasked: what a path typed in
+    /// the URL bar is relative to.
+    base: String,
+    /// The page URL the URL bar was last set to, so it follows the page as it navigates.
+    shown_url: Option<String>,
+    console_open: bool,
     view: BrowserView,
-    /// The screenshot generation `view.screenshot` was built from.
-    shot_generation: u64,
 }
 
 /// The files pane's own state: what it read of its worktree, and the selected file.
@@ -746,23 +774,22 @@ impl Workspace {
                 })
             }
             RendererKind::Web => {
-                let page = settings.url.as_deref().map(mask);
+                let base = settings
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| format!("http://localhost:{}", space.port));
                 let url = input(
                     cx,
-                    format!(
-                        "A page of the app, e.g. /login or http://localhost:{}",
-                        space.port
-                    ),
-                    page.as_deref(),
+                    "A URL such as google.com, or a path of the app such as /login".to_owned(),
+                    Some(&mask(&base)),
                 );
                 inputs.push(url.clone());
                 PaneState::Web(WebUi {
                     url,
-                    view: BrowserView {
-                        status: BrowserStatus::Idle,
-                        ..BrowserView::default()
-                    },
-                    shot_generation: 0,
+                    base,
+                    shown_url: None,
+                    console_open: false,
+                    view: BrowserView::default(),
                 })
             }
             RendererKind::Files => {
@@ -776,6 +803,13 @@ impl Workspace {
                 PaneState::Files(FilesUi::new(root, shown))
             }
         };
+        if let PaneState::Web(ui) = &state {
+            // The space's live browser, opening the pane's page the first time.
+            let start = ui.base.clone();
+            if let Err(e) = self.space_browser(id, Some(&start), cx) {
+                self.plugins.runtime(id).web.error = Some(self.redactor.redact(&e).into_owned());
+            }
+        }
         let subscriptions = inputs
             .iter()
             .map(|entity| {
@@ -858,23 +892,25 @@ impl Workspace {
                     }
                 }
                 RendererKind::Web if stale => {
-                    let snapshot = self.plugin_browser(&id);
+                    let page = self
+                        .browsers
+                        .view(&id)
+                        .map(|view| PageShown {
+                            status: view.status(),
+                            console: view.console(),
+                            network_errors: view.network_errors(),
+                        })
+                        .unwrap_or_default();
+                    let web = self.plugins.web_state(&id);
+                    let redactor = self.redactor.clone();
                     if let Some(PaneState::Web(ui)) = self.pane_state_mut(&key) {
-                        let previous = ui.view.screenshot.take();
-                        ui.view = browser_view(&snapshot);
-                        // The image is decoded once per screenshot: GPUI caches it by the bytes' hash.
-                        ui.view.screenshot = match (&snapshot.screenshot, previous) {
-                            (Some(_), Some(shot))
-                                if ui.shot_generation == snapshot.screenshot_generation =>
-                            {
-                                Some(shot)
-                            }
-                            (Some(bytes), _) => {
-                                ui.shot_generation = snapshot.screenshot_generation;
-                                Some(Screenshot::png(bytes.as_ref().clone()))
-                            }
-                            (None, _) => None,
-                        };
+                        ui.view = browser_view(&page, &web, ui.console_open, &redactor);
+                        // The URL bar follows the page as it navigates.
+                        if page.status.url.is_some() && page.status.url != ui.shown_url {
+                            ui.shown_url = page.status.url.clone();
+                            let shown = ui.view.url.to_string();
+                            ui.url.update(cx, |input, cx| input.set_value(&shown, cx));
+                        }
                     }
                 }
                 RendererKind::Logs => {
@@ -956,13 +992,40 @@ impl Workspace {
         }
     }
 
+    /// Open what the URL bar of browser pane `key` holds: any web page the user types (a bare host gets
+    /// `https://`, a path is on the app). The user's browsing is not limited to the app.
     fn web_pane_open(&mut self, key: &PaneKey, cx: &mut Context<Self>) {
         let Some(PaneState::Web(ui)) = self.pane_state_mut(key) else {
             return;
         };
-        let url = ui.url.read(cx).value().trim().to_owned();
-        let url = if url.is_empty() { "/".to_owned() } else { url };
-        self.browser_open(&key.0, &url, cx);
+        let url = typed_url(ui.url.read(cx).value(), &ui.base);
+        ui.shown_url = None;
+        let opened = self
+            .space_browser(&key.0, None, cx)
+            .and_then(|view| view.load(&url).map_err(|e| e.to_string()));
+        let error = opened.err().map(|e| self.redactor.redact(&e).into_owned());
+        self.plugins.runtime(&key.0).web.error = error;
+        self.plugin_panes.changed();
+        cx.notify();
+    }
+
+    /// Back, Forward or Reload in browser pane `key`.
+    fn web_pane_go(&mut self, key: &PaneKey, go: fn(&WebView), cx: &mut Context<Self>) {
+        if let Some(view) = self.browsers.view(&key.0) {
+            go(&view);
+        }
+        self.plugin_panes.changed();
+        cx.notify();
+    }
+
+    /// Open or close browser pane `key`'s console strip.
+    fn web_pane_toggle_console(&mut self, key: &PaneKey, cx: &mut Context<Self>) {
+        self.change_pane(key, cx, |state| {
+            if let PaneState::Web(ui) = state {
+                ui.console_open = !ui.console_open;
+                ui.view.console_open = ui.console_open;
+            }
+        });
     }
 
     fn files_ui(&mut self, key: &PaneKey) -> Option<&mut FilesUi> {
@@ -1158,7 +1221,14 @@ impl Workspace {
             PaneState::Http(ui) => render_http(ui, &ws, &key).into_any_element(),
             PaneState::Logs(ui) => render_logs(ui, &ws, &key).into_any_element(),
             PaneState::Sql(ui) => render_sql(ui, &ws, &key).into_any_element(),
-            PaneState::Web(ui) => render_web(ui, &ws, &key).into_any_element(),
+            PaneState::Web(ui) => {
+                // A dialog draws over the pane, and the page would draw over the dialog: hide it then.
+                let page = self
+                    .browsers
+                    .view(id)
+                    .map(|view| page_area(view, self.dialog.is_none()));
+                render_web(ui, page, &ws, &key).into_any_element()
+            }
             PaneState::Files(ui) => render_files(ui, &ws, &key).into_any_element(),
             PaneState::Missing(why) => {
                 let theme = Theme::of(cx);
@@ -1314,15 +1384,39 @@ fn render_sql(ui: &SqlUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> SqlPaneV
         }))
 }
 
-fn render_web(ui: &WebUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> BrowserPaneView {
-    BrowserPaneView::new(ui.view.clone())
+fn render_web(
+    ui: &WebUi,
+    page: Option<AnyElement>,
+    ws: &WeakEntity<Workspace>,
+    key: &PaneKey,
+) -> BrowserPaneView {
+    let mut pane = BrowserPaneView::new(ui.view.clone())
         .url_input(ui.url.clone())
+        .on_back(on_ws(ws, key, |this, key, _, cx| {
+            this.web_pane_go(key, WebView::go_back, cx)
+        }))
+        .on_forward(on_ws(ws, key, |this, key, _, cx| {
+            this.web_pane_go(key, WebView::go_forward, cx)
+        }))
+        .on_reload(on_ws(ws, key, |this, key, _, cx| {
+            this.web_pane_go(
+                key,
+                |view| {
+                    view.reload();
+                },
+                cx,
+            )
+        }))
         .on_open(on_ws(ws, key, |this, key, _, cx| {
             this.web_pane_open(key, cx)
         }))
-        .on_reload(on_ws(ws, key, |this, key, _, cx| {
-            this.browser_reload(&key.0, cx)
-        }))
+        .on_toggle_console(on_ws(ws, key, |this, key, _, cx| {
+            this.web_pane_toggle_console(key, cx)
+        }));
+    if let Some(page) = page {
+        pane = pane.page(page);
+    }
+    pane
 }
 
 fn render_files(ui: &FilesUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> FilesPaneView {
@@ -1357,9 +1451,6 @@ fn render_files(ui: &FilesUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> File
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use xctx_browser::{ConsoleEntry, NetworkError};
     use xctx_http::{Failure, FailureKind, Response};
 
     use super::*;
@@ -1561,30 +1652,22 @@ mod tests {
     }
 
     #[test]
-    fn the_browser_view_maps_phases_console_and_failed_requests() {
-        assert_eq!(browser_status(&BrowserPhase::Idle), BrowserStatus::Idle);
-        assert_eq!(
-            browser_status(&BrowserPhase::ChromeNotFound),
-            BrowserStatus::ChromeNotFound
-        );
-        assert_eq!(
-            browser_status(&BrowserPhase::Connecting),
-            BrowserStatus::Connecting
-        );
-        assert_eq!(browser_status(&BrowserPhase::Ready), BrowserStatus::Ready);
-        assert_eq!(
-            browser_status(&BrowserPhase::Failed("gone".into())),
-            BrowserStatus::Failed("gone".into())
-        );
-        let snapshot = BrowserSnapshot {
-            phase: BrowserPhase::Ready,
-            url: Some("http://localhost:4011/login".into()),
-            screenshot: Some(Arc::new(vec![1, 2, 3])),
-            screenshot_generation: 4,
+    fn the_browser_view_maps_the_live_page_masked() {
+        let redactor = Redactor::new([("TOKEN".to_owned(), "hunter22".to_owned())]);
+        let page = PageShown {
+            status: PageStatus {
+                url: Some("http://localhost:4011/login?token=hunter22".into()),
+                title: Some("Sign in hunter22".into()),
+                loading: true,
+                progress: 0.25,
+                can_go_back: true,
+                can_go_forward: false,
+                error: Some("http://localhost:4011/x could not be loaded: hunter22".into()),
+            },
             console: vec![
                 ConsoleEntry {
                     level: "exception".into(),
-                    text: "TypeError".into(),
+                    text: "TypeError hunter22".into(),
                     location: Some("app.js:1:2".into()),
                 },
                 ConsoleEntry {
@@ -1595,35 +1678,54 @@ mod tests {
             ],
             network_errors: vec![
                 NetworkError {
-                    url: "http://localhost:4011/api".into(),
+                    url: "http://localhost:4011/api?key=hunter22".into(),
                     status: Some(404),
                     reason: "Not Found".into(),
-                    resource_type: None,
+                    resource_type: Some("fetch".into()),
                 },
                 NetworkError {
                     url: "http://localhost:4011/ws".into(),
                     status: None,
-                    reason: "net::ERR_CONNECTION_REFUSED".into(),
+                    reason: "Could not connect to the server.".into(),
                     resource_type: None,
                 },
             ],
-            error: None,
         };
-        let view = browser_view(&snapshot);
-        assert_eq!(view.status, BrowserStatus::Ready);
-        assert_eq!(view.url.as_ref(), "http://localhost:4011/login");
-        assert!(view.screenshot.is_none());
+        let web = WebState {
+            busy: 1,
+            error: Some("#go: no element matches".into()),
+        };
+        let view = browser_view(&page, &web, true, &redactor);
+        let everything = format!("{view:?}");
+        assert!(!everything.contains("hunter22"), "{everything}");
+        assert!(view.url.starts_with("http://localhost:4011/login"));
+        assert_eq!(view.loading, Some(0.25));
+        assert!(view.can_go_back && !view.can_go_forward && view.has_page);
+        assert!(view.agent_busy && view.console_open);
+        assert!(view.load_error.is_some());
+        assert_eq!(view.error.as_deref(), Some("#go: no element matches"));
         assert_eq!(view.console[0].level, Some(LogLevel::Error));
-        assert_eq!(view.console[0].text.as_ref(), "TypeError (app.js:1:2)");
+        assert!(view.console[0].text.ends_with("(app.js:1:2)"));
         assert_eq!(view.console[1].level, Some(LogLevel::Info));
         let details: Vec<&str> = view
             .network_errors
             .iter()
             .map(|n| n.detail.as_ref())
             .collect();
-        assert_eq!(details, ["404 Not Found", "net::ERR_CONNECTION_REFUSED"]);
+        assert_eq!(
+            details,
+            ["404 Not Found", "Could not connect to the server."]
+        );
         assert_eq!(console_level("warning"), Some(LogLevel::Warn));
         assert_eq!(console_level("dir"), None);
+
+        let blank = browser_view(
+            &PageShown::default(),
+            &WebState::default(),
+            false,
+            &redactor,
+        );
+        assert!(!blank.has_page && blank.loading.is_none() && !blank.agent_busy);
     }
 
     #[test]

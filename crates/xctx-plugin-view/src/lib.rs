@@ -8,7 +8,8 @@
 //! lines, query results, browser state and worktree listings into these types. Every text they draw is drawn as
 //! given, so the app masks secrets before passing it in. Long content is capped (see each module's limits) with a
 //! note counting what was left out. Inputs (a URL, a body, a filter, a query) are elements the app passes in,
-//! typically `xctx-ui`'s `PromptInput`; without one the pane draws the view's text in its place.
+//! typically `xctx-ui`'s `PromptInput`; without one the pane draws the view's text in its place. The browser
+//! pane's page is a native view the app places over an element it passes in ([`BrowserPaneView::page`]).
 //!
 //! Colours come from the `xctx-ui` [`xctx_ui::Theme`] global, as everywhere else.
 
@@ -21,9 +22,8 @@ pub mod logs;
 pub mod sql;
 
 pub use browser::{
-    BROWSER_LINE_CHARS, BROWSER_NO_SCREENSHOT, BrowserPaneView, BrowserStatus, BrowserView,
-    CHROME_INSTALL_HINT, CHROME_NOT_FOUND, CONSOLE_ROW_LIMIT, ConsoleRow, NETWORK_ROW_LIMIT,
-    NetworkErrorRow, Screenshot,
+    BROWSER_LINE_CHARS, BROWSER_NO_PAGE, BrowserPaneView, BrowserView, CONSOLE_ROW_LIMIT,
+    CONSOLE_STRIP_HEIGHT, ConsoleRow, NETWORK_ROW_LIMIT, NetworkErrorRow, loading_label,
 };
 pub use common::{Caps, Excerpt, excerpt};
 pub use files::{

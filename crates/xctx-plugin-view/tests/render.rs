@@ -10,11 +10,10 @@ use gpui::{
     Window, div, prelude::*,
 };
 use xctx_plugin_view::{
-    BrowserPaneView, BrowserStatus, BrowserView, ConsoleRow, FILES_ROW_LIMIT, FileMark, FileRow,
-    FileRowKind, FilesPaneView, FilesPreview, FilesView, HttpDiffView, HttpPaneView,
-    HttpResponseView, HttpRow, HttpView, LOG_LINE_LIMIT, LogLevel, LogLine, LogsPaneView, LogsView,
-    NetworkErrorRow, PreviewBody, SQL_COL_LIMIT, SQL_ROW_LIMIT, Screenshot, SqlPaneView,
-    SqlResultView, SqlView,
+    BrowserPaneView, BrowserView, ConsoleRow, FILES_ROW_LIMIT, FileMark, FileRow, FileRowKind,
+    FilesPaneView, FilesPreview, FilesView, HttpDiffView, HttpPaneView, HttpResponseView, HttpRow,
+    HttpView, LOG_LINE_LIMIT, LogLevel, LogLine, LogsPaneView, LogsView, NetworkErrorRow,
+    PreviewBody, SQL_COL_LIMIT, SQL_ROW_LIMIT, SqlPaneView, SqlResultView, SqlView,
 };
 use xctx_ui::Theme;
 
@@ -483,11 +482,11 @@ fn the_database_pane_caps_the_table_and_shows_errors(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------------------------------------------
 // Browser
 
-fn browser_view(status: BrowserStatus) -> BrowserView {
+fn browser_view() -> BrowserView {
     BrowserView {
-        url: "http://localhost:3000".into(),
-        status,
-        screenshot: None,
+        url: "http://localhost:3000/".into(),
+        title: Some("The app".into()),
+        has_page: true,
         console: vec![
             ConsoleRow {
                 level: Some(LogLevel::Error),
@@ -502,73 +501,97 @@ fn browser_view(status: BrowserStatus) -> BrowserView {
             url: "http://localhost:3000/api".into(),
             detail: "500".into(),
         }],
-        error: None,
+        ..BrowserView::default()
     }
 }
 
 fn build_browser(view: BrowserView, log: Log) -> AnyElement {
-    let (open, reload) = (log.clone(), log);
+    let (back, forward, reload, open, toggle) =
+        (log.clone(), log.clone(), log.clone(), log.clone(), log);
     BrowserPaneView::new(view)
-        .on_open(move |_, _| push(&open, "open"))
+        .page(
+            div()
+                .size_full()
+                .debug_selector(|| "the-live-page".to_owned()),
+        )
+        .on_back(move |_, _| push(&back, "back"))
+        .on_forward(move |_, _| push(&forward, "forward"))
         .on_reload(move |_, _| push(&reload, "reload"))
+        .on_open(move |_, _| push(&open, "open"))
+        .on_toggle_console(move |_, _| push(&toggle, "console"))
         .into_any_element()
 }
 
 #[gpui::test]
-fn the_browser_pane_opens_reloads_and_lists_the_console(cx: &mut TestAppContext) {
-    let (events, _host, cx) = host(cx, browser_view(BrowserStatus::Ready), build_browser);
+fn the_browser_toolbar_follows_the_history(cx: &mut TestAppContext) {
+    let (events, host, cx) = host(cx, browser_view(), build_browser);
+    for selector in ["browser-url", "browser-page", "the-live-page"] {
+        assert!(drawn(cx, selector), "{selector} is drawn");
+    }
+    assert!(!drawn(cx, "browser-loading") && !drawn(cx, "browser-agent"));
+    // No history yet: Back and Forward do nothing; Reload and Open work.
     for selector in [
-        "browser-status",
-        "browser-no-screenshot",
+        "browser-back",
+        "browser-forward",
+        "browser-reload",
+        "browser-open",
+    ] {
+        assert!(click(cx, selector), "{selector} is drawn");
+    }
+    assert_eq!(*events.borrow(), ["reload", "open"]);
+    update(cx, &host, |view| {
+        view.can_go_back = true;
+        view.can_go_forward = true;
+        view.loading = Some(0.5);
+        view.agent_busy = true;
+    });
+    assert!(drawn(cx, "browser-loading") && drawn(cx, "browser-agent"));
+    for selector in ["browser-back", "browser-forward"] {
+        assert!(click(cx, selector), "{selector} is drawn");
+    }
+    assert_eq!(*events.borrow(), ["reload", "open", "back", "forward"]);
+}
+
+#[gpui::test]
+fn a_blank_browser_cannot_reload_and_shows_its_errors(cx: &mut TestAppContext) {
+    let (events, host, cx) = host(cx, BrowserView::default(), build_browser);
+    assert!(click(cx, "browser-reload"));
+    assert!(events.borrow().is_empty(), "{:?}", events.borrow());
+    assert!(!drawn(cx, "browser-load-error") && !drawn(cx, "browser-error"));
+    update(cx, &host, |view| {
+        view.load_error =
+            Some("http://localhost:3000/ could not be loaded: Could not connect".into());
+        view.error = Some("#go: no element matches".into());
+    });
+    assert!(drawn(cx, "browser-load-error") && drawn(cx, "browser-error"));
+}
+
+#[gpui::test]
+fn without_a_page_element_the_pane_says_so(cx: &mut TestAppContext) {
+    let (_events, _host, cx) = host(cx, browser_view(), |view, _| {
+        BrowserPaneView::new(view).into_any_element()
+    });
+    assert!(drawn(cx, "browser-no-page"));
+}
+
+#[gpui::test]
+fn the_console_strip_opens_and_caps_its_lists(cx: &mut TestAppContext) {
+    let (events, host, cx) = host(cx, browser_view(), build_browser);
+    assert!(drawn(cx, "browser-console-toggle"));
+    assert!(!drawn(cx, "browser-console") && !drawn(cx, "browser-console-row-0"));
+    assert!(click(cx, "browser-console-toggle"));
+    assert_eq!(*events.borrow(), ["console"]);
+    update(cx, &host, |view| view.console_open = true);
+    for selector in [
+        "browser-console",
         "browser-console-row-0",
         "browser-console-row-1",
         "browser-network-row-0",
     ] {
         assert!(drawn(cx, selector), "{selector} is drawn");
     }
-    assert!(!drawn(cx, "browser-chrome-missing"));
-    for selector in ["browser-open", "browser-reload"] {
-        assert!(click(cx, selector), "{selector} is drawn");
-    }
-    assert_eq!(*events.borrow(), ["open", "reload"]);
-}
-
-#[gpui::test]
-fn without_chrome_the_browser_pane_says_how_to_install_it(cx: &mut TestAppContext) {
-    let (events, host, cx) = host(
-        cx,
-        browser_view(BrowserStatus::ChromeNotFound),
-        build_browser,
-    );
-    assert!(drawn(cx, "browser-chrome-missing"));
-    for selector in ["browser-open", "browser-reload"] {
-        assert!(click(cx, selector), "{selector} is drawn");
-    }
-    assert!(events.borrow().is_empty(), "{:?}", events.borrow());
-
-    // Connecting: still nothing. Disconnected: Open retries, Reload waits for a page.
-    update(cx, &host, |view| view.status = BrowserStatus::Connecting);
-    assert!(!drawn(cx, "browser-chrome-missing"));
-    assert!(click(cx, "browser-open"));
-    assert!(events.borrow().is_empty(), "{:?}", events.borrow());
+    assert!(!drawn(cx, "browser-console-more") && !drawn(cx, "browser-network-more"));
     update(cx, &host, |view| {
-        view.status = BrowserStatus::Failed("Chrome exited".into());
-        view.error = Some("websocket closed".into());
-    });
-    assert!(drawn(cx, "browser-error"));
-    for selector in ["browser-reload", "browser-open"] {
-        assert!(click(cx, selector), "{selector} is drawn");
-    }
-    assert_eq!(*events.borrow(), ["open"]);
-}
-
-#[gpui::test]
-fn the_browser_pane_draws_a_screenshot_and_caps_its_lists(cx: &mut TestAppContext) {
-    let (_events, host, cx) = host(cx, browser_view(BrowserStatus::Ready), build_browser);
-    assert!(!drawn(cx, "browser-console-more"));
-    assert!(!drawn(cx, "browser-network-more"));
-    update(cx, &host, |view| {
-        view.screenshot = Some(Screenshot::png(TINY_PNG.to_vec()));
         view.console = (0..300)
             .map(|i| ConsoleRow {
                 level: Some(LogLevel::Warn),
@@ -578,28 +601,14 @@ fn the_browser_pane_draws_a_screenshot_and_caps_its_lists(cx: &mut TestAppContex
         view.network_errors = (0..300)
             .map(|i| NetworkErrorRow {
                 url: format!("http://localhost:3000/{i}").into(),
-                detail: "net::ERR_CONNECTION_REFUSED".into(),
+                detail: "Could not connect to the server.".into(),
             })
             .collect();
     });
-    for selector in [
-        "browser-screenshot",
-        "browser-console-more",
-        "browser-network-more",
-    ] {
+    for selector in ["browser-console-more", "browser-network-more"] {
         assert!(drawn(cx, selector), "{selector} is drawn");
     }
-    assert!(!drawn(cx, "browser-no-screenshot"));
 }
-
-/// A 1×1 PNG.
-const TINY_PNG: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
-    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x00, 0x00,
-    0x02, 0x00, 0x01, 0xe5, 0x27, 0xde, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
-    0x42, 0x60, 0x82,
-];
 
 // ---------------------------------------------------------------------------------------------------------------
 // Files

@@ -3,7 +3,7 @@
 //! plugin trust, mounts across a restart, events reaching the loop, the shared space and the Inbox, and the files
 //! pane's listing, git status, previews and refusal of anything outside the worktree.
 //!
-//! Nothing here touches the network, the user's plugins, or Chrome.
+//! Nothing here touches the network, the user's plugins, or a browser.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -724,7 +724,8 @@ fn mounts_survive_a_restart_and_logs_tail_into_the_pane() -> TestResult {
     assert!(!out.text.contains("INFO up"), "{}", out.text);
 
     later.remove_mount(&fx.space.id, PaneId(6))?;
-    assert!(later.stop_backend(&fx.space, PaneId(6)).is_none());
+    // No web pane is left, so the space's browser would close too.
+    assert!(later.stop_backend(&fx.space, PaneId(6)));
     assert!(
         fx.host()
             .mounted(&fx.space, &Redactor::default())
