@@ -6302,6 +6302,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xctx-plugin"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 1.2.2+spec-1.1.0",
+ "xctx-core",
+]
+
+[[package]]
 name = "xctx-term"
 version = "0.1.0"
 dependencies = [

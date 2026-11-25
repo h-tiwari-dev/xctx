@@ -1,0 +1,30 @@
+# The Figma connector. Its token comes from the space's mise secrets.
+name = "figma"
+version = "1.0.0"
+description = "Read Figma frames and export them as images"
+secrets = ["FIGMA_TOKEN"]
+
+[pane]
+kind = "web"
+
+[[tools]]
+name = "frame.read"
+description = "A frame's layers, text and styles"
+effect = "read"
+builtin = "figma.frame.read"
+params = [
+  { name = "file", type = "string", required = true, description = "The Figma file key" },
+  { name = "node", type = "string", required = true, description = "The frame's node id" },
+]
+
+[[tools]]
+name = "frame.export"
+description = "Export a frame as an image into the space's artifacts"
+effect = "read"
+builtin = "figma.frame.export"
+params = [
+  { name = "file", type = "string", required = true, description = "The Figma file key" },
+  { name = "node", type = "string", required = true, description = "The frame's node id" },
+  { name = "format", type = "string", description = "png (default), jpg or svg" },
+  { name = "scale", type = "integer", description = "1 to 4" },
+]
