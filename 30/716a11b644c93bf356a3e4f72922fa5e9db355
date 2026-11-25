@@ -1,0 +1,22 @@
+Cargo.lock
+  h_5a0a1d6be5b4d2 6595-6604
+crates/xctx-nav/Cargo.toml
+  h_5a0a1d6be5b4d2 1-10
+crates/xctx-nav/src/lib.rs
+  h_5a0a1d6be5b4d2 1-20
+crates/xctx-nav/src/palette.rs
+  h_5a0a1d6be5b4d2 1-498
+crates/xctx-nav/src/roster.rs
+  h_5a0a1d6be5b4d2 1-704
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "30716a11b644c93bf356a3e4f72922fa5e9db355",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
