@@ -208,7 +208,7 @@ impl Workspace {
                 .id(("space-card", index))
                 .cursor_pointer()
                 .rounded(Theme::RADIUS_MD)
-                .hover(|style| style.bg(theme.surface_hover))
+                .hover(|style| style.bg(theme.raised))
                 .on_click(cx.listener(move |this, _, window, cx| this.show_space(&id, window, cx)))
                 .child(space_summary(space, running, index, &theme));
             list = list.child(
@@ -341,7 +341,7 @@ impl Workspace {
                     .rounded(Theme::RADIUS_FULL)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.elevated)
+                    .bg(theme.raised)
                     .text_size(Theme::TEXT_SM)
                     .child(root.display().to_string())
                     .child(
@@ -461,7 +461,7 @@ fn row(theme: &Theme) -> Div {
         .px(Theme::SPACE_3)
         .py(Theme::SPACE_2)
         .rounded(Theme::RADIUS_MD)
-        .bg(theme.elevated)
+        .bg(theme.raised)
 }
 
 fn notice(message: String, color: gpui::Hsla, theme: &Theme) -> Div {

@@ -244,7 +244,7 @@ impl RenderOnce for ForkDialog {
             .rounded(Theme::RADIUS_LG)
             .border_1()
             .border_color(theme.accent.alpha(0.55))
-            .bg(theme.elevated)
+            .bg(theme.overlay)
             .child(
                 div()
                     .flex()
@@ -316,7 +316,7 @@ impl RenderOnce for ForkDialog {
                     .flex_col()
                     .pt(Theme::SPACE_1)
                     .border_t_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.border_subtle)
                     .children(rows),
             )
             .children(error)
@@ -327,7 +327,7 @@ impl RenderOnce for ForkDialog {
                     .gap(Theme::SPACE_2)
                     .pt(Theme::SPACE_2)
                     .border_t_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.border_subtle)
                     .child(if busy {
                         div()
                             .debug_selector(|| "fork-busy-hint".to_owned())

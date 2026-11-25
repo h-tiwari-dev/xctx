@@ -51,3 +51,10 @@ See [`docs/m5.md`](m5.md).
   trigger or stop loops.
 - **First-party plugins**: Browser pane, API client (Postman-style replay), Logs & read-only DB pane (write-gated),
   Jira/Figma connectors, pluggable agent runners (`pi`, `fx`), and voice/canvas task entry.
+
+### Milestone 6 — The shell: UX and visual overhaul (planned)
+See [`docs/m6.md`](m6.md).
+- **One shell for every feature**: a Roster of spaces and agents by state, a space header with the loop, one
+  Inspector (Graph / Shared / Attempts / Plugins), an Inbox overlay, and a command palette (`⌘K`).
+- **Visual system**: semantic theme tokens, dark and light, icons, motion, one mono font token, and a component
+  gallery.

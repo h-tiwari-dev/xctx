@@ -341,7 +341,7 @@ impl RenderOnce for FilesPaneView {
             .rounded(Theme::RADIUS_SM)
             .border_1()
             .border_color(theme.border)
-            .bg(theme.bg)
+            .bg(theme.chrome)
             .text_size(Theme::TEXT_XS)
             .children(rows)
             .children(rows_more)
@@ -395,7 +395,7 @@ fn tree_row(
     };
     let gutter =
         |text: &'static str, color| div().flex_none().w(px(12.0)).text_color(color).child(text);
-    let hover = theme.surface_hover;
+    let hover = theme.raised;
     match &row.kind {
         FileRowKind::Folder {
             open,
@@ -444,7 +444,7 @@ fn tree_row(
                         .child(mark.letter())
                 }));
             if selected {
-                element = element.bg(theme.accent_muted);
+                element = element.bg(theme.selection);
             }
             if let Some(handler) = on_file.clone() {
                 let path = row.path.clone();
@@ -601,7 +601,7 @@ fn preview(preview: FilesPreview, on_diff: Option<BoolHandler>, theme: &Theme) -
                 .rounded(Theme::RADIUS_SM)
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.bg)
+                .bg(theme.chrome)
                 .font_family("Menlo")
                 .text_size(Theme::TEXT_XS)
                 .children(body),

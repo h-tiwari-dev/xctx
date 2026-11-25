@@ -268,7 +268,7 @@ impl RenderOnce for PlanGateCard {
             .rounded(Theme::RADIUS_LG)
             .border_1()
             .border_color(theme.accent.alpha(0.55))
-            .bg(theme.elevated)
+            .bg(theme.overlay)
             .child(
                 div()
                     .flex()
@@ -338,7 +338,7 @@ impl RenderOnce for PlanGateCard {
                     .gap(Theme::SPACE_2)
                     .pt(Theme::SPACE_2)
                     .border_t_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.border_subtle)
                     .child(
                         div()
                             .flex_1()

@@ -334,7 +334,7 @@ fn mono_box(id: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
         .rounded(Theme::RADIUS_SM)
         .border_1()
         .border_color(theme.border)
-        .bg(theme.bg)
+        .bg(theme.chrome)
         .font_family("Menlo")
         .text_size(Theme::TEXT_XS)
 }
@@ -436,7 +436,7 @@ impl RenderOnce for HttpPaneView {
                 let selector = format!("http-row-{id}");
                 let selected = view.selected == Some(id);
                 let compared = view.compare == Some(id);
-                let hover = theme.surface_hover;
+                let hover = theme.raised;
                 let compare = self
                     .on_compare
                     .clone()
@@ -499,7 +499,7 @@ impl RenderOnce for HttpPaneView {
                     )
                     .children(compare);
                 if selected {
-                    element = element.bg(theme.accent_muted);
+                    element = element.bg(theme.selection);
                 }
                 if let Some(handler) = self.on_select.clone() {
                     element = element.on_click(move |_, window, cx| handler(id, window, cx));

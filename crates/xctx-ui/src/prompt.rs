@@ -537,7 +537,7 @@ impl Render for PromptInput {
                 (
                     range,
                     HighlightStyle {
-                        background_color: Some(theme.accent_muted),
+                        background_color: Some(theme.selection),
                         ..HighlightStyle::default()
                     },
                 )
@@ -631,7 +631,7 @@ impl Render for PromptInput {
             .rounded(Theme::RADIUS_MD)
             .border_1()
             .border_color(theme.outline(focused))
-            .bg(theme.elevated)
+            .bg(theme.raised)
             .text_size(Theme::TEXT_LG)
             .cursor_text()
             .child(body)

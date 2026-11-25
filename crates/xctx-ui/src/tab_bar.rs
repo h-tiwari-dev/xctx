@@ -213,7 +213,7 @@ fn tab(
     active: bool,
     on_click: Option<Handler>,
 ) -> gpui::Stateful<gpui::Div> {
-    let hover_bg = theme.surface_hover;
+    let hover_bg = theme.raised;
     let mut tab = div()
         .id(id)
         .flex()
@@ -228,7 +228,7 @@ fn tab(
         .whitespace_nowrap()
         .cursor_pointer();
     tab = if active {
-        tab.bg(theme.elevated)
+        tab.bg(theme.raised)
             .border_color(theme.border)
             .text_color(theme.text)
             .font_weight(FontWeight::SEMIBOLD)
@@ -341,7 +341,7 @@ impl RenderOnce for TabBar {
                 .children(graph)
                 .children(add_repo)
                 .children(plugins)
-                .child(div().w(px(1.0)).h(px(16.0)).bg(theme.divider))
+                .child(div().w(px(1.0)).h(px(16.0)).bg(theme.border_subtle))
                 .child(discard)
                 .child(ship)
         });
@@ -355,11 +355,17 @@ impl RenderOnce for TabBar {
             .pl(self.leading_inset)
             .pr(Theme::SPACE_2)
             .gap(Theme::SPACE_2)
-            .bg(theme.bg)
+            .bg(theme.chrome)
             .border_b_1()
-            .border_color(theme.divider)
+            .border_color(theme.border_subtle)
             .child(home)
-            .child(div().flex_none().w(px(1.0)).h(px(16.0)).bg(theme.divider))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .bg(theme.border_subtle),
+            )
             .child(
                 div()
                     .id("tab-spaces")

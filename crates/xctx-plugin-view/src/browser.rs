@@ -248,7 +248,7 @@ impl RenderOnce for BrowserPaneView {
             .rounded(Theme::RADIUS_SM)
             .border_1()
             .border_color(theme.border)
-            .bg(theme.bg)
+            .bg(theme.chrome)
             .overflow_hidden();
         let screenshot = match view.screenshot.clone() {
             Some(shot) => {
@@ -340,7 +340,7 @@ impl RenderOnce for BrowserPaneView {
                 .rounded(Theme::RADIUS_SM)
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.bg)
+                .bg(theme.chrome)
                 .font_family("Menlo")
                 .text_size(Theme::TEXT_XS)
         };
