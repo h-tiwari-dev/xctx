@@ -1,0 +1,20 @@
+AGENTS.md
+  h_5a0a1d6be5b4d2 4-5
+docs/m6-theme.md
+  h_5a0a1d6be5b4d2 1-206
+docs/m6.md
+  h_5a0a1d6be5b4d2 1-288
+docs/roadmap.md
+  h_5a0a1d6be5b4d2 54-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "0f2761c6721ef1dec1ae12380516770e37cd9e5d",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
