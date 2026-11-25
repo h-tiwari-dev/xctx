@@ -90,7 +90,8 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    /// Connects to `ws_url` (a `ws://` URL on the loopback address).
+    /// Connects to `ws_url`, which must be a `ws://` URL on the loopback address (`127.0.0.1`, `[::1]` or
+    /// `localhost`): DevTools is never driven across the network, whatever `/json/version` says.
     pub(crate) fn connect(ws_url: &str) -> Result<Self> {
         let parsed = url::Url::parse(ws_url).map_err(|e| BrowserError::InvalidUrl {
             url: ws_url.to_owned(),
@@ -99,13 +100,21 @@ impl Connection {
         if parsed.scheme() != "ws" {
             return Err(BrowserError::UnsupportedScheme(parsed.scheme().to_owned()));
         }
+        if !is_loopback_url(&parsed) {
+            return Err(BrowserError::InvalidUrl {
+                url: ws_url.to_owned(),
+                reason:
+                    "a DevTools websocket must be on this machine (127.0.0.1, [::1] or localhost)"
+                        .to_owned(),
+            });
+        }
         let addr = parsed
             .socket_addrs(|| None)
             .ok()
-            .and_then(|a| a.into_iter().next())
+            .and_then(|a| a.into_iter().find(|a| a.ip().is_loopback()))
             .ok_or_else(|| BrowserError::InvalidUrl {
                 url: ws_url.to_owned(),
-                reason: "it names no reachable address".to_owned(),
+                reason: "it names no reachable loopback address".to_owned(),
             })?;
         let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
             .map_err(|e| BrowserError::io(format!("could not connect to {ws_url}"), e))?;
@@ -219,6 +228,16 @@ impl Connection {
     }
 }
 
+/// Whether `url`'s host is the machine itself.
+pub(crate) fn is_loopback_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
 fn ws_error(e: tungstenite::Error) -> BrowserError {
     match e {
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
@@ -274,6 +293,31 @@ mod tests {
                 result: Ok(Value::Null)
             })
         );
+    }
+
+    #[test]
+    fn only_loopback_websockets_are_connected() {
+        for url in [
+            "ws://192.168.1.20:9222/devtools/browser/x",
+            "ws://example.com:9222/devtools/browser/x",
+            "ws://localhost.evil.com:9222/devtools/browser/x",
+        ] {
+            assert!(
+                matches!(
+                    Connection::connect(url),
+                    Err(BrowserError::InvalidUrl { .. })
+                ),
+                "{url}"
+            );
+        }
+        let ok = |u: &str| url::Url::parse(u).is_ok_and(|u| is_loopback_url(&u));
+        assert!(ok("ws://127.0.0.1:1/devtools/browser/x"));
+        assert!(ok("ws://[::1]:1/devtools/browser/x"));
+        assert!(ok("ws://LOCALHOST:1/devtools/browser/x"));
+        assert!(matches!(
+            Connection::connect("wss://127.0.0.1:1/x"),
+            Err(BrowserError::UnsupportedScheme(_))
+        ));
     }
 
     #[test]

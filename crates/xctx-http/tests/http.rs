@@ -19,7 +19,17 @@ const LARGE: usize = 100_000;
 
 struct Server {
     base: String,
+    port: u16,
     counter_hits: Arc<AtomicUsize>,
+}
+
+impl Server {
+    /// The defaults, allowing this server's port on the machine itself.
+    fn options(&self) -> SendOptions {
+        let mut options = SendOptions::default();
+        options.allow_local_port(self.port);
+        options
+    }
 }
 
 /// Start a server answering canned responses by path, one thread per connection.
@@ -39,6 +49,7 @@ fn server() -> Server {
     });
     Server {
         base: format!("http://127.0.0.1:{port}"),
+        port,
         counter_hits,
     }
 }
@@ -73,6 +84,17 @@ fn handle(stream: TcpStream, hits: &AtomicUsize) {
     let method = parts.next().unwrap_or("").to_owned();
     let path = parts.next().unwrap_or("").to_owned();
 
+    // `/redirect-port/<status>/<port>` redirects with that status to `/echo` on that port.
+    if let Some(rest) = path.strip_prefix("/redirect-port/") {
+        let (status, port) = rest.split_once('/').unwrap_or(("302", rest));
+        let out = format!(
+            "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\
+             location: http://127.0.0.1:{port}/echo\r\n\r\n"
+        );
+        let mut stream = stream;
+        let _ = stream.write_all(out.as_bytes());
+        return;
+    }
     let (status, headers, payload): (u16, Vec<(&str, String)>, String) = match path.as_str() {
         "/ok" => (
             200,
@@ -143,7 +165,7 @@ fn response(exchange: &Exchange) -> &Response {
 fn get(server: &Server, path: &str) -> Exchange {
     ok(send(
         &Request::new("GET", format!("{}{path}", server.base)),
-        &SendOptions::default(),
+        &server.options(),
     ))
 }
 
@@ -165,7 +187,7 @@ fn sends_headers_and_body() {
     let req = Request::new("post", format!("{}/echo", s.base))
         .header("X-Test", "yes")
         .body("{\"a\":1}");
-    let ex = ok(send(&req, &SendOptions::default()));
+    let ex = ok(send(&req, &s.options()));
     let body = &response(&ex).body;
     assert!(body.starts_with("POST /echo\n"), "{body}");
     assert!(body.to_ascii_lowercase().contains("x-test: yes"), "{body}");
@@ -184,7 +206,7 @@ fn times_out() {
     let s = server();
     let options = SendOptions {
         timeout: Duration::from_millis(150),
-        ..SendOptions::default()
+        ..s.options()
     };
     let ex = ok(send(
         &Request::new("GET", format!("{}/slow", s.base)),
@@ -203,7 +225,7 @@ fn caps_the_body() {
     let s = server();
     let options = SendOptions {
         max_body_bytes: 1000,
-        ..SendOptions::default()
+        ..s.options()
     };
     let ex = ok(send(
         &Request::new("GET", format!("{}/large", s.base)),
@@ -252,7 +274,7 @@ fn no_redirects_returns_the_redirect() {
     let s = server();
     let options = SendOptions {
         max_redirects: 0,
-        ..SendOptions::default()
+        ..s.options()
     };
     let ex = ok(send(
         &Request::new("GET", format!("{}/redirect-away", s.base)),
@@ -265,7 +287,7 @@ fn no_redirects_returns_the_redirect() {
 fn refuses_hosts_and_schemes_that_are_not_allowed() {
     let req = Request::new("GET", "http://example.com/");
     match send(&req, &SendOptions::default()) {
-        Err(HttpError::HostNotAllowed { host, .. }) => assert_eq!(host, "example.com"),
+        Err(HttpError::HostNotAllowed { host, .. }) => assert_eq!(host, "example.com:80"),
         other => panic!("expected a refusal, got {other:?}"),
     }
     let none = SendOptions {
@@ -287,10 +309,12 @@ fn refuses_hosts_and_schemes_that_are_not_allowed() {
         send(&Request::new("GET", "not a url"), &SendOptions::default()),
         Err(HttpError::InvalidUrl { .. })
     ));
+    let mut local = SendOptions::default();
+    local.allow_local_port(80);
     assert!(matches!(
         send(
             &Request::new("GET", "http://localhost/").header("bad name", "x"),
-            &SendOptions::default()
+            &local
         ),
         Err(HttpError::InvalidRequest(_))
     ));
@@ -302,8 +326,10 @@ fn allows_configured_base_url_hosts() {
         "https://API.Staging.example:8443/v1",
     ]));
     assert!(options.is_allowed("api.staging.example"));
-    assert!(options.is_allowed("[::1]"));
-    assert!(options.is_allowed("localhost"));
+    assert!(options.allows_url("https://api.staging.example:8443/other"));
+    assert!(!options.allows_url("https://api.staging.example/"));
+    assert!(!options.allows_url("http://api.staging.example:8443/"));
+    assert!(!options.is_allowed("localhost"));
     assert!(!options.is_allowed("staging.example"));
     assert!(SendOptions::for_base_urls(["file:///etc"]).is_err());
 }
@@ -312,9 +338,11 @@ fn allows_configured_base_url_hosts() {
 fn a_refused_connection_is_a_failure() {
     // Bind and drop to find a port nothing listens on.
     let port = ok(TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr())).port();
+    let mut options = SendOptions::default();
+    options.allow_local_port(port);
     let ex = ok(send(
         &Request::new("GET", format!("http://127.0.0.1:{port}/")),
-        &SendOptions::default(),
+        &options,
     ));
     assert!(ex.failure().is_some(), "{ex:?}");
 }
@@ -386,9 +414,9 @@ fn replays_a_saved_request() {
     let mut history = HttpHistory::new(SpaceId::new("demo"));
     let id = history.record(ok(send(
         &Request::new("POST", format!("{}/counter", s.base)).body("{}"),
-        &SendOptions::default(),
+        &s.options(),
     )));
-    let runs = ok(replay(&history, id, 11, &SendOptions::default()));
+    let runs = ok(replay(&history, id, 11, &s.options()));
     assert_eq!(runs.len(), 11);
     assert_eq!(s.counter_hits.load(Ordering::SeqCst), 12);
     assert!(runs.iter().all(|e| e.request.method == "POST"));
@@ -397,11 +425,11 @@ fn replays_a_saved_request() {
     assert_eq!(ids.last(), Some(&12));
 
     assert!(matches!(
-        replay(&history, 999, 1, &SendOptions::default()),
+        replay(&history, 999, 1, &s.options()),
         Err(HttpError::NotFound(999))
     ));
     assert!(matches!(
-        replay(&history, id, 0, &SendOptions::default()),
+        replay(&history, id, 0, &s.options()),
         Err(HttpError::BadCount { .. })
     ));
     let none = SendOptions {
@@ -534,4 +562,162 @@ fn masks_auth_headers_and_secrets() {
     assert_eq!(r.body, "{\"token\":\"[REDACTED:STRIPE_KEY]\"}");
     // The original is untouched.
     assert!(response(&ex).body.contains("sk_live_supersecret"));
+}
+
+#[test]
+fn only_the_allowed_port_is_reachable_on_the_machine() {
+    let allowed = server();
+    let other = server();
+    let options = allowed.options();
+    let refused = send(&Request::new("GET", format!("{}/ok", other.base)), &options);
+    match refused {
+        Err(HttpError::HostNotAllowed { host, .. }) => {
+            assert_eq!(host, format!("127.0.0.1:{}", other.port));
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(response(&get(&allowed, "/ok")).status, 200);
+
+    // A redirect to the other port is not followed either.
+    let ex = get(&allowed, &format!("/redirect-port/302/{}", other.port));
+    let f = ex.failure().map(|f| (f.kind, f.message.clone()));
+    assert!(
+        matches!(&f, Some((FailureKind::RedirectRefused, m)) if m.contains(&other.port.to_string())),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn a_redirect_to_another_port_drops_credentials() {
+    let first = server();
+    let second = server();
+    let mut options = first.options();
+    options.allow_local_port(second.port);
+    let req = Request::new(
+        "GET",
+        format!("{}/redirect-port/302/{}", first.base, second.port),
+    )
+    .header("Authorization", "Bearer abc")
+    .header("Cookie", "session=1")
+    .header("X-Auth-Token", "t")
+    .header("X-Test", "kept");
+    let ex = ok(send(&req, &options));
+    let body = response(&ex).body.to_ascii_lowercase();
+    assert!(body.starts_with("get /echo"), "{body}");
+    assert!(body.contains("x-test: kept"), "{body}");
+    assert!(!body.contains("authorization"), "{body}");
+    assert!(!body.contains("cookie"), "{body}");
+    assert!(!body.contains("x-auth-token"), "{body}");
+
+    // A same-origin redirect keeps them.
+    let same = Request::new(
+        "GET",
+        format!("{}/redirect-port/307/{}", first.base, first.port),
+    )
+    .header("Authorization", "Bearer abc");
+    let body = response(&ok(send(&same, &options)))
+        .body
+        .to_ascii_lowercase();
+    assert!(body.contains("authorization: bearer abc"), "{body}");
+}
+
+#[test]
+fn a_307_to_another_origin_does_not_resend_the_body() {
+    let first = server();
+    let second = server();
+    let mut options = first.options();
+    options.allow_local_port(second.port);
+    for status in [307, 308] {
+        let req = Request::new(
+            "POST",
+            format!("{}/redirect-port/{status}/{}", first.base, second.port),
+        )
+        .body("{\"card\":\"4242\"}");
+        let ex = ok(send(&req, &options));
+        assert_eq!(
+            ex.failure().map(|f| f.kind),
+            Some(FailureKind::RedirectRefused),
+            "{ex:?}"
+        );
+    }
+    // Without a body there is nothing to resend.
+    let req = Request::new(
+        "GET",
+        format!("{}/redirect-port/307/{}", first.base, second.port),
+    );
+    assert_eq!(response(&ok(send(&req, &options))).status, 200);
+}
+
+#[test]
+fn the_history_file_holds_no_credentials() {
+    let dir = ok(tempfile::tempdir());
+    let space = SpaceId::new("demo");
+    let s = server();
+    let mut history = HttpHistory::new(space.clone());
+    let secret = history.record(ok(send(
+        &Request::new("GET", format!("{}/secret?api_key=k3y-value", s.base))
+            .header("Authorization", "Bearer s3cr3t-bearer")
+            .header("Cookie", "session=c00kie-value")
+            .header("X-Trace", "visible"),
+        &s.options(),
+    )));
+    let plain = history.record(ok(send(
+        &Request::new("POST", format!("{}/counter", s.base)).body("{}"),
+        &s.options(),
+    )));
+    ok(save(dir.path(), &history));
+
+    let text = ok(std::fs::read_to_string(ok(http_path(dir.path(), "demo"))));
+    for value in ["s3cr3t-bearer", "c00kie-value", "abc123", "k3y-value"] {
+        assert!(!text.contains(value), "{value} in {text}");
+    }
+    assert!(text.contains("visible"), "{text}");
+    // Memory keeps the raw values for replay.
+    assert!(
+        history
+            .get(secret)
+            .is_some_and(|e| e.request.headers[0].1 == "Bearer s3cr3t-bearer")
+    );
+    assert_eq!(ok(replay(&history, secret, 1, &s.options())).len(), 1);
+
+    let loaded = ok(load(dir.path(), &space));
+    assert_eq!(ok(replay(&loaded, plain, 2, &s.options())).len(), 2);
+    match replay(&loaded, secret, 1, &s.options()) {
+        Err(e @ HttpError::Masked { .. }) => {
+            let message = e.to_string();
+            assert!(message.contains("Authorization"), "{message}");
+            assert!(message.contains("Cookie"), "{message}");
+            assert!(message.contains("not restored"), "{message}");
+        }
+        other => panic!("expected a masked refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_damaged_history_is_kept_until_quarantined() {
+    let dir = ok(tempfile::tempdir());
+    let space = SpaceId::new("demo");
+    let path = ok(http_path(dir.path(), "demo"));
+    ok(std::fs::create_dir_all(path.parent().unwrap_or(dir.path())));
+    let history = HttpHistory::new(space.clone());
+
+    ok(std::fs::write(&path, "{ not json"));
+    assert!(load(dir.path(), &space).is_err());
+    assert!(save(dir.path(), &history).is_err());
+    assert_eq!(ok(std::fs::read_to_string(&path)), "{ not json");
+
+    let moved = ok(xctx_http::quarantine(&path));
+    assert!(moved.ends_with("http.json.bad"), "{moved:?}");
+    assert_eq!(ok(std::fs::read_to_string(&moved)), "{ not json");
+    ok(save(dir.path(), &history));
+    assert_eq!(ok(load(dir.path(), &space)), history);
+
+    ok(std::fs::write(&path, r#"{"version":99,"something":"new"}"#));
+    assert!(matches!(
+        save(dir.path(), &history),
+        Err(HttpError::UnsupportedVersion { found: 99, .. })
+    ));
+    let second = ok(xctx_http::quarantine(&path));
+    assert!(second.ends_with("http.json.bad.2"), "{second:?}");
+    assert!(xctx_http::quarantine(&path).is_err());
 }

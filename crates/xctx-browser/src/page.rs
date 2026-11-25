@@ -27,6 +27,9 @@ pub const MAX_ENTRY_CHARS: usize = 4000;
 /// The most in-flight requests whose URL is remembered (to name a failed one); past that the map is cleared.
 const MAX_TRACKED_REQUESTS: usize = 2000;
 
+/// How many loader ids that reached their load event are remembered, newest kept.
+const MAX_LOADED_LOADERS: usize = 32;
+
 /// A list that keeps only its newest `capacity` items and counts the ones it dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedLog<T> {
@@ -142,7 +145,15 @@ pub(crate) struct PageState {
     pub(crate) console: BoundedLog<ConsoleEntry>,
     pub(crate) network: BoundedLog<NetworkError>,
     requests: HashMap<String, String>,
-    pub(crate) loads: u64,
+    /// The main frame's id, once a navigation said.
+    main_frame: Option<String>,
+    /// The loader of the main frame's latest committed navigation.
+    main_loader: Option<String>,
+    /// How many main-frame navigations committed.
+    navigations: u64,
+    /// Loader ids whose `load` lifecycle event fired, newest last. A navigation waits for its own loader, so
+    /// a late load of the previous document cannot end the wait early.
+    loaded: VecDeque<String>,
 }
 
 impl PageState {
@@ -151,8 +162,25 @@ impl PageState {
             console: BoundedLog::new(MAX_CONSOLE_ENTRIES),
             network: BoundedLog::new(MAX_NETWORK_ERRORS),
             requests: HashMap::new(),
-            loads: 0,
+            main_frame: None,
+            main_loader: None,
+            navigations: 0,
+            loaded: VecDeque::new(),
         }
+    }
+
+    /// Whether the document of loader `loader_id` reached its load event.
+    pub(crate) fn is_loaded(&self, loader_id: &str) -> bool {
+        self.loaded.iter().any(|l| l == loader_id)
+    }
+
+    /// Whether a main-frame navigation committed after `navigations_before` and its document loaded.
+    pub(crate) fn reloaded(&self, navigations_before: u64) -> bool {
+        self.navigations > navigations_before
+            && self
+                .main_loader
+                .as_deref()
+                .is_some_and(|l| self.is_loaded(l))
     }
 
     /// Forgets the console and network errors (on navigation).
@@ -166,7 +194,32 @@ impl PageState {
     pub(crate) fn handle(&mut self, event: Event) {
         let p = &event.params;
         match event.method.as_str() {
-            "Page.loadEventFired" => self.loads += 1,
+            "Page.lifecycleEvent" => {
+                let is_main = match (&self.main_frame, str_at(p, "/frameId")) {
+                    (Some(main), Some(frame)) => main == frame,
+                    _ => true,
+                };
+                if str_at(p, "/name") == Some("load")
+                    && is_main
+                    && let Some(loader) = str_at(p, "/loaderId")
+                {
+                    if self.loaded.len() >= MAX_LOADED_LOADERS {
+                        self.loaded.pop_front();
+                    }
+                    self.loaded.push_back(loader.to_owned());
+                }
+            }
+            "Page.frameNavigated" => {
+                let Some(frame) = p.get("frame") else {
+                    return;
+                };
+                if frame.get("parentId").is_some() {
+                    return;
+                }
+                self.main_frame = str_at(frame, "/id").map(str::to_owned);
+                self.main_loader = str_at(frame, "/loaderId").map(str::to_owned);
+                self.navigations += 1;
+            }
             "Runtime.consoleAPICalled" => {
                 let level = str_at(p, "/type").unwrap_or("log").to_owned();
                 let text = p
@@ -328,6 +381,9 @@ impl Page {
         for domain in ["Page.enable", "Runtime.enable", "Network.enable"] {
             page.call(domain, json!({}))?;
         }
+        // Lifecycle events name the loader they belong to, so a wait can tell this navigation's load from a
+        // late one of the previous document.
+        page.call("Page.setLifecycleEventsEnabled", json!({ "enabled": true }))?;
         Ok(page)
     }
 
@@ -360,7 +416,6 @@ impl Page {
     pub fn open(&mut self, url: &str) -> Result<()> {
         let checked = self.policy.check(url)?;
         self.state.clear();
-        let loads = self.state.loads;
         let result = self.call("Page.navigate", json!({ "url": checked.as_str() }))?;
         if let Some(error) = result
             .get("errorText")
@@ -372,24 +427,61 @@ impl Page {
                 reason: error.to_owned(),
             });
         }
-        if result.get("loaderId").is_none() {
-            return Ok(());
+        if let Some(frame) = result.get("frameId").and_then(Value::as_str) {
+            self.state.main_frame = Some(frame.to_owned());
         }
-        self.wait_for_load(loads)
+        let Some(loader) = result.get("loaderId").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let loader = loader.to_owned();
+        self.wait_for_load(|state| state.is_loaded(&loader))
     }
 
-    /// Reloads the page and waits for its load event. Clears the console and network errors first.
+    /// Reloads the page and waits for the reloaded document's load event. Clears the console and network
+    /// errors first.
     pub fn reload(&mut self) -> Result<()> {
         self.state.clear();
-        let loads = self.state.loads;
+        let before = self.state.navigations;
         self.call("Page.reload", json!({ "ignoreCache": true }))?;
-        self.wait_for_load(loads)
+        self.wait_for_load(|state| state.reloaded(before))
     }
 
-    /// The page's current URL.
+    /// The page's current URL, as [`Page::current_url`] reads it.
     pub fn url(&mut self) -> Result<String> {
-        let value = self.evaluate("location.href")?;
-        Ok(value.as_str().unwrap_or_default().to_owned())
+        self.current_url()
+    }
+
+    /// The URL the page is on now, asked of Chrome (`Page.getNavigationHistory`) rather than of the page's
+    /// scripts, so it follows redirects, links the user clicked and scripts that navigated, and the page cannot
+    /// fake it. Check it against the policy before showing what the page holds: see
+    /// [`Page::allowed_current_url`].
+    pub fn current_url(&mut self) -> Result<String> {
+        let history = self.call("Page.getNavigationHistory", json!({}))?;
+        let index = history
+            .get("currentIndex")
+            .and_then(Value::as_u64)
+            .and_then(|i| usize::try_from(i).ok())
+            .ok_or_else(|| BrowserError::BadMessage("a history without currentIndex".to_owned()))?;
+        history
+            .pointer(&format!("/entries/{index}/url"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                BrowserError::BadMessage("a history without the current entry".to_owned())
+            })
+    }
+
+    /// [`Page::current_url`] if the page's [`UrlPolicy`] allows it (or it is `about:blank`, a tab that has
+    /// not opened anything), and otherwise the policy's error ([`BrowserError::HostNotAllowed`] or
+    /// [`BrowserError::UnsupportedScheme`]): call it before a screenshot or reading the console, so a page that
+    /// redirected or was clicked away to another site is not captured.
+    pub fn allowed_current_url(&mut self) -> Result<String> {
+        let url = self.current_url()?;
+        if url == "about:blank" {
+            return Ok(url);
+        }
+        self.policy.check(&url)?;
+        Ok(url)
     }
 
     /// A PNG of the viewport.
@@ -509,15 +601,15 @@ impl Page {
             .call(method, params, self.timeout, &mut |e| state.handle(e))
     }
 
-    fn wait_for_load(&mut self, loads_before: u64) -> Result<()> {
-        if self.state.loads > loads_before {
+    fn wait_for_load(&mut self, done: impl Fn(&PageState) -> bool) -> Result<()> {
+        if done(&self.state) {
             return Ok(());
         }
         let deadline = Instant::now() + self.timeout;
         let state = &mut self.state;
         let loaded = self.conn.pump(deadline, &mut |e| {
             state.handle(e);
-            state.loads > loads_before
+            done(state)
         })?;
         if loaded {
             Ok(())
@@ -527,5 +619,78 @@ impl Page {
                 timeout: self.timeout,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(method: &str, params: Value) -> Event {
+        Event {
+            method: method.to_owned(),
+            params,
+        }
+    }
+
+    fn lifecycle(frame: &str, loader: &str, name: &str) -> Event {
+        event(
+            "Page.lifecycleEvent",
+            json!({ "frameId": frame, "loaderId": loader, "name": name, "timestamp": 1.0 }),
+        )
+    }
+
+    fn navigated(frame: &str, loader: &str, parent: Option<&str>) -> Event {
+        let mut f = json!({ "id": frame, "loaderId": loader, "url": "http://localhost:3000/" });
+        if let Some(parent) = parent {
+            f["parentId"] = json!(parent);
+        }
+        event("Page.frameNavigated", json!({ "frame": f }))
+    }
+
+    #[test]
+    fn a_late_load_of_the_previous_document_does_not_end_the_next_wait() {
+        let mut state = PageState::new();
+        state.handle(navigated("MAIN", "L1", None));
+        // The next navigation (loader L2) starts; the first document's load arrives late.
+        state.handle(lifecycle("MAIN", "L1", "load"));
+        state.handle(event("Page.loadEventFired", json!({ "timestamp": 2.0 })));
+        assert!(!state.is_loaded("L2"));
+        state.handle(lifecycle("MAIN", "L2", "DOMContentLoaded"));
+        assert!(!state.is_loaded("L2"));
+        // An iframe's load is not the page's.
+        state.handle(lifecycle("CHILD", "L2", "load"));
+        assert!(!state.is_loaded("L2"));
+        state.handle(lifecycle("MAIN", "L2", "load"));
+        assert!(state.is_loaded("L2"));
+    }
+
+    #[test]
+    fn a_reload_waits_for_the_new_documents_load() {
+        let mut state = PageState::new();
+        state.handle(navigated("MAIN", "L1", None));
+        state.handle(lifecycle("MAIN", "L1", "load"));
+        let before = state.navigations;
+        assert!(!state.reloaded(before), "the old load does not count");
+        state.handle(navigated("CHILD", "C1", Some("MAIN")));
+        assert!(
+            !state.reloaded(before),
+            "an iframe navigating is not the reload"
+        );
+        state.handle(navigated("MAIN", "L3", None));
+        assert!(!state.reloaded(before));
+        state.handle(lifecycle("MAIN", "L3", "load"));
+        assert!(state.reloaded(before));
+    }
+
+    #[test]
+    fn only_the_newest_loaders_are_remembered() {
+        let mut state = PageState::new();
+        for i in 0..(MAX_LOADED_LOADERS + 5) {
+            state.handle(lifecycle("MAIN", &format!("L{i}"), "load"));
+        }
+        assert_eq!(state.loaded.len(), MAX_LOADED_LOADERS);
+        assert!(!state.is_loaded("L0"));
+        assert!(state.is_loaded(&format!("L{}", MAX_LOADED_LOADERS + 4)));
     }
 }

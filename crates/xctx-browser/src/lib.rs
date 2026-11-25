@@ -5,7 +5,9 @@
 //! Everything blocks (a plain socket for the `/json/*` endpoints and a `tungstenite` websocket for the
 //! protocol, no async runtime); the app calls it from a background thread. Each [`Page`] has its own
 //! connection and reads its events whenever it waits for an answer, keeping only bounded lists of what it
-//! needs. Pages open only URLs their [`UrlPolicy`] allows, the machine itself by default.
+//! needs. Pages open only URLs their [`UrlPolicy`] allows (nothing by default; the app allows the space's
+//! port on the machine itself and its base URLs), and [`Page::allowed_current_url`] checks where a page went
+//! since. [`BrowserError::is_transport`] tells a broken connection (reset Chrome) from a failed page action.
 //!
 //! ```no_run
 //! # fn main() -> xctx_browser::Result<()> {
@@ -13,8 +15,11 @@
 //! let mut options = LaunchOptions::new(find_chrome()?, "/path/to/xctx/browser-profile");
 //! options.headless = true;
 //! let mut browser = Browser::launch(options)?;
-//! let mut page = browser.new_page(UrlPolicy::default())?;
+//! let mut policy = UrlPolicy::default();
+//! policy.allow_local_port(3000);
+//! let mut page = browser.new_page(policy)?;
 //! page.open("http://localhost:3000/")?;
+//! page.allowed_current_url()?;
 //! let png = page.screenshot()?;
 //! let console = page.console()?;
 //! let failed = page.network_errors()?;

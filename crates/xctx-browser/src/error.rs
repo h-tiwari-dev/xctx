@@ -140,6 +140,17 @@ pub enum BrowserError {
 }
 
 impl BrowserError {
+    /// Whether the DevTools connection itself broke ([`BrowserError::Closed`], [`BrowserError::WebSocket`],
+    /// [`BrowserError::Io`] or [`BrowserError::BadMessage`]), so the browser should be reset. Everything else
+    /// (a page that failed to load or took too long, a refused URL, a script that threw, an error answer)
+    /// leaves the connection usable: keep Chrome and report the error.
+    pub fn is_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::Closed | Self::WebSocket(_) | Self::Io { .. } | Self::BadMessage(_)
+        )
+    }
+
     pub(crate) fn io(context: impl Into<String>, source: std::io::Error) -> Self {
         Self::Io {
             context: context.into(),
@@ -150,3 +161,44 @@ impl BrowserError {
 
 /// The result type of the DevTools client's fallible operations.
 pub type Result<T, E = BrowserError> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_broken_connection_is_a_transport_error() {
+        let transport = [
+            BrowserError::Closed,
+            BrowserError::WebSocket("reset".into()),
+            BrowserError::io("read", std::io::Error::other("x")),
+            BrowserError::BadMessage("garbage".into()),
+        ];
+        for e in &transport {
+            assert!(e.is_transport(), "{e}");
+        }
+        let page = [
+            BrowserError::Navigation {
+                url: "http://localhost:3000/".into(),
+                reason: "net::ERR_CONNECTION_REFUSED".into(),
+            },
+            BrowserError::HostNotAllowed {
+                host: "example.com:443".into(),
+                allowed: "no host".into(),
+            },
+            BrowserError::Script("boom".into()),
+            BrowserError::Timeout {
+                method: "the page load".into(),
+                timeout: Duration::from_secs(1),
+            },
+            BrowserError::Protocol {
+                method: "Page.navigate".into(),
+                code: -32000,
+                message: "x".into(),
+            },
+        ];
+        for e in &page {
+            assert!(!e.is_transport(), "{e}");
+        }
+    }
+}

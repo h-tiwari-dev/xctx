@@ -1,6 +1,11 @@
 //! A space's HTTP history and its file: `<data dir>/spaces/<slug>/http.json`, next to the space's `graph.json`
-//! and `attempts.json`, written atomically. A missing file is an empty history; a damaged one is an error and
-//! is left alone.
+//! and `attempts.json`, written atomically. A missing file is an empty history; a damaged one (or one from a
+//! newer xctx) is an error, is left alone, and is never overwritten by [`save`]: move it aside with
+//! [`quarantine`] to start afresh.
+//!
+//! The file never holds credentials: [`save`] masks sensitive headers and URL credentials
+//! ([`Exchange::masked_for_disk`]). The raw values live only in the in-memory [`HttpHistory`], so a request
+//! loaded from disk that needed them cannot be replayed ([`crate::replay`] says which parts are missing).
 
 use std::fs;
 use std::io;
@@ -144,9 +149,34 @@ pub fn load(data_dir: &Path, space: &SpaceId) -> Result<HttpHistory> {
     Ok(history)
 }
 
-/// Save `history` to its space's file in `data_dir`, creating the space's directory if needed.
+/// The name a damaged history file gets from [`quarantine`]: `http.json.bad`.
+pub const QUARANTINE_SUFFIX: &str = ".bad";
+
+impl HttpHistory {
+    /// A copy to write to disk: every exchange as [`Exchange::masked_for_disk`] makes it.
+    pub fn masked_for_disk(&self) -> HttpHistory {
+        HttpHistory {
+            space: self.space.clone(),
+            exchanges: self
+                .exchanges
+                .iter()
+                .map(Exchange::masked_for_disk)
+                .collect(),
+            next_id: self.next_id,
+        }
+    }
+}
+
+/// Save `history` to its space's file in `data_dir`, creating the space's directory if needed. Sensitive
+/// headers and URL credentials are masked in the file ([`HttpHistory::masked_for_disk`]); `history` itself
+/// keeps the raw values.
+///
+/// Refuses, with the error [`load`] would give, to replace a file that is damaged, from a newer xctx, or of
+/// another space: call [`quarantine`] on it first. Saves are not locked: the caller must not run two saves of
+/// the same space at once (the app saves from one place, holding the space's history lock).
 pub fn save(data_dir: &Path, history: &HttpHistory) -> Result<()> {
     let path = http_path(data_dir, history.space.as_str())?;
+    check_replaceable(&path, &history.space)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| xctx_core::Error::Io {
             path: parent.to_path_buf(),
@@ -155,7 +185,7 @@ pub fn save(data_dir: &Path, history: &HttpHistory) -> Result<()> {
     }
     let doc = Document {
         version: HTTP_VERSION,
-        history: history.clone(),
+        history: history.masked_for_disk(),
     };
     let bytes = serde_json::to_vec_pretty(&doc).map_err(|source| xctx_core::Error::Json {
         path: path.clone(),
@@ -163,4 +193,89 @@ pub fn save(data_dir: &Path, history: &HttpHistory) -> Result<()> {
     })?;
     write_atomic(&path, &bytes)?;
     Ok(())
+}
+
+/// Just enough of a history file to tell whether it may be replaced, without keeping its exchanges.
+#[derive(Deserialize)]
+struct Probe {
+    #[serde(default)]
+    version: u64,
+    space: SpaceId,
+    #[allow(dead_code)]
+    exchanges: serde::de::IgnoredAny,
+}
+
+/// Fails when the file at `path` exists and is not a history of `space` this build reads.
+fn check_replaceable(path: &Path, space: &SpaceId) -> Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(xctx_core::Error::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+            .into());
+        }
+    };
+    let probe: Probe = serde_json::from_slice(&bytes).map_err(|source| {
+        // A newer xctx may have changed the shape; say so rather than calling it damaged.
+        match serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("version").and_then(serde_json::Value::as_u64))
+        {
+            Some(found) if found > u64::from(HTTP_VERSION) => HttpError::UnsupportedVersion {
+                path: path.to_path_buf(),
+                found: u32::try_from(found).unwrap_or(u32::MAX),
+                supported: HTTP_VERSION,
+            },
+            _ => xctx_core::Error::Json {
+                path: path.to_path_buf(),
+                source,
+            }
+            .into(),
+        }
+    })?;
+    if probe.version > u64::from(HTTP_VERSION) {
+        return Err(HttpError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            found: u32::try_from(probe.version).unwrap_or(u32::MAX),
+            supported: HTTP_VERSION,
+        });
+    }
+    if probe.space != *space {
+        return Err(HttpError::WrongSpace {
+            path: path.to_path_buf(),
+            found: probe.space.as_str().to_owned(),
+            expected: space.as_str().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Move the history file at `path` (one [`load`] or [`save`] refused) aside to `http.json.bad`, or
+/// `http.json.bad.2`, `.bad.3`, ... when that is taken, so nothing is lost and the next [`save`] starts a new
+/// file. Returns where it went. Fails when `path` does not exist or cannot be renamed.
+pub fn quarantine(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| HTTP_FILE.to_owned());
+    let mut n = 1u32;
+    let target = loop {
+        let candidate = if n == 1 {
+            path.with_file_name(format!("{name}{QUARANTINE_SUFFIX}"))
+        } else {
+            path.with_file_name(format!("{name}{QUARANTINE_SUFFIX}.{n}"))
+        };
+        if !candidate.exists() || n == u32::MAX {
+            break candidate;
+        }
+        n += 1;
+    };
+    fs::rename(path, &target).map_err(|source| xctx_core::Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(target)
 }
