@@ -1,5 +1,5 @@
 //! The API client core behind the http pane and the `http.send`, `http.replay` and `http.diff` tools: sending
-//! requests to a space's own hosts only, a bounded history per space on disk
+//! requests to a space's own origins only (scheme, host and port), a bounded history per space on disk
 //! (`<data dir>/spaces/<slug>/http.json`), replaying a saved request, diffing two exchanges, the
 //! `response.status` and `response.slow` events, and masking secrets before an exchange is shown.
 //!
@@ -22,8 +22,12 @@ pub use client::{
 pub use error::{HttpError, Result};
 pub use events::{EventRules, HttpEvent, RESPONSE_SLOW, RESPONSE_STATUS, events};
 pub use exchange::{
-    Exchange, Failure, FailureKind, Outcome, Request, Response, SENSITIVE_HEADERS,
-    is_sensitive_header,
+    Exchange, Failure, FailureKind, Outcome, Request, Response, SENSITIVE_HEADER_SUFFIXES,
+    SENSITIVE_HEADERS, SENSITIVE_QUERY_KEYS, is_masked_value, is_sensitive_header,
+    is_sensitive_query_key, mask_url,
 };
-pub use history::{HTTP_FILE, HTTP_VERSION, HttpHistory, MAX_HISTORY, http_path, load, save};
+pub use history::{
+    HTTP_FILE, HTTP_VERSION, HttpHistory, MAX_HISTORY, QUARANTINE_SUFFIX, http_path, load,
+    quarantine, save,
+};
 pub use replay::{ExchangeDiff, HeaderChange, MAX_REPLAYS, VOLATILE_HEADERS, diff, replay};

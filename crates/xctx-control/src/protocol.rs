@@ -304,10 +304,10 @@ pub enum Capability {
     /// Look at spaces, layouts, the Inbox, agent graphs, channels, contracts, loops, attempts and plugins.
     Read,
     /// Rearrange a space: split, close, focus, zoom and reshape panes; pause, add and remove agent lanes; advance a
-    /// loop; mount and unmount plugins.
+    /// loop; mount and unmount plugins; report plugin events (`plugin.emit`, whose actions can pass or fail the loop).
     Layout,
     /// Propose work and tell the user things: draft or propose widening a space, post to the Inbox, the channel or
-    /// the contract, set the status line, call plugin tools (writes become Inbox gates) and report plugin events.
+    /// the contract, set the status line, and call plugin tools (writes become Inbox gates).
     Propose,
     /// Steer on the user's behalf: resume a paused agent and set how far a loop runs without asking. These undo a
     /// user's pause or loosen a user's gate, so [`crate::ServerConfig::default`] (what pane agents get) leaves it
@@ -400,7 +400,9 @@ pub enum Method {
     PluginUnmount,
     /// `plugin.call`: call a mounted plugin's tool. Read tools run; write tools post a gate to the Inbox.
     PluginCall,
-    /// `plugin.emit`: report an event from a plugin's own tool, which the space routes to its loop.
+    /// `plugin.emit`: report an event from a plugin's own tool, which the space routes to its loop. Needs
+    /// [`Capability::Layout`]: a manifest action can pass or fail the loop's stage, moving the loop as
+    /// `loop.advance` does.
     PluginEmit,
 }
 
@@ -513,7 +515,8 @@ impl Method {
             | Method::GraphRemoveLane
             | Method::LoopAdvance
             | Method::PluginMount
-            | Method::PluginUnmount => Capability::Layout,
+            | Method::PluginUnmount
+            | Method::PluginEmit => Capability::Layout,
             Method::GraphResume | Method::LoopSetAutonomy => Capability::Steer,
             Method::SpaceDraft
             | Method::InboxPost
@@ -524,8 +527,7 @@ impl Method {
             | Method::SpaceWidenPropose
             | Method::AttemptReport
             | Method::AttemptPropose
-            | Method::PluginCall
-            | Method::PluginEmit => Capability::Propose,
+            | Method::PluginCall => Capability::Propose,
             Method::AttemptList
             | Method::AttemptDiff
             | Method::PluginList
@@ -2320,7 +2322,7 @@ mod tests {
             (Method::PluginMount, Layout),
             (Method::PluginUnmount, Layout),
             (Method::PluginCall, Propose),
-            (Method::PluginEmit, Propose),
+            (Method::PluginEmit, Layout),
         ];
         for (method, capability) in expected {
             assert_eq!(method.capability(), capability, "{method}");

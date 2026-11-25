@@ -714,20 +714,22 @@ impl CallEnv {
             .unwrap_or_else(|| format!("http://localhost:{}", self.port))
     }
 
+    /// The space's port on the machine itself and the origin of the pane's base URL, nothing else.
     fn send_options(&self) -> SendOptions {
         let mut options = SendOptions::default();
-        if let Some(base) = &self.http_base
-            && let Ok(host) = xctx_http::host_of(base)
-        {
-            options.allow_host(&host);
+        options.allow_local_port(self.port);
+        if let Some(base) = &self.http_base {
+            let _ = options.allow_url_origin(base);
         }
         options
     }
 
+    /// The space's port on the machine itself and the origin of the pane's URL, nothing else.
     fn url_policy(&self) -> UrlPolicy {
         let mut policy = UrlPolicy::default();
+        policy.allow_local_port(self.port);
         if let Some(url) = &self.web_url {
-            let _ = policy.allow_url_host(url);
+            let _ = policy.allow_url_origin(url);
         }
         policy
     }
@@ -1766,14 +1768,22 @@ impl PluginHost {
         self.trust.trust(&repo.repo, plugin, &manifest_hash(&bytes))
     }
 
-    /// The runtime of `space`, made on first use (its http history loaded from disk; a damaged history starts
-    /// empty, leaving the file in place until the next send replaces it).
+    /// The runtime of `space`, made on first use (its http history loaded from disk; a damaged history, or one
+    /// from a newer xctx, is moved aside to `http.json.bad` and the history starts empty).
     pub fn runtime(&mut self, space: &SpaceId) -> &mut SpaceRuntime {
         let data_dir = self.data_dir.clone();
         self.runtimes.entry(space.clone()).or_insert_with(|| {
             let history = data_dir
                 .as_deref()
-                .and_then(|d| xctx_http::load(d, space).ok())
+                .and_then(|d| match xctx_http::load(d, space) {
+                    Ok(history) => Some(history),
+                    Err(_) => {
+                        if let Ok(path) = xctx_http::http_path(d, space.as_str()) {
+                            let _ = xctx_http::quarantine(&path);
+                        }
+                        None
+                    }
+                })
                 .unwrap_or_else(|| HttpHistory::new(space.clone()));
             SpaceRuntime {
                 http: Arc::new(Mutex::new(history)),

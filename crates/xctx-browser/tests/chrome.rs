@@ -98,6 +98,7 @@ fn a_local_page_is_opened_captured_and_closed() -> Result<(), Box<dyn std::error
     };
     let started = Instant::now();
     let site = serve()?;
+    let other = serve()?;
     let profile = tempfile::tempdir()?;
     let profile_dir = profile.path().join("profile");
     let mut options = LaunchOptions::new(chrome, &profile_dir);
@@ -115,7 +116,10 @@ fn a_local_page_is_opened_captured_and_closed() -> Result<(), Box<dyn std::error
     drop(attached);
     assert!(process_exists(pid));
 
-    let mut page = browser.new_page(UrlPolicy::default())?;
+    let mut policy = UrlPolicy::default();
+    policy.allow_local_port(site);
+    policy.allow_local_port(1);
+    let mut page = browser.new_page(policy)?;
     assert!(
         browser
             .targets()?
@@ -126,6 +130,8 @@ fn a_local_page_is_opened_captured_and_closed() -> Result<(), Box<dyn std::error
     let url = format!("http://127.0.0.1:{site}/");
     page.open(&url)?;
     assert_eq!(page.url()?, url);
+    assert_eq!(page.current_url()?, url);
+    assert_eq!(page.allowed_current_url()?, url);
     assert_eq!(page.evaluate("document.title")?, "xctx test");
     assert_eq!(page.evaluate("Promise.resolve(1 + 2)")?, 3);
     assert!(matches!(
@@ -175,12 +181,40 @@ fn a_local_page_is_opened_captured_and_closed() -> Result<(), Box<dyn std::error
 
     assert!(matches!(
         page.open("https://example.com/"),
-        Err(BrowserError::HostNotAllowed { host, .. }) if host == "example.com"
+        Err(BrowserError::HostNotAllowed { host, .. }) if host == "example.com:443"
+    ));
+    assert!(matches!(
+        page.open(&format!("http://127.0.0.1:{other}/")),
+        Err(BrowserError::HostNotAllowed { .. })
     ));
     assert!(matches!(
         page.open("http://127.0.0.1:1/"),
         Err(BrowserError::Navigation { .. })
     ));
+    let failed = page.open("http://127.0.0.1:1/");
+    assert!(
+        failed.as_ref().is_err_and(|e| !e.is_transport()),
+        "{failed:?}"
+    );
+
+    // The page itself leaves for a port the policy does not allow: its URL is no longer allowed.
+    page.open(&url)?;
+    page.evaluate(&format!("location.href = 'http://127.0.0.1:{other}/'; 1"))?;
+    assert!(
+        wait_until(Duration::from_secs(5), || page
+            .current_url()
+            .is_ok_and(|u| u.contains(&other.to_string()))),
+        "the page navigated away"
+    );
+    assert!(matches!(
+        page.allowed_current_url(),
+        Err(BrowserError::HostNotAllowed { .. })
+    ));
+    // A late load from that navigation does not end the next open's wait early, and the page is back.
+    page.open(&url)?;
+    assert_eq!(page.allowed_current_url()?, url);
+    assert_eq!(page.evaluate("document.title")?, "xctx test");
+
     let id = page.target_id().to_owned();
     page.close()?;
     assert!(wait_until(Duration::from_secs(5), || {
@@ -196,6 +230,60 @@ fn a_local_page_is_opened_captured_and_closed() -> Result<(), Box<dyn std::error
         "no Chrome helper is left behind"
     );
     eprintln!("the Chrome test took {:?}", started.elapsed());
+    Ok(())
+}
+
+#[test]
+fn an_orphaned_chrome_on_the_profile_does_not_block_the_next_launch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let chrome = match find_chrome() {
+        Ok(chrome) => chrome,
+        Err(e) => {
+            eprintln!("skipping the Chrome test: {e}");
+            return Ok(());
+        }
+    };
+    let profile = tempfile::tempdir()?;
+    let profile_dir = profile.path().join("profile");
+    let mut options = LaunchOptions::new(chrome, &profile_dir);
+    options.headless = true;
+    let orphan = Browser::launch(options.clone())?;
+    let orphan_pid = orphan.pid().ok_or("a launched browser has a pid")?;
+    // As if xctx died: nothing quits this Chrome.
+    std::mem::forget(orphan);
+    assert!(process_exists(orphan_pid));
+    // Should the test fail, do not leave the orphan running.
+    struct KillGroup(u32);
+    impl Drop for KillGroup {
+        fn drop(&mut self) {
+            if let Ok(pid) = libc::pid_t::try_from(self.0) {
+                // SAFETY: only signals the group of the Chrome this test started.
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let _cleanup = KillGroup(orphan_pid);
+
+    let browser = Browser::launch(options)?;
+    assert!(!browser.version()?.browser.is_empty());
+    assert_ne!(browser.pid(), Some(orphan_pid));
+    // The orphan is our child here (the test forgot it), so reap it ourselves to see it is gone.
+    let reaped = wait_until(Duration::from_secs(5), || {
+        let Ok(pid) = libc::pid_t::try_from(orphan_pid) else {
+            return true;
+        };
+        let mut status = 0;
+        // SAFETY: waitpid on our own child only writes the status.
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == pid }
+    });
+    assert!(reaped, "the orphaned Chrome quit");
+    drop(browser);
+    assert!(
+        wait_until(Duration::from_secs(5), || !processes_using(&profile_dir)),
+        "no Chrome helper is left behind"
+    );
     Ok(())
 }
 

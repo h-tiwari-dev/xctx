@@ -25,6 +25,12 @@ const BROWSER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long closing waits for Chrome to quit on its own before killing it.
 const QUIT_GRACE: Duration = Duration::from_secs(3);
 
+/// The symlink Chrome keeps in its profile while it runs, pointing at `<hostname>-<pid>`.
+const SINGLETON_LOCK: &str = "SingletonLock";
+
+/// How long asking a possibly orphaned Chrome's DevTools port for `/json/version` may take.
+const ORPHAN_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// How Chrome is started by [`Browser::launch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchOptions {
@@ -171,6 +177,12 @@ impl Browser {
     /// Starts Chrome as `options` say and connects to it, waiting up to `options.timeout` for it to open its
     /// DevTools port. Chrome runs in its own process group, so closing takes its helper processes too.
     ///
+    /// A Chrome this client started earlier on the same profile and never quit (left running when xctx died)
+    /// is stopped first: when the profile's [`ACTIVE_PORT_FILE`] names a port that still answers as that same
+    /// browser, it is asked to close over DevTools, and its process group (the pid in the profile's
+    /// `SingletonLock`) is killed if it does not. Nothing is done when the port does not answer, or answers as
+    /// a different browser. Only `options.profile_dir` is looked at.
+    ///
     /// Fails if Chrome cannot be started, exits early (for example because another Chrome already uses the
     /// profile directory), or does not open its port in time; Chrome is killed in every failure case.
     pub fn launch(options: LaunchOptions) -> Result<Self> {
@@ -180,6 +192,7 @@ impl Browser {
                 e,
             )
         })?;
+        stop_orphan(&options.profile_dir);
         let port_file = options.profile_dir.join(ACTIVE_PORT_FILE);
         match std::fs::remove_file(&port_file) {
             Ok(()) => {}
@@ -343,23 +356,14 @@ impl Browser {
             );
         }
         drop(conn);
+        let pid = child.id();
         let deadline = Instant::now() + QUIT_GRACE;
-        let mut exited = false;
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    exited = true;
-                    break;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                Err(_) => break,
-            }
+        while Instant::now() < deadline && !exited_unreaped(pid) {
+            std::thread::sleep(Duration::from_millis(25));
         }
-        // Take the helpers (renderers, GPU) with it: they share Chrome's process group.
-        kill_group(child.id());
-        if exited {
-            return Ok(());
-        }
+        // Take the helpers (renderers, GPU) with it: they share Chrome's process group. Chrome is not reaped
+        // yet, so its pid (the group id) cannot have been reused by an unrelated process.
+        kill_group(pid);
         let _ = child.kill();
         child
             .wait()
@@ -382,6 +386,136 @@ fn kill_group(pid: u32) {
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
     }
+}
+
+/// Whether our child `pid` has exited, without reaping it (so its pid, and its group id, stay reserved).
+fn exited_unreaped(pid: u32) -> bool {
+    let id: libc::id_t = pid;
+    // SAFETY: siginfo_t is plain data, and waitid only writes into it; WNOWAIT leaves the child waitable.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            id,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        // An error means there is no such child left to wait for.
+        rc != 0 || info.si_pid() != 0
+    }
+}
+
+/// Stops a Chrome this client left running on `profile_dir` (see [`Browser::launch`]). Best effort: whatever
+/// fails here, the launch goes on and reports its own error.
+fn stop_orphan(profile_dir: &Path) {
+    let Ok(text) = std::fs::read_to_string(profile_dir.join(ACTIVE_PORT_FILE)) else {
+        return;
+    };
+    let Ok(active) = parse_active_port(&text) else {
+        return;
+    };
+    if !answers_as(&active) {
+        return;
+    }
+    let ws_url = format!("ws://127.0.0.1:{}{}", active.port, active.browser_path);
+    if let Ok(mut conn) = Connection::connect(&ws_url) {
+        let _ = conn.call(
+            "Browser.close",
+            json!({}),
+            ORPHAN_PROBE_TIMEOUT,
+            &mut |_| {},
+        );
+    }
+    let pid = singleton_pid(profile_dir);
+    let gone = |pid: Option<u32>| !answers_as(&active) && pid.is_none_or(|p| !is_running(p));
+    if wait(QUIT_GRACE, || gone(pid)) {
+        return;
+    }
+    // It did not quit. Its SingletonLock names its pid, which is its process group (it was started with
+    // process_group(0)); only kill a group led by that pid.
+    if let Some(pid) = pid
+        && is_group_leader(pid)
+    {
+        kill_group(pid);
+        wait(QUIT_GRACE, || gone(Some(pid)));
+    }
+}
+
+/// Whether the DevTools port in `active` answers as the very browser that wrote it: its `/json/version`
+/// websocket has the same (random, per-launch) browser path.
+fn answers_as(active: &ActivePort) -> bool {
+    http::get(active.port, "/json/version", ORPHAN_PROBE_TIMEOUT)
+        .ok()
+        .and_then(|body| serde_json::from_str::<VersionInfo>(&body).ok())
+        .is_some_and(|v| v.web_socket_debugger_url.ends_with(&active.browser_path))
+}
+
+/// The pid in `profile_dir`'s `SingletonLock` (`<hostname>-<pid>`), when it names this machine.
+fn singleton_pid(profile_dir: &Path) -> Option<u32> {
+    let target = std::fs::read_link(profile_dir.join(SINGLETON_LOCK)).ok()?;
+    let target = target.to_string_lossy();
+    let (host, pid) = target.rsplit_once('-')?;
+    let pid = pid.parse::<u32>().ok().filter(|p| *p > 1)?;
+    (host == hostname()?).then_some(pid)
+}
+
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `buf.len()` bytes into `buf`.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+/// Whether `pid` is a live process (not a zombie waiting to be reaped).
+fn is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::c_int::try_from(pid) else {
+        return false;
+    };
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let Ok(size_c) = libc::c_int::try_from(size) else {
+        return false;
+    };
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, which is that big.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size_c,
+        )
+    };
+    if written != size_c {
+        return false;
+    }
+    // SAFETY: proc_pidinfo filled the whole struct.
+    let info = unsafe { info.assume_init() };
+    info.pbi_status != libc::SZOMB
+}
+
+fn is_group_leader(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: getpgid only reads the process table.
+    unsafe { libc::getpgid(pid) == pid }
+}
+
+/// Polls `done` until it is true or `timeout` passes; returns its last answer.
+fn wait(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    done()
 }
 
 #[cfg(test)]
@@ -407,6 +541,79 @@ mod tests {
         assert!(parse_active_port("0\n/devtools/browser/x").is_err());
         assert!(parse_active_port("99999\n/devtools/browser/x").is_err());
         assert!(parse_active_port("9222\n/somewhere/else").is_err());
+    }
+
+    #[test]
+    fn a_stale_port_file_where_nothing_listens_is_left_to_the_launch() -> std::io::Result<()> {
+        let profile = tempfile::tempdir()?;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let port_file = profile.path().join(ACTIVE_PORT_FILE);
+        std::fs::write(&port_file, format!("{port}\n/devtools/browser/gone\n"))?;
+        // A lock naming this very process: it must never be signalled, since nothing answers on the port.
+        let lock = format!("{}-{}", hostname().unwrap_or_default(), std::process::id());
+        std::os::unix::fs::symlink(lock, profile.path().join(SINGLETON_LOCK))?;
+        let started = Instant::now();
+        stop_orphan(profile.path());
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // The launch removes the stale file and goes on to start "Chrome" (here a program that exits).
+        let options = LaunchOptions::new("/usr/bin/false", profile.path());
+        assert!(matches!(
+            Browser::launch(options),
+            Err(BrowserError::ExitedEarly { .. })
+        ));
+        assert!(!port_file.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_port_that_answers_as_another_browser_is_left_alone() -> std::io::Result<()> {
+        // Something else now listens on the old port: it is not the profile's browser.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/other"}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let active = ActivePort {
+            port,
+            browser_path: "/devtools/browser/mine".to_owned(),
+        };
+        assert!(!answers_as(&active));
+        let profile = tempfile::tempdir()?;
+        std::fs::write(
+            profile.path().join(ACTIVE_PORT_FILE),
+            format!("{port}\n/devtools/browser/mine\n"),
+        )?;
+        let started = Instant::now();
+        stop_orphan(profile.path());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn the_singleton_lock_names_a_pid_on_this_machine_only() -> std::io::Result<()> {
+        let profile = tempfile::tempdir()?;
+        assert_eq!(singleton_pid(profile.path()), None);
+        let host = hostname().unwrap_or_default();
+        std::os::unix::fs::symlink(format!("{host}-4242"), profile.path().join(SINGLETON_LOCK))?;
+        assert_eq!(singleton_pid(profile.path()), Some(4242));
+        let other = tempfile::tempdir()?;
+        std::os::unix::fs::symlink("elsewhere.local-4242", other.path().join(SINGLETON_LOCK))?;
+        assert_eq!(singleton_pid(other.path()), None);
+        assert!(is_running(std::process::id()));
+        Ok(())
     }
 
     #[test]

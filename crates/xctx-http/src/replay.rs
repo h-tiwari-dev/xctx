@@ -18,8 +18,10 @@ pub const VOLATILE_HEADERS: &[&str] = &["date"];
 /// Send the request of exchange `id` in `history` again, `times` times one after another, with `options`.
 ///
 /// Returns the new exchanges in order, not yet recorded: pass them to [`HttpHistory::record_all`]. Fails when
-/// no exchange has that id, when `times` is 0 or above [`MAX_REPLAYS`], or when `options` refuse the request
-/// (its host is no longer allowed, say); nothing is sent in those cases.
+/// no exchange has that id, when `times` is 0 or above [`MAX_REPLAYS`], when `options` refuse the request
+/// (its host is no longer allowed, say), or with [`HttpError::Masked`] when the exchange was loaded from disk
+/// and its credentials were masked there (they are never saved, see [`crate::save`]); nothing is sent in those
+/// cases.
 pub fn replay(
     history: &HttpHistory,
     id: u64,
@@ -33,6 +35,10 @@ pub fn replay(
         });
     }
     let request = &history.get(id).ok_or(HttpError::NotFound(id))?.request;
+    let parts = request.masked_parts();
+    if !parts.is_empty() {
+        return Err(HttpError::Masked { id, parts });
+    }
     (0..times).map(|_| send(request, options)).collect()
 }
 

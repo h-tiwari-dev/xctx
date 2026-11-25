@@ -48,6 +48,20 @@ pub enum HttpError {
         max: u32,
     },
 
+    /// The exchange was loaded from disk, where its credentials were masked, so it cannot be sent as it was.
+    #[error(
+        "exchange {id} was reloaded from disk, where its {} {} masked and not restored; send the request again \
+         with them instead of replaying it",
+        parts.join(", "),
+        if parts.len() == 1 { "was" } else { "were" }
+    )]
+    Masked {
+        /// The exchange's id.
+        id: u64,
+        /// What was masked: header names, and `url` when the URL held credentials.
+        parts: Vec<String>,
+    },
+
     /// The slug cannot name a folder under the spaces directory.
     #[error("{0:?} is not a valid space slug")]
     InvalidSlug(String),
