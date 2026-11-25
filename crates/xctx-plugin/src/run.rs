@@ -70,6 +70,26 @@ impl ToolOutput {
 /// A built-in plan is refused with [`PluginError::Builtin`]: the app routes those to its own implementations.
 /// A non-zero exit is not an error; it is in [`ToolOutput::status`].
 pub fn run_plan(plan: &CallPlan, timeout: Duration, max_output_bytes: usize) -> Result<ToolOutput> {
+    run_plan_env(plan, timeout, max_output_bytes, false)
+}
+
+/// [`run_plan`], except that the tool starts from an empty environment: `plan.env` is all it gets, so it must
+/// carry `PATH`, `HOME` and whatever else the tool needs. The app uses this so a tool does not inherit xctx's own
+/// environment (its secrets and tokens).
+pub fn run_plan_isolated(
+    plan: &CallPlan,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<ToolOutput> {
+    run_plan_env(plan, timeout, max_output_bytes, true)
+}
+
+fn run_plan_env(
+    plan: &CallPlan,
+    timeout: Duration,
+    max_output_bytes: usize,
+    clear_env: bool,
+) -> Result<ToolOutput> {
     let argv = match &plan.invocation {
         Invocation::Run { argv } => argv,
         Invocation::Builtin { name, .. } => {
@@ -90,7 +110,11 @@ pub fn run_plan(plan: &CallPlan, timeout: Duration, max_output_bytes: usize) -> 
         message,
     };
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    if clear_env {
+        command.env_clear();
+    }
+    let mut child = command
         .args(args)
         .current_dir(&plan.cwd)
         .envs(&plan.env)

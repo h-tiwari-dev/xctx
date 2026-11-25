@@ -303,11 +303,12 @@ impl Workspace {
             self.record_pane_session(id, pane, &session);
         }
         if let (Ok(view), Some(task)) = (&spawned, &stdin) {
-            // A runner that reads its task on standard input gets it typed in once it started.
+            // A runner that reads its task on standard input gets it typed in once it started, with its control
+            // characters flattened so the task cannot type keys of its own.
             let _ = view
                 .read(cx)
                 .session()
-                .write(format!("{task}\r").as_bytes());
+                .write(crate::spawn::typed_task(task).as_bytes());
         }
         let terminal = match spawned {
             Ok(view) => {

@@ -1060,9 +1060,8 @@ impl Workspace {
             |id| self.in_flight_spaces.contains(id),
             &params.space,
         )?;
-        let space = self
-            .active_space(&id)
-            .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+        // A closed tab's plugins run nothing: refused, as calls and pane actions are.
+        let space = self.open_space_for_plugins(&id)?;
         let registry = self.plugins.registry(&space);
         let plugin = registry.usable(&params.plugin).ok_or_else(|| {
             RpcError::not_found(format!("no usable plugin named {}", params.plugin))

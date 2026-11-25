@@ -396,6 +396,20 @@ impl Workspace {
             return;
         };
         let number = attempt.number();
+        // An attempt runs a fork of its writer's session: a runner that cannot fork (or is no longer installed)
+        // must not start it as something else.
+        if let Some(why) = self.fork_refusal(&space, &AgentNodeId::new(attempt.agent.clone())) {
+            let message = format!(
+                "attempt {number} of {id} was not started again: {why}; adopt or discard it, or choose a runner that can fork"
+            );
+            self.error(message.clone(), cx);
+            if let Some(tab) = self.tabs.get_mut(id) {
+                tab.attempt_terminals
+                    .insert(number, PaneTerminal::Failed(message));
+            }
+            cx.notify();
+            return;
+        }
         let worktree = attempt.worktree.worktree.clone();
         let started = self
             .sessions

@@ -34,6 +34,9 @@ pub const FILE_TAIL_START_BYTES: u64 = 64 * 1024;
 /// The longest line kept from a tailed command or file; the rest of the line is dropped.
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 
+/// The most bytes of a tailed file read in one poll.
+pub const FILE_READ_BYTES: u64 = 1024 * 1024;
+
 /// A plugin event matched in a line a logs pane tailed, sent to the workspace to fire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailEvent {
@@ -107,8 +110,9 @@ impl LogTail {
         }
     }
 
-    /// Run `argv` (no shell) in `cwd` with `env` on top of xctx's own environment, its stdout and stderr tailed
-    /// into `buffer`. Fails when it cannot be started.
+    /// Run `argv` (no shell) in `cwd` with exactly `env` as its environment (nothing of xctx's own is inherited;
+    /// see `plugin_host::isolated_env`), its stdout and stderr tailed into `buffer`. Fails when it cannot be
+    /// started.
     pub fn command(
         argv: &[String],
         cwd: &Path,
@@ -122,6 +126,7 @@ impl LogTail {
         let mut child = Command::new(program)
             .args(args)
             .current_dir(cwd)
+            .env_clear()
             .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -231,23 +236,54 @@ fn spawn_line_reader(
     target: TailTarget,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) => break,
-                Ok(_) => take_line(&line, &buffer, &target),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
+        read_lines(pipe, |line| take_line(line, &buffer, &target));
     })
+}
+
+/// Read `pipe` line by line until it ends, giving each line (without its newline) to `take`. At most
+/// [`MAX_LINE_BYTES`] of a line are kept: the rest of it is read and dropped as it arrives, so a stream that never
+/// sends a newline cannot grow memory without bound. A last line without a newline is given at the end.
+pub fn read_lines(pipe: impl Read, mut take: impl FnMut(&[u8])) {
+    let mut reader = BufReader::new(pipe);
+    let mut line: Vec<u8> = Vec::new();
+    // True while the rest of a line that was already cut is skipped.
+    let mut skipping = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let newline = available.iter().position(|&b| b == b'\n');
+        let chunk = &available[..newline.unwrap_or(available.len())];
+        if !skipping {
+            let room = MAX_LINE_BYTES.saturating_sub(line.len());
+            line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        let used = newline.map_or(available.len(), |at| at + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            if !skipping {
+                take(&line);
+            }
+            line.clear();
+            skipping = false;
+        } else if !skipping && line.len() >= MAX_LINE_BYTES {
+            take(&line);
+            line.clear();
+            skipping = true;
+        }
+    }
+    if !skipping && !line.is_empty() {
+        take(&line);
+    }
 }
 
 fn follow_file(path: &Path, buffer: &LogBuffer, target: &TailTarget, stop: &AtomicBool) {
     let mut offset: Option<u64> = None;
     let mut partial: Vec<u8> = Vec::new();
+    let mut skipping = false;
     while !stop.load(Ordering::Relaxed) {
         if let Ok(mut file) = File::open(path) {
             let len = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -255,22 +291,35 @@ fn follow_file(path: &Path, buffer: &LogBuffer, target: &TailTarget, stop: &Atom
                 None => len.saturating_sub(FILE_TAIL_START_BYTES),
                 Some(at) if at > len => {
                     partial.clear();
+                    skipping = false;
                     0
                 }
                 Some(at) => at,
             };
             if file.seek(SeekFrom::Start(start)).is_ok() {
+                // At most FILE_READ_BYTES a poll, so a file that grows fast is read in steps.
                 let mut bytes = Vec::new();
-                if file.read_to_end(&mut bytes).is_ok() {
+                if (&mut file)
+                    .take(FILE_READ_BYTES)
+                    .read_to_end(&mut bytes)
+                    .is_ok()
+                {
                     offset = Some(start + bytes.len() as u64);
-                    partial.extend_from_slice(&bytes);
-                    while let Some(end) = partial.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = partial.drain(..=end).collect();
-                        take_line(&line, buffer, target);
-                    }
-                    if partial.len() > MAX_LINE_BYTES {
-                        let line: Vec<u8> = std::mem::take(&mut partial);
-                        take_line(&line, buffer, target);
+                    for &b in &bytes {
+                        if b == b'\n' {
+                            if !skipping {
+                                take_line(&partial, buffer, target);
+                            }
+                            partial.clear();
+                            skipping = false;
+                        } else if !skipping {
+                            partial.push(b);
+                            if partial.len() >= MAX_LINE_BYTES {
+                                take_line(&partial, buffer, target);
+                                partial.clear();
+                                skipping = true;
+                            }
+                        }
                     }
                 }
             }
@@ -366,6 +415,12 @@ impl BrowserHandle {
 
     /// Run `action` on the space's page, starting Chrome and opening a tab first when needed, then refresh the
     /// snapshot (screenshot, console, failed requests). Blocks: call it from the background. Errors are masked.
+    ///
+    /// Only a broken DevTools connection ([`xctx_browser::BrowserError::is_transport`]) resets the browser; a page
+    /// that failed to load, took too long or was refused keeps Chrome and its page, and the error is reported.
+    /// The snapshot is refreshed only while the page is on an allowed origin
+    /// ([`Page::allowed_current_url`]): a page that redirected or was clicked away to another site is not
+    /// captured, and that is an error.
     pub fn with_page<T>(
         &self,
         policy: UrlPolicy,
@@ -377,30 +432,44 @@ impl BrowserHandle {
             s.phase = BrowserPhase::Connecting;
             s.error = None;
         });
+        let failure = |e: xctx_browser::BrowserError| {
+            if e.is_transport() {
+                PageFailure::Transport(e.to_string())
+            } else {
+                PageFailure::Page(e.to_string())
+            }
+        };
         let result = (|| {
             if session.browser.is_none() {
-                let chrome = find_chrome().map_err(|e| (true, e.to_string()))?;
+                let chrome = find_chrome().map_err(|e| PageFailure::NotFound(e.to_string()))?;
                 let options = LaunchOptions::new(chrome, session.profile_dir.clone());
-                session.browser =
-                    Some(Browser::launch(options).map_err(|e| (false, e.to_string()))?);
+                session.browser = Some(
+                    Browser::launch(options).map_err(|e| PageFailure::Transport(e.to_string()))?,
+                );
                 session.page = None;
             }
             if session.page.is_none() {
                 let Some(browser) = session.browser.as_mut() else {
-                    return Err((false, "Chrome is not running".to_owned()));
+                    return Err(PageFailure::Transport("Chrome is not running".to_owned()));
                 };
-                session.page = Some(
-                    browser
-                        .new_page(policy.clone())
-                        .map_err(|e| (false, e.to_string()))?,
-                );
+                session.page = Some(browser.new_page(policy.clone()).map_err(failure)?);
             }
             let Some(page) = session.page.as_mut() else {
-                return Err((false, "no page is open".to_owned()));
+                return Err(PageFailure::Transport("no page is open".to_owned()));
             };
             page.set_policy(policy);
-            let value = action(page).map_err(|e| (false, e.to_string()))?;
-            let url = page.url().ok();
+            let value = action(page).map_err(failure)?;
+            let url = match page.allowed_current_url() {
+                Ok(url) => url,
+                Err(e) if e.is_transport() => return Err(PageFailure::Transport(e.to_string())),
+                Err(e) => {
+                    let at = page.current_url().unwrap_or_default();
+                    return Err(PageFailure::LeftPolicy {
+                        url: at,
+                        why: e.to_string(),
+                    });
+                }
+            };
             let png = page.screenshot().ok();
             let console = page.console().unwrap_or_default();
             let network = page.network_errors().unwrap_or_default();
@@ -410,7 +479,7 @@ impl BrowserHandle {
             Ok((value, url, png, console, network)) => {
                 self.update(|s| {
                     s.phase = BrowserPhase::Ready;
-                    s.url = url.map(|u| redactor.redact(&u).into_owned());
+                    s.url = Some(xctx_http::mask_url(&url, redactor));
                     if let Some(png) = png {
                         s.screenshot = Some(Arc::new(png));
                         s.screenshot_generation += 1;
@@ -426,19 +495,30 @@ impl BrowserHandle {
                 });
                 Ok(value)
             }
-            Err((not_found, message)) => {
-                let message = redactor.redact(&message).into_owned();
-                if !not_found {
+            Err(failure) => {
+                let message = redactor.redact(&failure.message()).into_owned();
+                if matches!(failure, PageFailure::Transport(_)) {
                     // A broken connection is not reused: the next action starts over.
                     session.page = None;
                     session.browser = None;
                 }
                 self.update(|s| {
-                    s.phase = if not_found {
-                        BrowserPhase::ChromeNotFound
-                    } else {
-                        BrowserPhase::Failed(message.clone())
-                    };
+                    match &failure {
+                        PageFailure::NotFound(_) => s.phase = BrowserPhase::ChromeNotFound,
+                        PageFailure::Transport(_) => {
+                            s.phase = BrowserPhase::Failed(message.clone())
+                        }
+                        PageFailure::Page(_) => s.phase = BrowserPhase::Ready,
+                        PageFailure::LeftPolicy { url, .. } => {
+                            // Nothing of a page outside the allowed origins is kept or shown.
+                            s.phase = BrowserPhase::Ready;
+                            s.url = Some(xctx_http::mask_url(url, redactor));
+                            s.screenshot = None;
+                            s.screenshot_generation += 1;
+                            s.console.clear();
+                            s.network_errors.clear();
+                        }
+                    }
                     s.error = Some(message.clone());
                 });
                 Err(message)
@@ -464,6 +544,39 @@ impl BrowserHandle {
             let _ = browser.close();
         }
         self.update(|s| s.phase = BrowserPhase::Idle);
+    }
+}
+
+/// Why a page action failed, which decides whether the browser is kept.
+#[derive(Debug)]
+enum PageFailure {
+    /// No Chrome was found.
+    NotFound(String),
+    /// The DevTools connection broke, or Chrome could not start: reset the browser.
+    Transport(String),
+    /// The page failed (navigation, timeout, a refused URL): keep Chrome and the page.
+    Page(String),
+    /// The page is on `url`, which the policy does not allow: keep Chrome, show nothing of the page.
+    LeftPolicy {
+        /// Where the page is.
+        url: String,
+        /// The policy's refusal.
+        why: String,
+    },
+}
+
+impl PageFailure {
+    fn message(&self) -> String {
+        match self {
+            PageFailure::NotFound(m) | PageFailure::Transport(m) | PageFailure::Page(m) => {
+                m.clone()
+            }
+            PageFailure::LeftPolicy { why, .. } => {
+                format!(
+                    "the page left the allowed origins ({why}); its screenshot and console are not shown"
+                )
+            }
+        }
     }
 }
 
@@ -581,6 +694,50 @@ action = "fail"
         tail.stop();
         let lines: Vec<String> = buffer.snapshot().into_iter().map(|l| l.text).collect();
         assert_eq!(lines, ["first", "second", "third"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_without_a_newline_is_cut_and_the_rest_dropped() {
+        let mut long = vec![b'x'; MAX_LINE_BYTES * 5];
+        long.extend_from_slice(b"\nnext\nlast");
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        read_lines(long.as_slice(), |l| lines.push(l.to_vec()));
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES);
+        assert_eq!(lines[1], b"next");
+        assert_eq!(lines[2], b"last");
+        // A stream that never sends a newline keeps one capped line and nothing else.
+        let endless = std::io::repeat(b'y').take(MAX_LINE_BYTES as u64 * 64);
+        let mut count = 0;
+        let mut longest = 0;
+        read_lines(endless, |l| {
+            count += 1;
+            longest = longest.max(l.len());
+        });
+        assert_eq!((count, longest), (1, MAX_LINE_BYTES));
+    }
+
+    #[test]
+    fn a_tailed_command_does_not_inherit_xctxs_environment() -> TestResult {
+        let Ok(inherited) = std::env::var("CARGO_MANIFEST_DIR") else {
+            eprintln!("skipping: CARGO_MANIFEST_DIR is not set");
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let (target, _events) = target(Arc::new(AtomicBool::new(false)))?;
+        let buffer = LogBuffer::new(10);
+        let env: BTreeMap<String, String> = [("PATH", "/usr/bin:/bin"), ("PORT", "4011")]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .into();
+        let argv: Vec<String> = ["/bin/sh", "-c", "echo \"[$CARGO_MANIFEST_DIR] $PORT\""]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let tail = LogTail::command(&argv, dir.path(), &env, buffer.clone(), target)?;
+        assert!(wait_for(|| matches!(tail.status(), TailStatus::Exited(_))));
+        let lines: Vec<String> = buffer.snapshot().into_iter().map(|l| l.text).collect();
+        assert_eq!(lines, ["[] 4011"], "{inherited}");
         Ok(())
     }
 

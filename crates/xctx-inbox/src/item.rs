@@ -111,6 +111,14 @@ pub enum PluginGateKind {
         tool: String,
         /// The call's arguments as the user should see them, already masked by whoever posted the gate.
         args: String,
+        /// The plugin pane the call goes through (its layout id), so the call runs against the same mount after a
+        /// restart. Absent in gates posted before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// What the call reaches, masked: the pane's database or base URL. Absent when the pane has none, and
+        /// in gates posted before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     /// Mount a plugin that needs approval to mount, for example a connector with write tools.
     Mount {
@@ -121,6 +129,10 @@ pub enum PluginGateKind {
     TrustRepoPlugin {
         /// The repo the plugin lives in.
         repo: String,
+        /// The SHA-256 (hex) of the exact `plugin.toml` bytes the user is asked about. Approving trusts only that
+        /// manifest; empty in gates posted before it was recorded, which cannot be approved.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hash: String,
     },
 }
 
@@ -364,11 +376,14 @@ impl InboxItem {
                 format!("Fork {} {attempts} of {} in {}", a.count, a.agent, a.space)
             }
             ItemBody::PluginGate(g) => match &g.kind {
-                PluginGateKind::WriteCall { tool, .. } => {
-                    format!("Run {tool} ({}) in {}", g.plugin, g.space)
-                }
+                PluginGateKind::WriteCall { tool, target, .. } => match target {
+                    Some(target) if !target.trim().is_empty() => {
+                        format!("Run {tool} ({}) on {target} in {}", g.plugin, g.space)
+                    }
+                    _ => format!("Run {tool} ({}) in {}", g.plugin, g.space),
+                },
                 PluginGateKind::Mount { .. } => format!("Mount {} in {}", g.plugin, g.space),
-                PluginGateKind::TrustRepoPlugin { repo } => {
+                PluginGateKind::TrustRepoPlugin { repo, .. } => {
                     format!("Trust {repo}'s plugin {} in {}", g.plugin, g.space)
                 }
             },
@@ -424,9 +439,22 @@ impl InboxItem {
                     lines.push(r.clone());
                 }
                 match &g.kind {
-                    PluginGateKind::WriteCall { tool, args } => {
+                    PluginGateKind::WriteCall {
+                        tool,
+                        args,
+                        pane,
+                        target,
+                    } => {
                         if !args.trim().is_empty() {
                             lines.push(format!("Arguments: {args}"));
+                        }
+                        match (target, pane) {
+                            (Some(target), Some(pane)) => {
+                                lines.push(format!("Target: {target} (pane {pane})"))
+                            }
+                            (Some(target), None) => lines.push(format!("Target: {target}")),
+                            (None, Some(pane)) => lines.push(format!("Pane: {pane}")),
+                            (None, None) => {}
                         }
                         lines.push(format!(
                             "{tool} writes; it runs once, in this space's environment, only if you approve."
@@ -439,10 +467,21 @@ impl InboxItem {
                                 .to_owned(),
                         );
                     }
-                    PluginGateKind::TrustRepoPlugin { repo } => {
+                    PluginGateKind::TrustRepoPlugin { repo, hash } => {
                         lines.push(format!(
                             "The plugin comes from {repo}'s .xctx/plugins/ and runs its own commands."
                         ));
+                        if hash.is_empty() {
+                            lines.push(
+                                "This request does not record which manifest it is about: reject it and mount the plugin again."
+                                    .to_owned(),
+                            );
+                        } else {
+                            lines.push(format!(
+                                "Trust covers this plugin.toml (SHA-256 {}…) only, not the scripts or programs it runs: review those too. An edited manifest asks again.",
+                                hash.chars().take(12).collect::<String>()
+                            ));
+                        }
                         lines.push(
                             "Approving trusts it for this repo, the way mise trust does."
                                 .to_owned(),

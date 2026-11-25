@@ -442,7 +442,9 @@ fn check_plugin_gate(id: &ItemId, gate: &PluginGate) -> Result<()> {
     }
     match &gate.kind {
         PluginGateKind::WriteCall { tool, .. } if tool.trim().is_empty() => incomplete("no tool"),
-        PluginGateKind::TrustRepoPlugin { repo } if repo.trim().is_empty() => incomplete("no repo"),
+        PluginGateKind::TrustRepoPlugin { repo, .. } if repo.trim().is_empty() => {
+            incomplete("no repo")
+        }
         _ => Ok(()),
     }
 }

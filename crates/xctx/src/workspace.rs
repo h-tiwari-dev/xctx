@@ -278,7 +278,12 @@ impl Workspace {
             plan_repo_input,
             env_prompt: None,
             parent: ParentAgent::default(),
-            plugins: PluginHost::new(data_dir, user_plugin_dir()),
+            plugins: {
+                let mut host = PluginHost::new(data_dir, user_plugin_dir());
+                // Screenshots go where the rest of the app keeps a space's scratch files.
+                host.set_scratch_data_dir(std::env::var_os(xctx_core::store::DATA_DIR_ENV));
+                host
+            },
             runners: load_runners(user_runner_dir().as_deref()),
             plugin_ticker: false,
             plugin_panes: Default::default(),

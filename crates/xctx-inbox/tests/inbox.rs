@@ -528,6 +528,8 @@ fn a_plugin_gate_is_a_gate_that_must_say_what_it_allows() -> TestResult {
             PluginGateKind::WriteCall {
                 tool: "sql.write".into(),
                 args: "query=UPDATE users SET plan = 'pro' WHERE id = 7".into(),
+                pane: None,
+                target: None,
             },
         ),
         space(),
@@ -578,7 +580,10 @@ fn a_plugin_gate_is_a_gate_that_must_say_what_it_allows() -> TestResult {
     let trust = inbox.post(
         gate(
             "fixtures",
-            PluginGateKind::TrustRepoPlugin { repo: "api".into() },
+            PluginGateKind::TrustRepoPlugin {
+                repo: "api".into(),
+                hash: String::new(),
+            },
         ),
         space(),
         Source::App,
@@ -596,11 +601,16 @@ fn a_plugin_gate_is_a_gate_that_must_say_what_it_allows() -> TestResult {
             PluginGateKind::WriteCall {
                 tool: "".into(),
                 args: "".into(),
+                pane: None,
+                target: None,
             },
         ),
         gate(
             "fixtures",
-            PluginGateKind::TrustRepoPlugin { repo: "".into() },
+            PluginGateKind::TrustRepoPlugin {
+                repo: "".into(),
+                hash: String::new(),
+            },
         ),
     ] {
         let id = inbox.post(bad, space(), Source::Agent)?;
@@ -621,5 +631,54 @@ fn a_plugin_gate_is_a_gate_that_must_say_what_it_allows() -> TestResult {
     assert_eq!(first["plugin"], "sql");
     assert_eq!(first["request"]["type"], "write_call");
     assert_eq!(first["request"]["tool"], "sql.write");
+    Ok(())
+}
+
+#[test]
+fn plugin_gates_from_before_the_pane_target_and_hash_still_load() -> TestResult {
+    use xctx_inbox::{PluginGate, PluginGateKind};
+    let old_write: PluginGateKind =
+        serde_json::from_str(r#"{"type":"write_call","tool":"sql.write","args":"{}"}"#)?;
+    assert_eq!(
+        old_write,
+        PluginGateKind::WriteCall {
+            tool: "sql.write".into(),
+            args: "{}".into(),
+            pane: None,
+            target: None,
+        }
+    );
+    let old_trust: PluginGateKind =
+        serde_json::from_str(r#"{"type":"trust_repo_plugin","repo":"api"}"#)?;
+    assert_eq!(
+        old_trust,
+        PluginGateKind::TrustRepoPlugin {
+            repo: "api".into(),
+            hash: String::new(),
+        }
+    );
+    let new = PluginGateKind::WriteCall {
+        tool: "sql.write".into(),
+        args: "{}".into(),
+        pane: Some(4),
+        target: Some("db/dev.sqlite3".into()),
+    };
+    let back: PluginGateKind = serde_json::from_str(&serde_json::to_string(&new)?)?;
+    assert_eq!(back, new);
+    let item = ItemBody::PluginGate(PluginGate {
+        space: SpaceId::new("s"),
+        plugin: "database".into(),
+        kind: new,
+        rationale: None,
+    });
+    let dir = tempfile::tempdir()?;
+    let mut inbox = Inbox::open(dir.path())?;
+    let id = inbox.post(item, Some(SpaceId::new("s")), Source::Agent)?;
+    let posted = inbox.get(&id).ok_or("posted")?;
+    assert_eq!(
+        posted.title(),
+        "Run sql.write (database) on db/dev.sqlite3 in s"
+    );
+    assert!(posted.detail().contains("Target: db/dev.sqlite3 (pane 4)"));
     Ok(())
 }

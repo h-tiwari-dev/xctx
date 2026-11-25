@@ -620,6 +620,17 @@ pub fn pane_launch_for_runner(
     }
 }
 
+/// What is typed into a runner that reads its task on standard input: the task with every control character
+/// (newlines, tabs, escape sequences) turned into a space, so an agent's task cannot type keys or commands into the
+/// runner, then one Enter.
+pub fn typed_task(task: &str) -> String {
+    let flat: String = task
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    format!("{}\r", flat.trim())
+}
+
 /// The config that starts terminal plugin pane `role` in `space`, running `argv` (the plugin's command, no shell)
 /// in the repo's worktree with the space's environment, as [`pane_launch`] sets it up for a shell; `None` runs
 /// the login shell. A program that cannot be found falls back to the login shell with a notice.
@@ -1364,6 +1375,11 @@ mod tests {
         );
         assert!(launch.config.args.is_empty());
         assert_eq!(launch.stdin.as_deref(), Some("fix it"));
+        assert_eq!(typed_task("fix it"), "fix it\r");
+        assert_eq!(
+            typed_task("fix\nit\r\x1b[201~; rm -rf /\x03\t"),
+            "fix it  [201~; rm -rf /\r",
+        );
         assert_eq!(env(&launch, "READER_MODE"), Some("agent"));
         Ok(())
     }
