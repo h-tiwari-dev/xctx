@@ -574,7 +574,8 @@ impl Workspace {
         let shape = self.active_tab().map(|tab| layout_shape(tab.space.shape));
         let graph_open = self.active_tab().is_some_and(|tab| tab.graph_open);
         let entity = cx.entity().downgrade();
-        let (home, select, reshape, ship, discard, graph, plugins, add_repo) = (
+        let (home, select, reshape, ship, discard, graph, plugins, add_repo, add_agent) = (
+            entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
@@ -607,6 +608,13 @@ impl Workspace {
                 let _ = add_repo.update(cx, |this, cx| {
                     if this.dialog.is_none() {
                         this.open_add_repo_dialog(window, cx);
+                    }
+                });
+            })
+            .on_add_agent(move |window, cx| {
+                let _ = add_agent.update(cx, |this, cx| {
+                    if this.dialog.is_none() {
+                        this.open_add_agent_dialog(window, cx);
                     }
                 });
             })

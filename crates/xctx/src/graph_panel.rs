@@ -274,7 +274,12 @@ impl Workspace {
     /// Add a helper of `kind` to the graph and start its pane (see [`Workspace::start_agent_pane`]): a new session
     /// given its brief, in the space's first repo, with xctx's browser mounted for a Browser helper. When the
     /// pane cannot be split, the helper is taken out of the graph again so no lane is left without a pane.
-    fn add_helper_lane(&mut self, kind: HelperKind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_helper_lane(
+        &mut self,
+        kind: HelperKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(added) = self.panel_change(cx, |state, space| {
             let lane = add_role(state, &space.id, AgentRole::Helper { kind }, None)?;
             Ok((space.id.clone(), lane))

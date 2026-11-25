@@ -11,6 +11,7 @@ use gpui::{
 use xctx_core::{ShipOptions, SpaceId, Store, git};
 use xctx_ui::{Button, ButtonVariant, PromptEvent, PromptInput, Theme};
 
+use crate::add_agent::AddAgentState;
 use crate::add_repo::AddRepoState;
 use crate::attempt_ui::{ForkState, ReviewState};
 use crate::attempts::delete_pre_adopt_refs;
@@ -50,6 +51,8 @@ pub(crate) enum Dialog {
     Plugins(PluginsState),
     /// Add a repo to the space (see `add_repo.rs`).
     AddRepo(AddRepoState),
+    /// Start an agent whose pane was closed, or add a helper (see `add_agent.rs`).
+    AddAgent(AddAgentState),
 }
 
 impl Dialog {
@@ -62,6 +65,7 @@ impl Dialog {
             Dialog::Review(review) => &review.space,
             Dialog::Plugins(plugins) => &plugins.space,
             Dialog::AddRepo(add) => &add.space,
+            Dialog::AddAgent(add) => &add.space,
         }
     }
 
@@ -114,7 +118,8 @@ impl Dialog {
             | Dialog::Fork(_)
             | Dialog::Review(_)
             | Dialog::Plugins(_)
-            | Dialog::AddRepo(_) => {}
+            | Dialog::AddRepo(_)
+            | Dialog::AddAgent(_) => {}
         }
     }
 }
@@ -521,6 +526,11 @@ impl Workspace {
                 .track_focus(&self.dialog_focus)
                 .child(self.render_add_repo(add, cx))
                 .into_any_element(),
+            Dialog::AddAgent(add) => div()
+                .key_context(DIALOG_CONTEXT)
+                .track_focus(&self.dialog_focus)
+                .child(self.render_add_agent(add, cx))
+                .into_any_element(),
             _ => self
                 .render_confirmation(dialog, &theme, cx)
                 .key_context(DIALOG_CONTEXT)
@@ -688,9 +698,11 @@ impl Workspace {
                 )
             }
             // Drawn by `render_dialog` itself.
-            Dialog::Fork(_) | Dialog::Review(_) | Dialog::Plugins(_) | Dialog::AddRepo(_) => {
-                panel(&theme)
-            }
+            Dialog::Fork(_)
+            | Dialog::Review(_)
+            | Dialog::Plugins(_)
+            | Dialog::AddRepo(_)
+            | Dialog::AddAgent(_) => panel(&theme),
         }
     }
 }

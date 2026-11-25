@@ -1,6 +1,7 @@
 //! xctx: a native macOS agent multiplexer. One window holds Home and a tab per living space; each space runs its
 //! agents and shells in its own worktrees.
 
+mod add_agent;
 mod add_repo;
 mod agent_brief;
 mod agent_session;
