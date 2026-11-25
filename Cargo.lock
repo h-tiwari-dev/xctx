@@ -6529,6 +6529,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "xctx-plugin-view"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "xctx-ui",
+]
+
+[[package]]
 name = "xctx-term"
 version = "0.1.0"
 dependencies = [
