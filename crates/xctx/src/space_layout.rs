@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use xctx_core::{Space, SpaceShape};
 use xctx_layout::{
-    FocusDirection, LayoutError, PaneId, PaneKind, PaneRole, PaneTree, Reshape, RolePane, Shape,
-    SplitAxis, SplitId, reshape,
+    FocusDirection, LayoutError, PLUGIN_COLUMN_BASE_SHARE, PaneId, PaneKind, PaneRole, PaneTree,
+    Reshape, RolePane, Shape, SplitAxis, SplitId, reshape,
 };
 
 /// The share the existing pane keeps when it is split.
@@ -207,19 +207,27 @@ impl SpaceLayout {
         Ok(RolePane { id, role })
     }
 
-    /// Split `target` along `axis` with a new pane of `role` (such as a plugin's, see
-    /// [`PaneRole::for_plugin`]), which takes the focus. Returns the new pane, which needs starting.
-    pub fn split_role(
-        &mut self,
-        target: PaneId,
-        axis: SplitAxis,
-        role: PaneRole,
-    ) -> Result<RolePane, LayoutError> {
-        if self.role(target).is_none() {
-            return Err(LayoutError::UnknownPane(target));
-        }
+    /// Add a plugin pane of `role` (see [`PaneRole::for_plugin`]) where [`reshape`] would put it, so every pane
+    /// stays usable however many plugins are mounted: when the space has plugin panes already, the last of them
+    /// (in leaf order) is split to stack the new one below it, in the plugin column; when it has none, the whole
+    /// layout is split so a new plugin column on the right takes the share [`reshape`] gives it. The new pane
+    /// takes the focus. Returns it, which needs starting.
+    pub fn add_plugin_pane(&mut self, role: PaneRole) -> Result<RolePane, LayoutError> {
+        let last_plugin = self
+            .panes()
+            .into_iter()
+            .rev()
+            .find(|p| p.role.kind == PaneKind::Plugin)
+            .map(|p| p.id);
         let id = PaneId(self.next_pane_id);
-        self.tree.split(target, axis, id, SPLIT_RATIO)?;
+        match last_plugin {
+            Some(last) => self
+                .tree
+                .split(last, SplitAxis::Vertical, id, SPLIT_RATIO)?,
+            None => self
+                .tree
+                .split_root(SplitAxis::Horizontal, id, PLUGIN_COLUMN_BASE_SHARE)?,
+        };
         self.take_pane_id();
         self.roles.insert(id, role.clone());
         Ok(RolePane { id, role })
@@ -349,6 +357,93 @@ mod tests {
         assert_eq!(layout.close(pane.id)?, focused);
         assert_eq!(layout.role(pane.id), None);
         assert_eq!(layout.tree().panes().len(), 4);
+        Ok(())
+    }
+
+    /// The rectangle of `pane` in `layout` laid out in a 1200 x 800 window.
+    fn rect_of(layout: &SpaceLayout, pane: PaneId) -> Option<xctx_layout::Rect> {
+        let bounds = xctx_layout::Rect::new(0.0, 0.0, 1200.0, 800.0);
+        layout
+            .tree()
+            .layout(bounds, 0.0)
+            .panes
+            .into_iter()
+            .find(|p| p.id == pane)
+            .map(|p| p.rect)
+    }
+
+    #[test]
+    fn plugin_panes_go_into_a_column_on_the_right() -> Result<(), LayoutError> {
+        let mut layout = launched()?;
+        let before: Vec<PaneId> = layout.tree().panes();
+        let first = layout.add_plugin_pane(PaneRole::for_plugin("http", "api"))?;
+        assert_eq!(first.id, PaneId(5));
+        assert_eq!(layout.focused(), first.id);
+        // The first plugin splits the whole layout: a column taking about a third of the width.
+        let rect = rect_of(&layout, first.id).ok_or(LayoutError::NoPanes)?;
+        assert!((rect.x - 1200.0 * PLUGIN_COLUMN_BASE_SHARE).abs() < 1.0);
+        assert_eq!((rect.y, rect.height), (0.0, 800.0));
+        // The rest keep their places, only narrower.
+        let mut panes = before.clone();
+        panes.push(first.id);
+        assert_eq!(layout.tree().panes(), panes);
+
+        // Later plugins stack in that column, whatever pane is focused.
+        layout.focus(before[0])?;
+        let second = layout.add_plugin_pane(PaneRole::for_plugin("database", "api"))?;
+        let third = layout.add_plugin_pane(PaneRole::for_plugin("browser", "web"))?;
+        assert_eq!((second.id, third.id), (PaneId(6), PaneId(7)));
+        assert_eq!(layout.focused(), third.id);
+        assert_eq!(layout.next_pane_id(), 8);
+        for pane in [first.id, second.id, third.id] {
+            let rect = rect_of(&layout, pane).ok_or(LayoutError::UnknownPane(pane))?;
+            assert!((rect.width - 1200.0 * (1.0 - PLUGIN_COLUMN_BASE_SHARE)).abs() < 1.0);
+            assert!(rect.height >= 200.0, "{pane:?} is {rect:?}");
+        }
+        // No other pane got narrower than the column made it.
+        for pane in &before {
+            let rect = rect_of(&layout, *pane).ok_or(LayoutError::UnknownPane(*pane))?;
+            assert!(rect.width >= 300.0, "{pane:?} is {rect:?}");
+        }
+
+        // Reshaping afterwards keeps them in the same column, in the same order.
+        let plugins = |layout: &SpaceLayout| -> Vec<PaneId> {
+            layout
+                .panes()
+                .into_iter()
+                .filter(|p| p.role.kind == PaneKind::Plugin)
+                .map(|p| p.id)
+                .collect()
+        };
+        let mounted = plugins(&layout);
+        layout.reshape(Shape::Dev, &repos())?;
+        assert_eq!(plugins(&layout), mounted);
+        for pane in mounted {
+            let rect = rect_of(&layout, pane).ok_or(LayoutError::UnknownPane(pane))?;
+            assert!((rect.x - 1200.0 * PLUGIN_COLUMN_BASE_SHARE).abs() < 1.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_plugin_pane_saved_beside_another_pane_still_gets_the_next_one_below_it()
+    -> Result<(), LayoutError> {
+        // A layout saved before plugin panes went into a column: the plugin pane sits beside the first agent.
+        let mut layout = launched()?;
+        let agent = layout.agent_panes()[0];
+        let mut tree = layout.tree().clone();
+        tree.split(agent, SplitAxis::Horizontal, PaneId(5), SPLIT_RATIO)?;
+        let mut roles = layout.panes();
+        roles.push(RolePane {
+            id: PaneId(5),
+            role: PaneRole::for_plugin("logs", "api"),
+        });
+        layout = SpaceLayout::from_parts(tree, roles, 6).map_err(|_| LayoutError::NoPanes)?;
+        let next = layout.add_plugin_pane(PaneRole::for_plugin("http", "api"))?;
+        let old = rect_of(&layout, PaneId(5)).ok_or(LayoutError::UnknownPane(PaneId(5)))?;
+        let new = rect_of(&layout, next.id).ok_or(LayoutError::UnknownPane(next.id))?;
+        assert_eq!((new.x, new.width), (old.x, old.width));
+        assert!(new.y > old.y);
         Ok(())
     }
 

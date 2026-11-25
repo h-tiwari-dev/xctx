@@ -6,7 +6,7 @@
 //! [`mount_settings_for`]): a command or a log file for a logs pane, a command for a terminal, a database for
 //! a database pane, a base URL or a page for the API client or the browser.
 
-use gpui::{Context, Entity, ParentElement, Styled, Window, div, prelude::*, px};
+use gpui::{Context, Entity, Focusable, ParentElement, Styled, Window, div, prelude::*, px};
 use xctx_control::protocol::{PluginSource as ProtocolSource, PluginSummary};
 use xctx_core::{Redactor, Space, SpaceId};
 use xctx_plugin::{Registry, SqlEngine};
@@ -145,14 +145,25 @@ impl Workspace {
                 }
             },
         ));
+        // The keys go to the target, so what is typed before Mount is not lost; Esc there closes the menu (and
+        // the dialog's own Esc binding still applies, as the input sits inside the dialog's key context).
+        let focus = target.focus_handle(cx);
         self.dialog = Some(Dialog::Plugins(PluginsState {
             space: space.id.clone(),
             view,
             note: None,
             target,
         }));
-        self.dialog_focus.focus(window, cx);
+        focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// Give the keys back to the open menu's target, after a click on the menu or a mount moved them.
+    fn focus_plugins_target(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Dialog::Plugins(state)) = &self.dialog {
+            let focus = state.target.focus_handle(cx);
+            focus.focus(window, cx);
+        }
     }
 
     fn plugin_menu_for(&mut self, space: &Space) -> PluginMenuView {
@@ -206,6 +217,7 @@ impl Workspace {
             Err(e) => (Some(e.message), None),
         };
         self.refresh_plugins_menu(error, note);
+        self.focus_plugins_target(window, cx);
         cx.notify();
     }
 
@@ -220,6 +232,7 @@ impl Workspace {
                 Err(e) => (Some(e.message), None),
             };
         self.refresh_plugins_menu(error, note);
+        self.focus_plugins_target(window, cx);
         cx.notify();
     }
 
@@ -268,7 +281,7 @@ impl Workspace {
                     .text_size(Theme::TEXT_SM)
                     .text_color(theme.text_muted)
                     .child(format!(
-                        "Plugins in {}. A new plugin pane splits the focused pane; ⌘W on it unmounts it.",
+                        "Plugins in {}. A new plugin pane goes into the plugin column on the right; ⌘W on it unmounts it.",
                         state.space
                     )),
             )

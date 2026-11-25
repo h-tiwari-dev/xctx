@@ -45,7 +45,7 @@ See [`docs/m4.md`](m4.md).
 - **Outcome comparison & review sheet**: compare repros, tests, and diffs side by side, discard dead ends, or merge the
   winner.
 
-### Milestone 5 — Plugins & connectors as live panes + agent tools (next)
+### Milestone 5 — Plugins & connectors as live panes + agent tools (complete)
 See [`docs/m5.md`](m5.md).
 - **Plugin manifest contract**: every plugin provides a live GPUI pane, agent tools over the harness, and events that
   trigger or stop loops.

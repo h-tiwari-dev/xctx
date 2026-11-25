@@ -95,7 +95,7 @@ const DEV_AGENT_SHARE: f32 = 0.68;
 const DEBUG_AGENT_SHARE: f32 = 0.5;
 const REVIEW_GIT_SHARE: f32 = 0.65;
 /// The share of the width the per-repo groups keep when plugin panes sit in a column on the right.
-const PLUGIN_COLUMN_BASE_SHARE: f32 = 0.65;
+pub const PLUGIN_COLUMN_BASE_SHARE: f32 = 0.65;
 
 /// Lay a space out in `shape`.
 ///

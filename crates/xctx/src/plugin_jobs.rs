@@ -16,7 +16,7 @@ use xctx_core::{Space, SpaceId};
 use xctx_graph::{AgentNodeId, LoopDecision};
 use xctx_http::Request;
 use xctx_inbox::{ItemBody, ItemId, Level, Notice, PluginGate, PluginGateKind, Source};
-use xctx_layout::{PaneId, PaneKind, PaneRole, RolePane, SplitAxis};
+use xctx_layout::{PaneId, PaneKind, PaneRole, RolePane};
 use xctx_plugin::{
     CallPlan, Capability, Effect, Invocation, PaneSpec, RunnerError, RunnerManifest, check_scope,
 };
@@ -117,9 +117,9 @@ impl Workspace {
     // Mount and unmount
 
     /// Mount `plugin` into the open space `id`, working in `repo` (the focused pane's repo when `None`), with
-    /// `settings` chosen when mounting. Its pane is split from the focused pane, the layout and the mount are
-    /// saved, and what it runs is started. An untrusted repo plugin posts a trust gate to the Inbox instead, and
-    /// so does a connector with write tools when `from_agent` (an agent asked, through `plugin.mount`); either
+    /// `settings` chosen when mounting. Its pane goes into the plugin column on the right (see
+    /// [`crate::space_layout::SpaceLayout::add_plugin_pane`]), the layout and the mount are saved, and what it
+    /// runs is started. An untrusted repo plugin posts a trust gate to the Inbox instead, and so does a connector with write tools when `from_agent` (an agent asked, through `plugin.mount`); either
     /// mounts once the user approves it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn mount_plugin(
@@ -254,11 +254,7 @@ impl Workspace {
             .unwrap_or_default();
         let pane = tab
             .layout
-            .split_role(
-                focused,
-                SplitAxis::Horizontal,
-                PaneRole::for_plugin(plugin, repo.clone()),
-            )
+            .add_plugin_pane(PaneRole::for_plugin(plugin, repo.clone()))
             .map_err(|e| crate::space_tab::layout_error(id, e))?;
         if let Err(e) = self.plugins.add_mount(
             id,
