@@ -16,7 +16,9 @@ use xctx_layout::LayoutError;
 use xctx_layout::{FocusDirection, PaneId, PaneKind, PaneRole, RolePane, Shape, SplitAxis};
 use xctx_term::TerminalSession;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
-use xctx_ui::{PaneView, SharedTab, SplitView, Theme, pane_kind_label};
+use xctx_ui::{
+    Button, ButtonSize, ButtonVariant, PaneView, SharedTab, SplitView, Theme, pane_kind_label,
+};
 
 use crate::agent_session::AgentSession;
 use crate::lifecycle::reshape_space;
@@ -84,11 +86,15 @@ pub(crate) struct SpaceTab {
     /// The attempt whose agent the pane area shows instead of the split view (chosen on the attempt strip), if
     /// any. The space's own panes keep running meanwhile.
     pub(crate) shown_attempt: Option<u32>,
+    /// The web page of each of the space's repos (see [`crate::repo_links::repo_web_url`]), by repo name; read
+    /// once when the tab opens and again when a repo is added.
+    pub(crate) repo_links: HashMap<String, String>,
 }
 
 impl SpaceTab {
     /// A tab for `space` laid out as `layout`, with no terminals started yet and the graph panel closed.
     fn new(space: Space, layout: SpaceLayout) -> SpaceTab {
+        let repo_links = repo_links_of(&space);
         SpaceTab {
             space,
             layout,
@@ -97,8 +103,20 @@ impl SpaceTab {
             shared_tab: SharedTab::default(),
             attempt_terminals: HashMap::new(),
             shown_attempt: None,
+            repo_links,
         }
     }
+}
+
+/// The web page of each repo of `space` that has one, by repo name.
+pub(crate) fn repo_links_of(space: &Space) -> HashMap<String, String> {
+    space
+        .repos
+        .iter()
+        .filter_map(|repo| {
+            crate::repo_links::repo_web_url(&repo.repo).map(|url| (repo.name.clone(), url))
+        })
+        .collect()
 }
 
 impl SpaceTab {
@@ -231,7 +249,10 @@ impl Workspace {
         true
     }
 
-    /// Open a space that was just launched with its first layout, its agents given the task.
+    /// Open a space that was just launched with its first layout, its agents given the task, and set up what its
+    /// repos call for (see [`crate::dev_setup`]): the first web app's dev server in a terminal pane on the space's
+    /// `PORT` and xctx's browser on it, and the API client for the repos beside it. A mount that fails is shown
+    /// and the rest still mount.
     pub(crate) fn open_launched_space(
         &mut self,
         space: Space,
@@ -242,9 +263,36 @@ impl Workspace {
     ) {
         let id = space.id.clone();
         let start = AgentStart::Task(space.task.clone());
+        let worktrees: Vec<&std::path::Path> =
+            space.repos.iter().map(|r| r.worktree.as_path()).collect();
+        let setup = crate::dev_setup::space_setup(&worktrees);
+        let repos: Vec<String> = space.repos.iter().map(|r| r.name.clone()).collect();
         self.tabs.insert(id.clone(), SpaceTab::new(space, layout));
         for pane in &panes {
             self.spawn_pane(&id, pane, &start, window, cx);
+        }
+        for (repo, setup) in repos.into_iter().zip(setup) {
+            let mut mounts = Vec::new();
+            if let Some(app) = setup.web_app {
+                mounts.push((
+                    "terminal",
+                    crate::plugin_host::MountSettings {
+                        command: Some(app.command),
+                        ..Default::default()
+                    },
+                ));
+                mounts.push(("browser", Default::default()));
+            }
+            if setup.api_client {
+                mounts.push(("api-client", Default::default()));
+            }
+            for (plugin, settings) in mounts {
+                if let Err(e) =
+                    self.mount_plugin(&id, plugin, Some(repo.clone()), settings, false, window, cx)
+                {
+                    self.show_op_error(e, cx);
+                }
+            }
         }
     }
 
@@ -624,8 +672,8 @@ impl Workspace {
     }
 
     /// Split as [`Workspace::split_in`] does, binding the new pane to `agent` of the space's graph (when given)
-    /// before it starts, so it runs as that agent. A pane split for an agent (a new lane, such as a helper) always
-    /// starts fresh: `pi --continue` would resume the session of another agent in the worktree.
+    /// before it starts, so it runs as that agent. A pane split for an agent (a new lane, such as a helper) starts a
+    /// new session given its brief ([`crate::agent_brief::lane_brief`]), never resuming another agent's.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn split_for_agent(
         &mut self,
@@ -660,7 +708,17 @@ impl Workspace {
             .filter(|other| other.id != pane.id)
             .map(|other| other.role)
             .collect();
-        let start = split_agent_start(&tab.space, &pane.role, &others, agent.is_some());
+        let mut start = split_agent_start(&tab.space, &pane.role, &others, agent.is_some());
+        let space = tab.space.clone();
+        if let Some(agent) = &agent
+            && let Some(node) = self
+                .graphs
+                .load(&space)
+                .ok()
+                .and_then(|state| state.graph().node(agent).cloned())
+        {
+            start = AgentStart::Task(crate::agent_brief::lane_brief(&space, &node));
+        }
         if let Some(agent) = &agent
             && let Err(e) = self.bind_agent_pane(id, agent, pane.id)
         {
@@ -1024,7 +1082,11 @@ impl Workspace {
                         .into_any_element(),
                 };
                 let kind: PaneKind = pane.role.kind;
-                PaneView::new(pane.id, title, content).kind(kind)
+                let view = PaneView::new(pane.id, title, content).kind(kind);
+                match self.pane_accessories(tab, &pane, cx) {
+                    Some(accessories) => view.accessories(accessories),
+                    None => view,
+                }
             })
             .collect();
         let entity = cx.entity().downgrade();
@@ -1050,6 +1112,176 @@ impl Workspace {
             let _ = on_resize.update(cx, |this, cx| this.set_split_ratio(split, ratio, cx));
         })
         .into_any_element()
+    }
+
+    /// What a pane's header shows after its title, for an agent or shell pane working in one of the space's repos:
+    /// the repo's address on its git host (click copies it), its branch, Files (xctx's in-app file explorer of its
+    /// worktree) and Git (a lazygit pane in it); for an agent pane whose agent exited, Restart agent. Nothing here
+    /// leaves the app.
+    fn pane_accessories(
+        &self,
+        tab: &SpaceTab,
+        pane: &RolePane,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !matches!(pane.role.kind, PaneKind::Agent | PaneKind::Shell) {
+            return None;
+        }
+        let repo = tab.space.repos.iter().find(|r| r.name == pane.role.repo)?;
+        let theme = Theme::of(cx);
+        let id = pane.id.0 as usize;
+        let mut row = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(Theme::SPACE_0_5);
+        if let Some(url) = tab.repo_links.get(&repo.name).cloned() {
+            let shown = url.trim_start_matches("https://").to_owned();
+            row = row.child(
+                Button::new(("pane-remote", id), shown)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                        this.info(format!("copied {url}"), cx);
+                    })),
+            );
+        }
+        row = row.child(
+            div()
+                .px(Theme::SPACE_1)
+                .text_color(theme.text_subtle)
+                .child(repo.branch.clone()),
+        );
+        let exited = pane.role.kind == PaneKind::Agent
+            && tab.terminals.get(&pane.id).is_some_and(|terminal| {
+                matches!(
+                    terminal,
+                    PaneTerminal::Running {
+                        after_agent: true,
+                        ..
+                    }
+                ) || !terminal.is_alive(cx)
+            });
+        if exited {
+            let (space, restart) = (tab.space.id.clone(), pane.clone());
+            row = row.child(
+                Button::new(("pane-restart", id), "Restart agent")
+                    .variant(ButtonVariant::Primary)
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.restart_agent_in(&space, &restart, window, cx)
+                    })),
+            );
+        }
+        let (files_space, files_repo) = (tab.space.id.clone(), repo.name.clone());
+        let (git_space, git_repo, git_pane) = (tab.space.id.clone(), repo.name.clone(), pane.id);
+        Some(
+            row.child(
+                Button::new(("pane-files", id), "Files")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_repo_files(&files_space, &files_repo, window, cx)
+                    })),
+            )
+            .child(
+                Button::new(("pane-git", id), "Git")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_repo_git(&git_space, &git_repo, git_pane, window, cx)
+                    })),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Files: show xctx's file explorer of `repo`'s worktree in open space `id`, mounting the `files` plugin there
+    /// unless it is mounted already.
+    fn open_repo_files(
+        &mut self,
+        id: &SpaceId,
+        repo: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mounted = self
+            .mounted_plugins(id)
+            .into_iter()
+            .find(|m| m.plugin == "files" && m.repo == repo);
+        let result = match mounted {
+            Some(mount) => self.focus_pane_in(id, mount.pane, window, cx),
+            None => self
+                .mount_plugin(
+                    id,
+                    "files",
+                    Some(repo.to_owned()),
+                    crate::plugin_host::MountSettings::default(),
+                    false,
+                    window,
+                    cx,
+                )
+                .map(|_| ()),
+        };
+        if let Err(e) = result {
+            self.show_op_error(e, cx);
+        }
+    }
+
+    /// Git: focus the lazygit pane of `repo` in open space `id`, or split one beside `beside`.
+    fn open_repo_git(
+        &mut self,
+        id: &SpaceId,
+        repo: &str,
+        beside: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.tabs.get(id).and_then(|tab| {
+            tab.layout
+                .panes()
+                .into_iter()
+                .find(|p| p.role.kind == PaneKind::Git && p.role.repo == repo)
+                .map(|p| p.id)
+        });
+        let result = match existing {
+            Some(pane) => self.focus_pane_in(id, pane, window, cx),
+            None => self
+                .split_in(
+                    id,
+                    Some(beside),
+                    SplitAxis::Vertical,
+                    PaneKind::Git,
+                    Some(repo.to_owned()),
+                    window,
+                    cx,
+                )
+                .map(|_| ()),
+        };
+        if let Err(e) = result {
+            self.show_op_error(e, cx);
+        }
+    }
+
+    /// Start the agent of agent pane `pane` of open space `id` again (it exited, and its pane may run the shell
+    /// opened after it): the pane's terminal is replaced by the agent resuming its session.
+    pub(crate) fn restart_agent_in(
+        &mut self,
+        id: &SpaceId,
+        pane: &RolePane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(id) else {
+            return;
+        };
+        tab.terminals.remove(&pane.id);
+        self.spawn_pane(id, pane, &AgentStart::Continue, window, cx);
+        if self.may_focus_pane_of(id) {
+            self.focus_active_pane(window, cx);
+        }
+        cx.notify();
     }
 }
 

@@ -14,15 +14,20 @@ use crate::components::{Badge, Button, ButtonSize, ButtonVariant};
 use crate::theme::{Theme, Tone};
 
 /// Every helper kind, in the order the panel's add buttons show them.
-pub const HELPER_KINDS: [HelperKind; 3] =
-    [HelperKind::Tests, HelperKind::Reviewer, HelperKind::Probe];
+pub const HELPER_KINDS: [HelperKind; 4] = [
+    HelperKind::Tests,
+    HelperKind::Reviewer,
+    HelperKind::Probe,
+    HelperKind::Browser,
+];
 
-/// The name of a helper kind as the panel shows it: `Tests`, `Reviewer` or `Probe`.
+/// The name of a helper kind as the panel shows it: `Tests`, `Reviewer`, `Probe` or `Browser`.
 pub fn helper_kind_label(kind: HelperKind) -> &'static str {
     match kind {
         HelperKind::Tests => "Tests",
         HelperKind::Reviewer => "Reviewer",
         HelperKind::Probe => "Probe",
+        HelperKind::Browser => "Browser",
     }
 }
 
@@ -32,6 +37,7 @@ pub fn helper_kind_name(kind: HelperKind) -> &'static str {
         HelperKind::Tests => "tests",
         HelperKind::Reviewer => "reviewer",
         HelperKind::Probe => "probe",
+        HelperKind::Browser => "browser",
     }
 }
 
@@ -72,7 +78,51 @@ pub fn can_resume(state: &AgentState) -> bool {
 }
 
 type NodeHandler = Rc<dyn Fn(&AgentNodeId, &mut Window, &mut App)>;
+
+/// What an agent's pane is doing, as the window sees its terminal. Agents report their graph state through
+/// `xctx-ctl`; runners that never do (omp, claude) would otherwise stay IDLE whatever they do, so a card whose graph
+/// state is still [`AgentState::Idle`] shows this instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneLive {
+    /// Its program runs.
+    Running,
+    /// Its program exited, with its exit code when it had one.
+    Exited(Option<i32>),
+    /// It has no pane: Start opens one.
+    NoPane,
+}
+
+impl PaneLive {
+    /// The badge text.
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneLive::Running => "LIVE",
+            PaneLive::Exited(_) => "EXITED",
+            PaneLive::NoPane => "NOT STARTED",
+        }
+    }
+
+    /// The badge and dot tone.
+    pub fn tone(self) -> Tone {
+        match self {
+            PaneLive::Running => Tone::Success,
+            PaneLive::Exited(_) => Tone::Warning,
+            PaneLive::NoPane => Tone::Neutral,
+        }
+    }
+}
+
+/// The badge an agent's card shows: its graph state, unless that is still [`AgentState::Idle`] (nothing was
+/// reported) and the window knows what its pane does.
+pub fn card_badge(state: &AgentState, live: Option<PaneLive>) -> (&'static str, Tone) {
+    match (state, live) {
+        (AgentState::Idle, Some(live)) => (live.label(), live.tone()),
+        _ => (agent_state_label(state), agent_state_tone(state)),
+    }
+}
+
 type HelperHandler = Rc<dyn Fn(HelperKind, &mut Window, &mut App)>;
+type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// The handlers shared by every card.
 #[derive(Clone, Default)]
@@ -80,24 +130,29 @@ struct CardHandlers {
     on_pause: Option<NodeHandler>,
     on_resume: Option<NodeHandler>,
     on_talk: Option<NodeHandler>,
+    on_start: Option<NodeHandler>,
     on_remove: Option<NodeHandler>,
     on_fork: Option<NodeHandler>,
     /// Writers whose "Fork…" is hidden (their runner cannot fork sessions).
     no_fork: HashSet<AgentNodeId>,
+    /// What each agent's pane does, by agent.
+    live: HashMap<AgentNodeId, PaneLive>,
 }
 
 /// The Agent Graph panel: Orchestrator on top, Writers in the middle, Helpers and the add-helper buttons below.
 ///
-/// Test selectors: `graph-pause-<id>`, `graph-resume-<id>`, `graph-talk-<id>`, `graph-remove-<id>` on each
-/// card's buttons and `graph-add-<kind>` ([`helper_kind_name`]) on the add buttons. Talk appears only for an
-/// agent bound to a pane, and Remove only for helpers: a writer belongs to one of the space's repos and the panel
-/// cannot add it back. `graph-fork-<id>` is the "Fork…" button on writers, shown with
+/// Test selectors: `graph-pause-<id>`, `graph-resume-<id>`, `graph-talk-<id>`, `graph-start-<id>`,
+/// `graph-remove-<id>` on each card's buttons, `graph-add-<kind>` ([`helper_kind_name`]) on the add-helper buttons
+/// and `graph-add-repo` on the writers' "+ Repo". Open (`graph-talk-`) appears only for an agent bound to a pane,
+/// Start only for one without, and Remove only for helpers: a writer belongs to one of the space's repos and the
+/// panel cannot add it back. `graph-fork-<id>` is the "Fork…" button on writers, shown with
 /// [`AgentGraphView::on_fork`], and `graph-note-<id>` a card's note ([`AgentGraphView::notes`]).
 #[derive(IntoElement)]
 pub struct AgentGraphView {
     graph: AgentGraph,
     handlers: CardHandlers,
     on_add_helper: Option<HelperHandler>,
+    on_add_repo: Option<Handler>,
     notes: HashMap<AgentNodeId, SharedString>,
 }
 
@@ -108,6 +163,7 @@ impl AgentGraphView {
             graph,
             handlers: CardHandlers::default(),
             on_add_helper: None,
+            on_add_repo: None,
             notes: HashMap::new(),
         }
     }
@@ -153,12 +209,34 @@ impl AgentGraphView {
         self
     }
 
-    /// Call `handler` with an agent's id when its Talk button is clicked, to focus the agent's pane.
+    /// What each agent's pane does; a card whose graph state is still IDLE shows it instead (see
+    /// [`card_badge`]).
+    pub fn live(mut self, live: HashMap<AgentNodeId, PaneLive>) -> Self {
+        self.handlers.live = live;
+        self
+    }
+
+    /// Call `handler` with an agent's id when its Open button is clicked, to focus the agent's pane.
     pub fn on_talk(
         mut self,
         handler: impl Fn(&AgentNodeId, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.handlers.on_talk = Some(Rc::new(handler));
+        self
+    }
+
+    /// Show Start on each agent with no pane and call `handler` with its id when it is clicked, to open one.
+    pub fn on_start(
+        mut self,
+        handler: impl Fn(&AgentNodeId, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.handlers.on_start = Some(Rc::new(handler));
+        self
+    }
+
+    /// Show "+ Repo" beside the writers and call `handler` when it is clicked, to add a repo to the space.
+    pub fn on_add_repo(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_add_repo = Some(Rc::new(handler));
         self
     }
 
@@ -216,7 +294,7 @@ fn agent_card(
     note: Option<&SharedString>,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    let tone = agent_state_tone(&node.state);
+    let (state_label, tone) = card_badge(&node.state, handlers.live.get(&node.id).copied());
     let role_badge = match &node.role {
         AgentRole::Orchestrator => Badge::new("ORCHESTRATOR").tone(Tone::Accent),
         AgentRole::Writer { repo } => Badge::new(repo.clone()).tone(Tone::Accent),
@@ -235,10 +313,11 @@ fn agent_card(
             .text_color(color)
             .child(reason)
     });
-    let turns = if node.turns_used == 1 {
-        "1 turn".to_owned()
-    } else {
-        format!("{} turns", node.turns_used)
+    // Turns are only counted by the loop; a card with none says nothing rather than "0 turns".
+    let turns = match node.turns_used {
+        0 => None,
+        1 => Some("1 turn".to_owned()),
+        n => Some(format!("{n} turns")),
     };
 
     let pause = can_pause(&node.state).then(|| {
@@ -262,10 +341,19 @@ fn agent_card(
     let talk = node.pane_id.is_some().then(|| {
         card_button(
             "talk",
-            "Talk",
+            "Open",
             node,
-            ButtonVariant::Ghost,
+            ButtonVariant::Secondary,
             handlers.on_talk.as_ref(),
+        )
+    });
+    let start = (node.pane_id.is_none() && handlers.on_start.is_some()).then(|| {
+        card_button(
+            "start",
+            "Start",
+            node,
+            ButtonVariant::Primary,
+            handlers.on_start.as_ref(),
         )
     });
     let fork = (node.role.is_writer()
@@ -335,7 +423,7 @@ fn agent_card(
                         .text_color(theme.text)
                         .child(node.label.clone()),
                 )
-                .child(Badge::new(agent_state_label(&node.state)).tone(tone)),
+                .child(Badge::new(state_label).tone(tone)),
         )
         .child(
             div()
@@ -343,12 +431,12 @@ fn agent_card(
                 .items_center()
                 .gap(Theme::SPACE_2)
                 .child(role_badge)
-                .child(
+                .children(turns.map(|turns| {
                     div()
                         .text_size(Theme::TEXT_XS)
                         .text_color(theme.text_subtle)
-                        .child(turns),
-                ),
+                        .child(turns)
+                })),
         )
         .children(reason)
         .children(note)
@@ -360,6 +448,7 @@ fn agent_card(
                 .pt(Theme::SPACE_0_5)
                 .children(pause)
                 .children(resume)
+                .children(start)
                 .children(talk)
                 .children(fork)
                 .child(div().flex_1())
@@ -446,6 +535,13 @@ impl RenderOnce for AgentGraphView {
             }
             button
         });
+        let add_repo = self.on_add_repo.clone().map(|handler| {
+            Button::new("graph-add-repo", "+ Repo")
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .selector("graph-add-repo")
+                .on_click(move |_, window, cx| handler(window, cx))
+        });
 
         let writers_body = if writer_row.is_empty() {
             empty_line("No writers yet. Each repo in the space gets one.", &theme)
@@ -453,12 +549,16 @@ impl RenderOnce for AgentGraphView {
             div()
                 .flex()
                 .flex_wrap()
-                .items_center()
+                // Cards differ in height (a note, a turn count); their tops line up.
+                .items_start()
                 .gap(Theme::SPACE_1)
                 .children(writer_row)
         };
         let helpers_body = if helpers.is_empty() {
-            empty_line("No helpers. Add one to test, review or probe.", &theme)
+            empty_line(
+                "No helpers. Add one to test, review, probe or check the app in the browser.",
+                &theme,
+            )
         } else {
             div()
                 .flex()
@@ -511,7 +611,9 @@ impl RenderOnce for AgentGraphView {
                                     .items_center()
                                     .gap(Theme::SPACE_2)
                                     .child(tier_heading("WRITERS", &theme))
-                                    .children(contract_badge),
+                                    .children(contract_badge)
+                                    .child(div().flex_1())
+                                    .children(add_repo),
                             )
                             .child(writers_body),
                     )
@@ -562,9 +664,26 @@ mod tests {
     #[test]
     fn helper_kinds_are_listed_once_with_labels() {
         let labels: Vec<_> = HELPER_KINDS.into_iter().map(helper_kind_label).collect();
-        assert_eq!(labels, ["Tests", "Reviewer", "Probe"]);
+        assert_eq!(labels, ["Tests", "Reviewer", "Probe", "Browser"]);
         let names: Vec<_> = HELPER_KINDS.into_iter().map(helper_kind_name).collect();
-        assert_eq!(names, ["tests", "reviewer", "probe"]);
+        assert_eq!(names, ["tests", "reviewer", "probe", "browser"]);
+    }
+
+    #[test]
+    fn an_unreported_agent_shows_its_pane_and_a_reported_one_its_state() {
+        assert_eq!(
+            card_badge(&AgentState::Idle, Some(PaneLive::Running)),
+            ("LIVE", Tone::Success)
+        );
+        assert_eq!(
+            card_badge(&AgentState::Idle, Some(PaneLive::NoPane)).0,
+            "NOT STARTED"
+        );
+        assert_eq!(card_badge(&AgentState::Idle, None).0, "IDLE");
+        assert_eq!(
+            card_badge(&AgentState::Paused, Some(PaneLive::Running)).0,
+            "PAUSED"
+        );
     }
 
     #[test]

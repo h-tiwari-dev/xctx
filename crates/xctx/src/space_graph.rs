@@ -284,6 +284,7 @@ pub fn helper_kind(kind: xctx_control::protocol::HelperKind) -> HelperKind {
         xctx_control::protocol::HelperKind::Tests => HelperKind::Tests,
         xctx_control::protocol::HelperKind::Reviewer => HelperKind::Reviewer,
         xctx_control::protocol::HelperKind::Probe => HelperKind::Probe,
+        xctx_control::protocol::HelperKind::Browser => HelperKind::Browser,
     }
 }
 
@@ -325,7 +326,7 @@ pub fn lane_role(space: &Space, params: &GraphAddLaneParams) -> Result<AgentRole
         LaneRole::Helper => {
             let kind = params.kind.ok_or_else(|| {
                 RpcError::invalid_params(
-                    "graph.add_lane: a helper needs kind=tests, reviewer or probe",
+                    "graph.add_lane: a helper needs kind=tests, reviewer, probe or browser",
                 )
             })?;
             if let Some(repo) = params.repo.as_deref().map(str::trim)

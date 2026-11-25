@@ -49,7 +49,8 @@ pub fn ratio_for_drag(divider: &DividerRect, x: f32, y: f32) -> f32 {
     ratio.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO)
 }
 
-/// What one pane of a [`SplitView`] shows: a header title, an optional role badge, and the content below.
+/// What one pane of a [`SplitView`] shows: a header title, an optional role badge, optional header accessories,
+/// and the content below.
 pub struct PaneView {
     /// The pane in the tree this content belongs to.
     pub id: PaneId,
@@ -57,6 +58,7 @@ pub struct PaneView {
     pub title: SharedString,
     /// The pane's role, shown as a badge before the title.
     pub kind: Option<PaneKind>,
+    accessories: Option<AnyElement>,
     content: AnyElement,
 }
 
@@ -67,6 +69,7 @@ impl PaneView {
             id,
             title: title.into(),
             kind: None,
+            accessories: None,
             content: content.into_any_element(),
         }
     }
@@ -74,6 +77,13 @@ impl PaneView {
     /// Show `kind` as the pane's role badge.
     pub fn kind(mut self, kind: PaneKind) -> Self {
         self.kind = Some(kind);
+        self
+    }
+
+    /// Draw `accessories` in the header between the title and the zoom and close buttons, such as the pane's
+    /// branch and links to its repo.
+    pub fn accessories(mut self, accessories: impl IntoElement) -> Self {
+        self.accessories = Some(accessories.into_any_element());
         self
     }
 }
@@ -161,9 +171,14 @@ impl SplitView {
     ) -> AnyElement {
         let id = pane.id;
         let focused = pane.focused;
-        let (title, kind, content) = match view {
-            Some(view) => (view.title, view.kind, view.content),
-            None => (SharedString::default(), None, div().into_any_element()),
+        let (title, kind, accessories, content) = match view {
+            Some(view) => (view.title, view.kind, view.accessories, view.content),
+            None => (
+                SharedString::default(),
+                None,
+                None,
+                div().into_any_element(),
+            ),
         };
         let zoom = self.on_zoom.clone().map(|on_zoom| {
             Button::new(("pane-zoom", id.0), if zoomed { "⤡" } else { "⤢" })
@@ -209,6 +224,7 @@ impl SplitView {
                     })
                     .child(title),
             )
+            .children(accessories)
             .children(zoom)
             .children(close);
         div()

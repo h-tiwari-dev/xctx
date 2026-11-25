@@ -1,4 +1,5 @@
-//! The Ship and Discard confirmations shown over a space, the ship summary, and the background jobs they run.
+//! The Ship and Discard confirmations shown over a space, the ship summary, the "+ Repo" dialog's slot, and the
+//! background jobs they run.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use gpui::{
 use xctx_core::{ShipOptions, SpaceId, Store, git};
 use xctx_ui::{Button, ButtonVariant, PromptEvent, PromptInput, Theme};
 
+use crate::add_repo::AddRepoState;
 use crate::attempt_ui::{ForkState, ReviewState};
 use crate::attempts::delete_pre_adopt_refs;
 use crate::keymap::DIALOG_CONTEXT;
@@ -46,6 +48,8 @@ pub(crate) enum Dialog {
     Review(ReviewState),
     /// The space's Plugins menu (see `plugin_menu_dialog.rs`).
     Plugins(PluginsState),
+    /// Add a repo to the space (see `add_repo.rs`).
+    AddRepo(AddRepoState),
 }
 
 impl Dialog {
@@ -57,6 +61,7 @@ impl Dialog {
             Dialog::Fork(fork) => &fork.space,
             Dialog::Review(review) => &review.space,
             Dialog::Plugins(plugins) => &plugins.space,
+            Dialog::AddRepo(add) => &add.space,
         }
     }
 
@@ -64,7 +69,9 @@ impl Dialog {
     pub(crate) fn is_running(&self) -> bool {
         matches!(
             self,
-            Dialog::Ship { running: true, .. } | Dialog::Discard { running: true, .. }
+            Dialog::Ship { running: true, .. }
+                | Dialog::Discard { running: true, .. }
+                | Dialog::AddRepo(AddRepoState { running: true, .. })
         )
     }
 
@@ -103,7 +110,11 @@ impl Dialog {
                     *dirty = dirty_repos;
                 }
             }
-            Dialog::Shipped { .. } | Dialog::Fork(_) | Dialog::Review(_) | Dialog::Plugins(_) => {}
+            Dialog::Shipped { .. }
+            | Dialog::Fork(_)
+            | Dialog::Review(_)
+            | Dialog::Plugins(_)
+            | Dialog::AddRepo(_) => {}
         }
     }
 }
@@ -507,6 +518,11 @@ impl Workspace {
                 .key_context(DIALOG_CONTEXT)
                 .track_focus(&self.dialog_focus)
                 .into_any_element(),
+            Dialog::AddRepo(add) => div()
+                .key_context(DIALOG_CONTEXT)
+                .track_focus(&self.dialog_focus)
+                .child(self.render_add_repo(add, cx))
+                .into_any_element(),
             _ => self
                 .render_confirmation(dialog, &theme, cx)
                 .key_context(DIALOG_CONTEXT)
@@ -674,12 +690,14 @@ impl Workspace {
                 )
             }
             // Drawn by `render_dialog` itself.
-            Dialog::Fork(_) | Dialog::Review(_) | Dialog::Plugins(_) => panel(&theme),
+            Dialog::Fork(_) | Dialog::Review(_) | Dialog::Plugins(_) | Dialog::AddRepo(_) => {
+                panel(&theme)
+            }
         }
     }
 }
 
-fn panel(theme: &Theme) -> gpui::Div {
+pub(crate) fn panel(theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -693,27 +711,27 @@ fn panel(theme: &Theme) -> gpui::Div {
         .shadow_lg()
 }
 
-fn heading(title: String) -> gpui::Div {
+pub(crate) fn heading(title: String) -> gpui::Div {
     div()
         .text_size(Theme::TEXT_LG)
         .font_weight(FontWeight::SEMIBOLD)
         .child(title)
 }
 
-fn text(message: String, theme: &Theme) -> gpui::Div {
+pub(crate) fn text(message: String, theme: &Theme) -> gpui::Div {
     div()
         .text_size(Theme::TEXT_SM)
         .text_color(theme.text_muted)
         .child(message)
 }
 
-fn error_text(message: String, theme: &Theme) -> gpui::Div {
+pub(crate) fn error_text(message: String, theme: &Theme) -> gpui::Div {
     div()
         .text_size(Theme::TEXT_SM)
         .text_color(theme.danger)
         .child(message)
 }
 
-fn actions() -> gpui::Div {
+pub(crate) fn actions() -> gpui::Div {
     div().flex().justify_end().gap(Theme::SPACE_2)
 }

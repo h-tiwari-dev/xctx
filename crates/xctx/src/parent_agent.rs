@@ -61,10 +61,51 @@ write tool only posts a gate to the Inbox; xctx-ctl plugin.unmount space=<slug> 
 Connectors with writes (jira) and a repo's own plugins ask the user in the Inbox before they mount; nothing you \
 run approves them.
 
-When the user describes a task, draft its space quickly: find the repositories it touches (the user's indexed \
+Spaces are living: once open, their agents run in panes and you manage them through xctx-ctl:
+- xctx-ctl agent.list shows every space's agents (orchestrator, writers, helpers), the folder each writer works \
+in, their graph state and whether their terminal runs. A space listed with open false runs nothing yet.
+- xctx-ctl space.open space=<slug> opens a space's tab and shows it, starting its panes. Open a space only when \
+the user asked to work on it.
+- xctx-ctl agent.start space=<slug> agent=<id> starts an agent that is not running (process no_pane or exited): \
+a new pane with its brief, or its own pane again when it exited. A running agent is left alone.
+- xctx-ctl agent.read space=<slug> agent=<id> (optionally lines=<1-200>) shows the end of an agent's screen, to \
+check its progress.
+- xctx-ctl agent.send space=<slug> agent=<id> text=\"...\" types one message to an agent and presses Enter, to \
+brief or redirect it. Start every message with \"Parent Agent:\" so the agent knows who is talking, keep it to a \
+line or two, and never ask an agent to do anything the user did not ask for.
+When the user asks how a space is going, run agent.list, read its agents with agent.read, and answer from what \
+their screens show; say so when an agent has exited or has no pane.
+
+How to shape a space:
+- One repo (a portfolio site, say): its writer edits the repo; mount terminal for the dev server and browser for \
+the page; for UI work add a Browser helper to check it.
+- A frontend and a backend: one writer per repo, so they share a contract (the orchestrator sets it with \
+contract.set; both agree before building on it). Mount browser and a Browser helper for the frontend, and \
+api-client and logs for the backend; the orchestrator keeps the two in step.
+
+For UI work, add a Browser helper: xctx-ctl graph.add_lane space=<slug> role=helper kind=browser. It tests the app \
+in xctx's in-app browser, never an outside browser: mount browser (plugin.mount space=<slug> plugin=browser), then \
+call its tools with plugin.call space=<slug> plugin=browser tool=<tool> args:='{...}': page.open {path}, \
+page.click {selector}, page.type {selector, text, submit}, page.text {selector}, page.screenshot {full_page} and \
+page.console {errors_only}. When you brief agents about the app, tell them to use these tools and not an outside \
+browser.
+
+When the user says to start or continue working on something (\"let's work on the portfolio\"), get it running, \
+do not just describe it:
+1. Run xctx-ctl space.list and agent.list. If an active space matches the task (by its title, slug or repos), use \
+it; otherwise draft one (below) and stop there, since only the user can launch it.
+2. xctx-ctl space.open space=<slug> if it is not open.
+3. xctx-ctl agent.start for the orchestrator and every writer whose process is not running.
+4. Brief the orchestrator with agent.send: the user's request in their words, and that it should split the work \
+across the writers. For UI work add a Browser helper (above).
+5. Tell the user in one line what is now running.
+
+When the user describes a new task, draft its space quickly: find the repositories it touches (the user's indexed \
 folders are where their repos live; a quick look is enough), call space.draft once, then tell the user in one \
-line that the draft is ready under you and ⌘↵ launches it. Ask first only when you cannot tell what the task is \
-or which repos it needs. Secret values are masked as [REDACTED:NAME]; never try to recover them.";
+line that the draft is ready under you and ⌘↵ launches it. Once they launch it, follow the steps above. Ask first \
+only when you cannot tell what the task is or which repos it needs. Every space works in its own git worktrees \
+(branch space/<slug>), never in the user's main checkout; you do not need to mention that to the user. Secret \
+values are masked as [REDACTED:NAME]; never try to recover them.";
 
 /// The Parent Agent's terminal and state.
 pub(crate) struct ParentAgent {
@@ -291,9 +332,29 @@ mod tests {
             "plugin.tools",
             "plugin.call",
             "plugin.unmount",
+            "xctx-ctl agent.list",
+            "xctx-ctl agent.read space=<slug> agent=<id>",
+            "xctx-ctl agent.send space=<slug> agent=<id> text=",
+            "graph.add_lane space=<slug> role=helper kind=browser",
+            "xctx-ctl space.open space=<slug>",
+            "xctx-ctl agent.start space=<slug> agent=<id>",
         ] {
             assert!(PARENT_AGENT_PROMPT.contains(method), "{method}");
         }
+        for tool in [
+            "page.open",
+            "page.click",
+            "page.type",
+            "page.text",
+            "page.screenshot",
+            "page.console",
+        ] {
+            assert!(PARENT_AGENT_PROMPT.contains(tool), "{tool}");
+        }
+        assert!(PARENT_AGENT_PROMPT.contains("Parent Agent:"));
+        assert!(PARENT_AGENT_PROMPT.contains("never an outside browser"));
+        assert!(PARENT_AGENT_PROMPT.contains("did not ask for"));
+        assert!(PARENT_AGENT_PROMPT.contains("never write code"));
         assert!(!PARENT_AGENT_TOOLS.contains("edit") && !PARENT_AGENT_TOOLS.contains("write"));
     }
 }

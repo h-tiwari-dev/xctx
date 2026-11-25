@@ -90,7 +90,14 @@ mod tests {
         assert!(builtin("logs").event("logs.error").is_some());
         assert_eq!(effect("database", "sql.read"), Some(Effect::Read));
         assert_eq!(effect("database", "sql.write"), Some(Effect::Write));
-        for tool in ["page.open", "page.screenshot", "page.console"] {
+        for tool in [
+            "page.open",
+            "page.screenshot",
+            "page.console",
+            "page.click",
+            "page.type",
+            "page.text",
+        ] {
             assert_eq!(effect("browser", tool), Some(Effect::Read), "{tool}");
         }
         assert_eq!(effect("jira", "issue.read"), Some(Effect::Read));

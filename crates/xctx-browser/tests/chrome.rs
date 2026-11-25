@@ -7,7 +7,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use xctx_browser::{
-    Browser, BrowserError, LaunchOptions, ScreenshotOptions, UrlPolicy, find_chrome,
+    Browser, BrowserError, LaunchOptions, MAX_PAGE_TEXT_CHARS, ScreenshotOptions, UrlPolicy,
+    find_chrome,
 };
 
 const PAGE: &str = r#"<!doctype html>
@@ -18,7 +19,19 @@ const PAGE: &str = r#"<!doctype html>
 <script>throw new Error("boom from the page");</script>
 </body></html>"#;
 
-/// Serves `PAGE` at `/`, a 204 for the favicon and a 404 for everything else, forever, on a thread.
+/// A page to click, type into and read. The `data-q` attribute holds `x"y\z</script>`.
+const FORM: &str = r#"<!doctype html>
+<html><head><title>xctx form</title></head>
+<body><h1 id="out">waiting</h1>
+<input id="q" data-q="x&quot;y\z&lt;/script&gt;">
+<button id="go" style="margin-top: 2000px"
+  onclick="document.getElementById('out').textContent = 'clicked ' + event.isTrusted">Go   now</button>
+<button id="hidden" style="display: none">hidden</button>
+<form action="/" method="get"><input id="s" name="s"></form>
+</body></html>"#;
+
+/// Serves `PAGE` at `/`, `FORM` at `/form`, a 204 for the favicon and a 404 for everything else, forever,
+/// on a thread.
 fn serve() -> std::io::Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -42,8 +55,10 @@ fn answer(mut stream: TcpStream) {
     }
     let head = String::from_utf8_lossy(&buf);
     let path = head.split_whitespace().nth(1).unwrap_or("/");
+    let path = path.split('?').next().unwrap_or(path);
     let (status, body) = match path {
         "/" => ("200 OK", PAGE),
+        "/form" => ("200 OK", FORM),
         "/favicon.ico" => ("204 No Content", ""),
         _ => ("404 Not Found", "not here"),
     };
@@ -299,4 +314,82 @@ fn a_chrome_that_is_not_there_fails_to_launch() {
         Browser::launch(options),
         Err(BrowserError::Spawn { .. })
     ));
+}
+
+#[test]
+fn a_page_is_clicked_typed_into_and_read() -> Result<(), Box<dyn std::error::Error>> {
+    let chrome = match find_chrome() {
+        Ok(chrome) => chrome,
+        Err(e) => {
+            eprintln!("skipping the Chrome test: {e}");
+            return Ok(());
+        }
+    };
+    let site = serve()?;
+    let other = serve()?;
+    let profile = tempfile::tempdir()?;
+    let mut options = LaunchOptions::new(chrome, profile.path().join("profile"));
+    options.headless = true;
+    options.window_size = Some((800, 600));
+    let mut browser = Browser::launch(options)?;
+    let mut policy = UrlPolicy::default();
+    policy.allow_local_port(site);
+    let mut page = browser.new_page(policy)?;
+    let form = format!("http://127.0.0.1:{site}/form");
+    page.open(&form)?;
+
+    // The button is below the fold: it is scrolled into view and gets a trusted click.
+    let clicked = page.click("#go")?;
+    assert_eq!(clicked.tag, "button");
+    assert_eq!(clicked.text, "Go now");
+    assert_eq!(clicked.url, form);
+    assert_eq!(page.text(Some("#out"))?.text, "clicked true");
+    assert!(matches!(
+        page.click("#nothing-here"),
+        Err(BrowserError::Element { .. })
+    ));
+    assert!(matches!(
+        page.click("#hidden"),
+        Err(BrowserError::Element { .. })
+    ));
+
+    // A selector and text with quotes, backslashes and `</script>` reach the page as they are.
+    let nasty_text = r#"he said "hi" \ </script><b>"#;
+    let typed = page.type_text(r#"input[data-q="x\"y\\z</script>"]"#, nasty_text, false)?;
+    assert_eq!(typed.value.as_deref(), Some(nasty_text));
+    let again = page.type_text("#q", "replaced", false)?;
+    assert_eq!(
+        again.value.as_deref(),
+        Some("replaced"),
+        "the field is cleared first"
+    );
+    assert!(matches!(
+        page.type_text("#out", "x", false),
+        Err(BrowserError::Element { .. })
+    ));
+
+    let body = page.text(None)?;
+    assert!(body.text.contains("clicked true") && body.text.contains("Go now"));
+    assert!(!body.truncated && body.chars <= MAX_PAGE_TEXT_CHARS);
+
+    // Enter submits the form; the navigation is waited for.
+    let submitted = page.type_text("#s", "query", true)?;
+    assert_eq!(submitted.url, format!("http://127.0.0.1:{site}/?s=query"));
+    assert_eq!(page.evaluate("document.title")?, "xctx test");
+
+    // A click that leaves the allowed origin is an error.
+    page.open(&form)?;
+    page.evaluate(&format!(
+        "const a = document.createElement('a'); a.id = 'away'; a.textContent = 'away'; \
+         a.href = 'http://127.0.0.1:{other}/'; document.body.prepend(a); 1"
+    ))?;
+    assert!(matches!(
+        page.click("#away"),
+        Err(BrowserError::HostNotAllowed { .. })
+    ));
+    assert!(matches!(
+        page.text(None),
+        Err(BrowserError::HostNotAllowed { .. })
+    ));
+    Ok(())
 }

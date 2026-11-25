@@ -4,11 +4,12 @@
 //! xctx-ctl [--socket <path>] [--compact] <method> [key=value | key:=<json>]...
 //! ```
 //!
-//! `key=value` passes a string, except that `pane`, `since_id`, `limit`, `max_iterations`, `max_turns` and
-//! `version` are numbers, `all`, `checks_passed` and `production` booleans, `repos` a comma-separated list, and
-//! `args` (of `plugin.call`) a JSON object. `key:=<json>` passes any JSON value, so `args:='{"path":"/health"}'`
+//! `key=value` passes a string, except that `pane`, `since_id`, `limit`, `lines`, `max_iterations`, `max_turns`
+//! and `version` are numbers, `all`, `checks_passed` and `production` booleans, `repos` a comma-separated list,
+//! and `args` (of `plugin.call`) a JSON object. `key:=<json>` passes any JSON value, so `args:='{"path":"/health"}'`
 //! works too. Methods about a space take `space` from `$XCTX_SPACE` when it is not
-//! given, so an agent in a space's pane can say `xctx-ctl pane.split axis=vertical`. Likewise `channel.post`
+//! given, so an agent in a space's pane can say `xctx-ctl pane.split axis=vertical`; `agent.list` does not, so
+//! without `space=` it lists every space. Likewise `channel.post`
 //! takes `from`, `contract.set` `author` and `contract.agree` `agent` from `$XCTX_AGENT_ID`, and `attempt.report`
 //! takes `attempt` from `$XCTX_ATTEMPT_ID` and `token` from `$XCTX_ATTEMPT_TOKEN`.
 
@@ -40,6 +41,7 @@ const INTEGER_KEYS: &[&str] = &[
     "pane",
     "since_id",
     "limit",
+    "lines",
     "max_iterations",
     "max_turns",
     "version",
@@ -85,11 +87,16 @@ impl From<RpcError> for UsageError {
     }
 }
 
-/// Whether `method` takes its `space` from `$XCTX_SPACE` when none is given.
+/// Whether `method` takes its `space` from `$XCTX_SPACE` when none is given. `agent.list` does not: without a
+/// space it lists every space's agents, which is what the Parent Agent (which has no space) wants.
 pub fn defaults_space(method: Method) -> bool {
     !matches!(
         method,
-        Method::Ping | Method::SpaceList | Method::SpaceDraft | Method::InboxList
+        Method::Ping
+            | Method::SpaceList
+            | Method::SpaceDraft
+            | Method::InboxList
+            | Method::AgentList
     )
 }
 
@@ -304,7 +311,7 @@ pub fn help() -> String {
         out,
         "\nenvironment:\n  \
          {CONTROL_SOCKET_ENV:<20} the socket (else control.sock in the xctx data directory)\n  \
-         {SPACE_ENV:<20} the default space=, set in every pane of a space\n  \
+         {SPACE_ENV:<20} the default space= (except agent.list's), set in every pane of a space\n  \
          {AGENT_ENV:<20} the default from= (channel.post), author= (contract.set) and agent= \
          (contract.agree), set in every agent's pane\n  \
          {ATTEMPT_ENV:<20} the default attempt= of attempt.report, set in every attempt's panes\n  \
@@ -314,7 +321,8 @@ pub fn help() -> String {
          Nothing here approves, launches, widens, forks, adopts or runs a plugin write: space.draft posts a \
          Plan Gate, space.widen_propose a space widening, attempt.propose an attempt proposal, and \
          plugin.mount (connectors with writes, untrusted repo plugins) and plugin.call (write tools) a plugin \
-         gate, which the user approves in the window.\n"
+         gate, which the user approves in the window. agent.send types its text as one line (control \
+         characters become spaces) and presses Enter.\n"
     );
     out
 }
@@ -855,6 +863,112 @@ mod tests {
         }
         assert!(text.contains("space.widen_propose"));
         assert!(text.contains(AGENT_ENV));
+    }
+
+    #[test]
+    fn agent_methods_parse_and_agent_list_never_defaults_its_space() -> Result<(), UsageError> {
+        use crate::protocol::{AgentListParams, AgentReadParams, AgentSendParams};
+        let here = Some("here");
+        assert_eq!(
+            call("agent.list", here)?,
+            Call::AgentList(AgentListParams::default()),
+            "$XCTX_SPACE does not narrow agent.list"
+        );
+        assert_eq!(
+            call("agent.list space=there", here)?,
+            Call::AgentList(AgentListParams {
+                space: Some("there".into())
+            })
+        );
+        assert_eq!(
+            call("agent.read agent=writer-api lines=200", here)?,
+            Call::AgentRead(AgentReadParams {
+                space: "here".into(),
+                agent: "writer-api".into(),
+                lines: Some(200),
+            })
+        );
+        assert_eq!(
+            call("agent.read space=s agent=orchestrator", None)?,
+            Call::AgentRead(AgentReadParams {
+                space: "s".into(),
+                agent: "orchestrator".into(),
+                lines: None,
+            })
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    "agent.send",
+                    "space=s",
+                    "agent=helper-browser-1",
+                    "text=Parent Agent here: open /login and click Sign in",
+                ]
+                .map(str::to_owned),
+                None,
+                Some("orchestrator"),
+            )?,
+            Command::Call {
+                socket: None,
+                compact: false,
+                call: Call::AgentSend(AgentSendParams {
+                    space: "s".into(),
+                    agent: "helper-browser-1".into(),
+                    text: "Parent Agent here: open /login and click Sign in".into(),
+                }),
+            },
+            "the agent written to is never defaulted"
+        );
+        for bad in [
+            "agent.read space=s agent=a lines=201",
+            "agent.read space=s agent=a lines=0",
+            "agent.read space=s agent=a lines=many",
+            "agent.read space=s",
+            "agent.send space=s agent=a",
+            "agent.send space=s agent=a text=",
+            "agent.send space=s text=hi",
+        ] {
+            assert!(parse_args(args(bad), None, None).is_err(), "{bad}");
+        }
+        assert!(
+            parse_args(
+                ["agent.send", "space=s", "agent=a", "text=   "].map(str::to_owned),
+                None,
+                None
+            )
+            .is_err(),
+            "whitespace-only text is refused"
+        );
+        assert_eq!(
+            call("agent.start agent=orchestrator", here)?,
+            Call::AgentStart(crate::protocol::AgentParams {
+                space: "here".into(),
+                agent: "orchestrator".into(),
+            })
+        );
+        assert_eq!(
+            call("space.open space=portfolio", None)?,
+            Call::SpaceOpen(SpaceParams {
+                space: "portfolio".into()
+            })
+        );
+        assert!(parse_args(args("agent.start space=s"), None, None).is_err());
+        assert!(parse_args(args("space.open"), None, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn help_lists_the_agent_methods_with_their_parameters() {
+        let text = help();
+        for line in [
+            "agent.list           [space=<slug>]",
+            "agent.read           space=<slug> agent=<id> [lines=<1-200>]",
+            "agent.send           space=<slug> agent=<id> text=<message>",
+            "agent.start          space=<slug> agent=<id>",
+            "space.open           space=<slug>",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
     }
 
     #[test]

@@ -30,6 +30,102 @@ const MAX_TRACKED_REQUESTS: usize = 2000;
 /// How many loader ids that reached their load event are remembered, newest kept.
 const MAX_LOADED_LOADERS: usize = 32;
 
+/// The most characters [`Page::text`] returns.
+pub const MAX_PAGE_TEXT_CHARS: usize = 20_000;
+
+/// How many characters of a clicked element's text [`Clicked::text`] keeps.
+const CLICKED_TEXT_CHARS: usize = 80;
+
+/// How long an action waits for a navigation it may have started to commit.
+const ACTION_SETTLE: Duration = Duration::from_millis(300);
+
+/// What [`Page::click`] clicked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clicked {
+    /// The element's tag name, lowercase (`button`, `a`).
+    pub tag: String,
+    /// The element's visible text (or value), whitespace collapsed, cut to 80 characters.
+    pub text: String,
+    /// The page's URL after the click (and any navigation it caused).
+    pub url: String,
+}
+
+/// What [`Page::type_text`] left in the field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Typed {
+    /// The field's value afterwards, or `None` when it is gone (a submit navigated away).
+    pub value: Option<String>,
+    /// The page's URL afterwards.
+    pub url: String,
+}
+
+/// What [`Page::text`] read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageText {
+    /// The visible text, at most [`MAX_PAGE_TEXT_CHARS`] characters.
+    pub text: String,
+    /// Whether the text was cut.
+    pub truncated: bool,
+    /// How many characters the whole text had.
+    pub chars: usize,
+    /// The page's URL.
+    pub url: String,
+}
+
+/// `value` as a JavaScript string literal: JSON-encoded, with `<` escaped too so `</script>` cannot close
+/// anything should the script ever be embedded in HTML.
+pub(crate) fn js_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"\"".to_owned())
+        .replace('<', "\\u003c")
+}
+
+/// A script that runs `body` with `el` bound to the first element matching `selector` (or to
+/// `document.body` when `selector` is `None`), returning `null` when nothing matches.
+pub(crate) fn element_script(selector: Option<&str>, body: &str) -> String {
+    let find = match selector {
+        Some(selector) => format!("document.querySelector({})", js_string(selector)),
+        None => "document.body".to_owned(),
+    };
+    format!("(() => {{ const el = {find}; if (!el) return null; {body} }})()")
+}
+
+/// `text` cut to `max` characters, and whether it was cut.
+pub(crate) fn cap_text(text: &str, max: usize) -> (String, bool) {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => (text[..at].to_owned(), true),
+        None => (text.to_owned(), false),
+    }
+}
+
+const CLICK_TARGET: &str = "el.scrollIntoView({ block: 'center', inline: 'center' }); \
+    const r = el.getBoundingClientRect(); \
+    const text = (el.innerText || el.value || '').replace(/\\s+/g, ' ').trim(); \
+    return { tag: el.tagName.toLowerCase(), text, x: r.left + r.width / 2, y: r.top + r.height / 2, \
+    boxed: r.width > 0 && r.height > 0 };";
+
+const CLEAR_FIELD: &str = "el.focus(); \
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype \
+    : el instanceof HTMLInputElement ? HTMLInputElement.prototype : null; \
+    if (proto) { Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, ''); } \
+    else if (el.isContentEditable) { el.textContent = ''; } \
+    else { return { editable: false }; } \
+    el.dispatchEvent(new Event('input', { bubbles: true })); \
+    return { editable: document.activeElement === el };";
+
+const FIELD_VALUE: &str = "el.dispatchEvent(new Event('change', { bubbles: true })); \
+    return 'value' in el && typeof el.value === 'string' ? el.value : el.innerText;";
+
+const READ_VALUE: &str =
+    "return 'value' in el && typeof el.value === 'string' ? el.value : el.innerText;";
+
+fn element_error(selector: &str, reason: &str) -> BrowserError {
+    BrowserError::Element {
+        selector: selector.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
 /// A list that keeps only its newest `capacity` items and counts the ones it dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedLog<T> {
@@ -584,6 +680,114 @@ impl Page {
             .unwrap_or(Value::Null))
     }
 
+    /// Clicks the first element matching the CSS `selector`: scrolls it into view and sends a real
+    /// (trusted) left click at its centre through `Input.dispatchMouseEvent`, then waits for a navigation the
+    /// click started. The page must be on an allowed URL before, and still be after (see
+    /// [`Page::allowed_current_url`]); a click that leaves the policy is an error.
+    ///
+    /// Fails with [`BrowserError::Element`] when nothing matches or the element has no box.
+    pub fn click(&mut self, selector: &str) -> Result<Clicked> {
+        self.allowed_current_url()?;
+        let target = self.evaluate(&element_script(Some(selector), CLICK_TARGET))?;
+        if target.is_null() {
+            return Err(element_error(selector, "no element matches"));
+        }
+        if target.get("boxed").and_then(Value::as_bool) != Some(true) {
+            return Err(element_error(
+                selector,
+                "the element has no box to click (hidden or empty)",
+            ));
+        }
+        let at = |k: &str| target.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let (x, y) = (at("x"), at("y"));
+        let before = self.state.navigations;
+        self.call(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseMoved", "x": x, "y": y }),
+        )?;
+        for kind in ["mousePressed", "mouseReleased"] {
+            self.call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 }),
+            )?;
+        }
+        self.settle(before)?;
+        let text = target.get("text").and_then(Value::as_str).unwrap_or("");
+        Ok(Clicked {
+            tag: str_at(&target, "/tag").unwrap_or_default().to_owned(),
+            text: cap_text(text, CLICKED_TEXT_CHARS).0,
+            url: self.allowed_current_url()?,
+        })
+    }
+
+    /// Types `text` into the first element matching `selector` (an input, a textarea or an editable
+    /// element): focuses it, clears it (firing `input` so frameworks see it), inserts the text with
+    /// `Input.insertText` and fires `change`. With `submit`, presses Enter afterwards and waits for a
+    /// navigation it started. The page must be on an allowed URL before and after, as for [`Page::click`].
+    pub fn type_text(&mut self, selector: &str, text: &str, submit: bool) -> Result<Typed> {
+        self.allowed_current_url()?;
+        let cleared = self.evaluate(&element_script(Some(selector), CLEAR_FIELD))?;
+        if cleared.is_null() {
+            return Err(element_error(selector, "no element matches"));
+        }
+        if cleared.get("editable").and_then(Value::as_bool) != Some(true) {
+            return Err(element_error(selector, "the element cannot take text"));
+        }
+        if !text.is_empty() {
+            self.call("Input.insertText", json!({ "text": text }))?;
+        }
+        let mut value = self.evaluate(&element_script(Some(selector), FIELD_VALUE))?;
+        if submit {
+            let before = self.state.navigations;
+            for kind in ["keyDown", "keyUp"] {
+                let mut key = json!({
+                    "type": kind, "key": "Enter", "code": "Enter",
+                    "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+                });
+                if kind == "keyDown" {
+                    key["text"] = json!("\r");
+                }
+                self.call("Input.dispatchKeyEvent", key)?;
+            }
+            self.settle(before)?;
+            value = self.evaluate(&element_script(Some(selector), READ_VALUE))?;
+        }
+        Ok(Typed {
+            value: value.as_str().map(str::to_owned),
+            url: self.allowed_current_url()?,
+        })
+    }
+
+    /// The visible text (`innerText`) of the first element matching `selector`, or of the whole body,
+    /// cut to [`MAX_PAGE_TEXT_CHARS`]. The page must be on an allowed URL.
+    pub fn text(&mut self, selector: Option<&str>) -> Result<PageText> {
+        let url = self.allowed_current_url()?;
+        let value = self.evaluate(&element_script(selector, "return el.innerText;"))?;
+        let Some(full) = value.as_str() else {
+            return Err(element_error(
+                selector.unwrap_or("body"),
+                "no element matches",
+            ));
+        };
+        let (text, truncated) = cap_text(full, MAX_PAGE_TEXT_CHARS);
+        Ok(PageText {
+            text,
+            truncated,
+            chars: full.chars().count(),
+            url,
+        })
+    }
+
+    /// After an input action: reads events for a moment and, when a main-frame navigation committed since
+    /// `navigations_before`, waits for its load.
+    fn settle(&mut self, navigations_before: u64) -> Result<()> {
+        self.pump(ACTION_SETTLE)?;
+        if self.state.navigations > navigations_before {
+            self.wait_for_load(|state| state.reloaded(navigations_before))?;
+        }
+        Ok(())
+    }
+
     /// Closes the tab.
     pub fn close(mut self) -> Result<()> {
         self.conn.close();
@@ -692,5 +896,42 @@ mod tests {
         assert_eq!(state.loaded.len(), MAX_LOADED_LOADERS);
         assert!(!state.is_loaded("L0"));
         assert!(state.is_loaded(&format!("L{}", MAX_LOADED_LOADERS + 4)));
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+
+    const NASTY: &str = r#"a"b'c\d</script><script>alert(1)</script>`${x}`"#;
+
+    #[test]
+    fn selectors_and_text_are_json_encoded_into_scripts() {
+        let literal = js_string(NASTY);
+        assert!(!literal.contains("</script>"), "{literal}");
+        assert!(!literal.contains('<'), "{literal}");
+        let back: String = serde_json::from_str(&literal).unwrap_or_default();
+        assert_eq!(back, NASTY, "the literal reads back as the value");
+
+        let script = element_script(Some(NASTY), "return el.innerText;");
+        assert!(script.contains(&format!("document.querySelector({literal})")));
+        assert!(
+            !script.contains(NASTY),
+            "the raw selector is never spliced in"
+        );
+        assert!(!script.contains("</script>"));
+        assert!(element_script(None, "return 1;").contains("const el = document.body;"));
+    }
+
+    #[test]
+    fn text_is_capped_on_a_character_boundary() {
+        assert_eq!(cap_text("héllo", 10), ("héllo".to_owned(), false));
+        assert_eq!(cap_text("héllo", 5), ("héllo".to_owned(), false));
+        assert_eq!(cap_text("héllo", 2), ("hé".to_owned(), true));
+        assert_eq!(cap_text("", 0), (String::new(), false));
+        let long = "x".repeat(MAX_PAGE_TEXT_CHARS + 7);
+        let (cut, truncated) = cap_text(&long, MAX_PAGE_TEXT_CHARS);
+        assert!(truncated);
+        assert_eq!(cut.chars().count(), MAX_PAGE_TEXT_CHARS);
     }
 }

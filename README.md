@@ -27,7 +27,15 @@ write waits for approval in the Inbox. A plugin's events can start or stop the s
 
 No further milestone is planned yet; see [`docs/roadmap.md`](docs/roadmap.md).
 
-**Agents.** Agent panes run `omp` by default (the built-in `omp` runner: a task, and `omp --continue` on reopen). omp cannot create a session under an id xctx chooses, so spaces on the default runner get no Fork or attempts; for those, set `"runner": "pi"` on the space (or on one agent) in `spaces/<slug>/graph.json` in the data directory. When an agent exits on its own (you quit it), its pane opens your login shell in the same worktree, with the space's environment; the agent starts again the next time the space opens.
+**Agents.** Agent panes run `omp` by default (the built-in `omp` runner: a task, and `omp --continue` on reopen). omp cannot create a session under an id xctx chooses, so spaces on the default runner get no Fork or attempts; for those, set `"runner": "pi"` on the space (or on one agent) in `spaces/<slug>/graph.json` in the data directory. When an agent exits on its own (you quit it), its pane opens your login shell in the same worktree with the space's environment, and the pane header offers **Restart agent**.
+
+**Living spaces.**
+- **Home** lists every space's agents with what each one's pane is doing (LIVE, EXITED, NOT STARTED); **Open** jumps to an agent's pane and **Start** opens one. The folders xctx indexes for repos sit above the Parent Agent.
+- **The Parent Agent drives them** through `xctx-ctl agent.list`, `agent.read space=<slug> agent=<id>` (an agent's screen, secrets masked) and `agent.send space=<slug> agent=<id> text="..."` (typed into the agent's terminal, shown in the status bar).
+- **In a space**, every agent card in the graph panel (⌘G) has **Open** or **Start**. New lanes (the orchestrator, helpers, the writer of an added repo) start with a brief of their role instead of a bare prompt. **+ Repo** (tab bar or the graph's Writers row) adds a repo to the space with its own worktree, writer and agent pane.
+- **Helpers** include **Browser**, which tests the app in xctx's own browser plugin (`page.open`, `page.click`, `page.type`, `page.text`, `page.screenshot`, `page.console`) and never in an outside browser.
+- **Pane headers** show the repo's git host address (click copies it), its branch, **Files** (the in-app file explorer of the worktree) and **Git** (lazygit in it).
+- **Launch** sets up web apps: the first repo whose `package.json` names a web framework and a `dev` or `start` script gets a terminal pane running that script on the space's `PORT` (installing dependencies first when `node_modules` is missing) and xctx's browser on it. The space's other repos (a backend beside a frontend) get the API client.
 
 ## Prerequisites
 

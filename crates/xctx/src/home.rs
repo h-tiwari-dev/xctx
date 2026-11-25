@@ -8,10 +8,13 @@ use gpui::{
     prelude::*,
 };
 use xctx_core::{Space, SpaceDraft};
+use xctx_graph::AgentRole;
 use xctx_ui::{
-    Badge, Button, ButtonSize, ButtonVariant, ParentAgentDrawer, Theme, Tone, shape_label,
+    Badge, Button, ButtonSize, ButtonVariant, PaneLive, ParentAgentDrawer, Theme, Tone, card_badge,
+    helper_kind_label, shape_label,
 };
 
+use crate::graph_panel::pane_lives;
 use crate::lifecycle::{folder_to_index, home_dir, launch_space};
 use crate::space_layout::layout_shape;
 use crate::workspace::Workspace;
@@ -139,8 +142,9 @@ impl Workspace {
                         div()
                             .text_size(Theme::TEXT_SM)
                             .text_color(theme.text_subtle)
-                            .child("Tell the Parent Agent. It drafts a space from your indexed repos and shows it here; ⌘↵ launches it."),
+                            .child("Tell the Parent Agent. It drafts a space from your indexed repos and shows it here; ⌘↵ launches it. It can also check on and message the agents of your living spaces."),
                     )
+                    .child(self.render_roots(cx))
                     .child(self.render_parent_agent(cx)),
             );
         if let Some(plan) = self.render_plan_review(cx) {
@@ -153,16 +157,18 @@ impl Workspace {
             column = column.child(notice(format!("{busy}…"), theme.text_muted, &theme));
         }
         column = column
-            .child(self.render_inbox(cx))
             .child(self.render_spaces(cx))
-            .child(self.render_roots(cx));
+            .child(self.render_inbox(cx));
         div()
             .id("home")
             .size_full()
             .overflow_y_scroll()
             .flex()
             .justify_center()
-            .child(column)
+            // Top-aligned, the column is as tall as its content, so the overflow scrolls here instead of being
+            // cut off at the window's height.
+            .items_start()
+            .child(column.flex_none())
             .into_any_element()
     }
 
@@ -198,68 +204,148 @@ impl Workspace {
                 .tabs
                 .get(&space.id)
                 .is_some_and(|tab| tab.agent_running(cx));
+            let header = div()
+                .id(("space-card", index))
+                .cursor_pointer()
+                .rounded(Theme::RADIUS_MD)
+                .hover(|style| style.bg(theme.surface_hover))
+                .on_click(cx.listener(move |this, _, window, cx| this.show_space(&id, window, cx)))
+                .child(space_summary(space, running, index, &theme));
             list = list.child(
                 card(&theme)
-                    .id(("space-card", index))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.surface_hover))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.show_space(&id, window, cx)),
-                    )
-                    .child(space_summary(space, running, index, &theme)),
+                    .child(header)
+                    .child(self.render_space_agents(space, index, cx)),
             );
         }
         list
     }
 
+    /// The agents of `space` under its card, each with what its pane does and Open (or Start when it has no
+    /// pane), which shows the space with that agent's pane focused. A space that is not open says so: its agents
+    /// start when it opens.
+    fn render_space_agents(&self, space: &Space, index: usize, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::of(cx);
+        let rows = div().flex().flex_col().gap(Theme::SPACE_1);
+        let (Some(tab), Some(state)) = (self.tabs.get(&space.id), self.graphs.get(&space.id))
+        else {
+            return rows.child(
+                div()
+                    .text_size(Theme::TEXT_SM)
+                    .text_color(theme.text_subtle)
+                    .child("Not open: click it to open the space and start its agents."),
+            );
+        };
+        let live = pane_lives(state.graph(), tab, cx);
+        let mut rows = rows;
+        for (row_index, node) in state.graph().nodes().iter().enumerate() {
+            let status = live.get(&node.id).copied().unwrap_or(PaneLive::NoPane);
+            let (label, tone) = card_badge(&node.state, Some(status));
+            let role = match &node.role {
+                AgentRole::Orchestrator => "orchestrator".to_owned(),
+                AgentRole::Writer { repo } => format!("writer · {repo}"),
+                AgentRole::Helper { kind } => format!("helper · {}", helper_kind_label(*kind)),
+            };
+            let (space_id, agent) = (space.id.clone(), node.id.clone());
+            let has_pane = node.pane_id.is_some();
+            let action = Button::new(
+                ("home-agent", index * 1000 + row_index),
+                if has_pane { "Open" } else { "Start" },
+            )
+            .variant(if has_pane {
+                ButtonVariant::Secondary
+            } else {
+                ButtonVariant::Primary
+            })
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.show_space(&space_id, window, cx);
+                let result = if has_pane {
+                    this.open_agent_pane(&space_id, &agent, window, cx)
+                } else {
+                    this.start_agent_pane(&space_id, &agent, window, cx)
+                        .map(|_| ())
+                };
+                if let Err(e) = result {
+                    this.show_op_error(e, cx);
+                }
+            }));
+            rows = rows.child(
+                row(&theme)
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(gpui::px(7.0))
+                            .rounded_full()
+                            .bg(theme.tone(tone).fg),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(node.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(Theme::TEXT_SM)
+                            .text_color(theme.text_subtle)
+                            .child(role),
+                    )
+                    .child(Badge::new(label).tone(tone))
+                    .child(action),
+            );
+        }
+        rows
+    }
+
+    /// The folders xctx indexes for repos, as a compact strip above the Parent Agent (it drafts from them): each
+    /// folder with ✕, how many repos were found, Rescan, and where another folder is typed.
     fn render_roots(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::of(cx);
-        let roots = self.roots.clone();
         let status = if self.scanning {
             "indexing…".to_owned()
         } else {
-            let count = self.index.repos().len();
-            if count == 1 {
-                "1 repo indexed".to_owned()
-            } else {
-                format!("{count} repos indexed")
+            match self.index.repos().len() {
+                1 => "1 repo indexed".to_owned(),
+                count => format!("{count} repos indexed"),
             }
         };
-        let mut list = div().flex().flex_col().gap(Theme::SPACE_2).child(
-            div()
-                .flex()
-                .items_center()
-                .gap(Theme::SPACE_2)
-                .child(section_title("Indexed folders", &theme))
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(Theme::TEXT_SM)
-                        .text_color(theme.text_subtle)
-                        .child(status),
-                )
-                .child(
-                    Button::new("rescan", "Rescan")
-                        .variant(ButtonVariant::Secondary)
-                        .size(ButtonSize::Compact)
-                        .disabled(self.scanning)
-                        .on_click(cx.listener(|this, _, _, cx| this.rescan(cx))),
-                ),
-        );
-        if roots.is_empty() {
-            list = list.child(notice(
-                "xctx finds repos in the folders you index. Add the folder that holds your repos, such as ~/code or ~/Desktop.".to_owned(),
-                theme.warning,
-                &theme,
-            ));
+        let mut folders = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(Theme::SPACE_1)
+            .child(
+                div()
+                    .text_size(Theme::TEXT_SM)
+                    .text_color(theme.text_muted)
+                    .child("Repos from"),
+            );
+        if self.roots.is_empty() {
+            folders = folders.child(
+                div()
+                    .text_size(Theme::TEXT_SM)
+                    .text_color(theme.warning)
+                    .child("no folder yet: add the one that holds your repos, such as ~/code"),
+            );
         }
-        for (index, root) in roots.into_iter().enumerate() {
-            let label = root.display().to_string();
-            list = list.child(
-                row(&theme)
-                    .child(div().flex_1().truncate().child(label))
+        for (index, root) in self.roots.iter().enumerate() {
+            let root = root.clone();
+            folders = folders.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Theme::SPACE_0_5)
+                    .pl(Theme::SPACE_2)
+                    .rounded(Theme::RADIUS_FULL)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.elevated)
+                    .text_size(Theme::TEXT_SM)
+                    .child(root.display().to_string())
                     .child(
-                        Button::new(("remove-root", index), "Remove")
+                        Button::new(("remove-root", index), "✕")
                             .variant(ButtonVariant::Ghost)
                             .size(ButtonSize::Compact)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -268,21 +354,40 @@ impl Workspace {
                     ),
             );
         }
-        list.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(Theme::SPACE_2)
-                .child(div().flex_1().child(self.root_input.clone()))
-                .child(
-                    Button::new("add-root", "Add folder")
-                        .variant(ButtonVariant::Secondary)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let input = this.root_input.read(cx).value().to_owned();
-                            this.add_root(input, cx);
-                        })),
-                ),
-        )
+        folders = folders
+            .child(
+                div()
+                    .text_size(Theme::TEXT_SM)
+                    .text_color(theme.text_subtle)
+                    .child(status),
+            )
+            .child(
+                Button::new("rescan", "Rescan")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .disabled(self.scanning)
+                    .on_click(cx.listener(|this, _, _, cx| this.rescan(cx))),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .gap(Theme::SPACE_1)
+            .child(folders)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Theme::SPACE_2)
+                    .child(div().flex_1().child(self.root_input.clone()))
+                    .child(
+                        Button::new("add-root", "Add folder")
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let input = this.root_input.read(cx).value().to_owned();
+                                this.add_root(input, cx);
+                            })),
+                    ),
+            )
     }
 }
 

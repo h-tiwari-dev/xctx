@@ -137,6 +137,16 @@ pub enum BrowserError {
     /// A script passed to [`crate::Page::evaluate`] threw.
     #[error("the script threw: {0}")]
     Script(String),
+
+    /// The element an action targets cannot be used: nothing matches its selector, it has no box to click,
+    /// or it cannot take text.
+    #[error("{selector}: {reason}")]
+    Element {
+        /// The CSS selector as given.
+        selector: String,
+        /// What is wrong, for example `no element matches`.
+        reason: String,
+    },
 }
 
 impl BrowserError {
@@ -187,6 +197,10 @@ mod tests {
                 allowed: "no host".into(),
             },
             BrowserError::Script("boom".into()),
+            BrowserError::Element {
+                selector: "#go".into(),
+                reason: "no element matches".into(),
+            },
             BrowserError::Timeout {
                 method: "the page load".into(),
                 timeout: Duration::from_secs(1),

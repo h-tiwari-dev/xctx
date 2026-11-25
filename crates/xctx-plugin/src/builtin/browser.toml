@@ -33,3 +33,32 @@ builtin = "page.console"
 params = [
   { name = "errors_only", type = "boolean", description = "Only errors" },
 ]
+
+[[tools]]
+name = "page.click"
+description = "Click the first element matching a CSS selector on the open page (a real mouse click at its centre)"
+effect = "read"
+builtin = "page.click"
+params = [
+  { name = "selector", type = "string", required = true, description = "A CSS selector, such as button[type=submit]" },
+]
+
+[[tools]]
+name = "page.type"
+description = "Clear a field of the open page and type text into it, optionally pressing Enter"
+effect = "read"
+builtin = "page.type"
+params = [
+  { name = "selector", type = "string", required = true, description = "A CSS selector of an input, a textarea or an editable element" },
+  { name = "text", type = "string", required = true, description = "The text to type" },
+  { name = "submit", type = "boolean", description = "Press Enter afterwards" },
+]
+
+[[tools]]
+name = "page.text"
+description = "The visible text of the open page, or of the element matching a selector (up to 20000 characters)"
+effect = "read"
+builtin = "page.text"
+params = [
+  { name = "selector", type = "string", description = "A CSS selector; the whole page when left out" },
+]

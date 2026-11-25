@@ -1183,7 +1183,56 @@ fn run_page(
             })?;
             Ok(page_output(&browser.snapshot(), errors_only, "console"))
         }
+        "page.click" => {
+            let selector = str_arg(args, "selector").ok_or("page.click: selector is required")?;
+            let clicked = browser.with_page(policy, redactor, |page| page.click(selector))?;
+            let text = format!(
+                "clicked <{}> {:?}, now at {}",
+                clicked.tag, clicked.text, clicked.url
+            );
+            Ok(action_output(json!(clicked), &text, redactor))
+        }
+        "page.type" => {
+            let selector = str_arg(args, "selector").ok_or("page.type: selector is required")?;
+            let typed = str_arg(args, "text").ok_or("page.type: text is required")?;
+            let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
+            let result = browser.with_page(policy, redactor, |page| {
+                page.type_text(selector, typed, submit)
+            })?;
+            let text = match &result.value {
+                Some(value) => format!("typed into {selector}: {value:?}, now at {}", result.url),
+                None => format!(
+                    "typed into {selector}; the field is gone, now at {}",
+                    result.url
+                ),
+            };
+            Ok(action_output(json!(result), &text, redactor))
+        }
+        "page.text" => {
+            let selector = str_arg(args, "selector").filter(|s| !s.trim().is_empty());
+            let read = browser.with_page(policy, redactor, |page| page.text(selector))?;
+            let mut text = read.text.clone();
+            if read.truncated {
+                text.push_str(&format!(
+                    "\n[cut at {} of {} characters]",
+                    read.text.chars().count(),
+                    read.chars
+                ));
+            }
+            Ok(action_output(json!(read), &text, redactor))
+        }
         other => Err(format!("{other} is not a browser built-in")),
+    }
+}
+
+/// The output of a page action: its JSON and text, both redacted (they hold what the page shows).
+fn action_output(mut json: Value, text: &str, redactor: &Redactor) -> CallOutput {
+    redactor.redact_json(&mut json);
+    CallOutput {
+        json,
+        text: cut_chars(&redactor.redact(text), TOOL_MAX_OUTPUT),
+        events: Vec::new(),
+        effect: PaneEffect::None,
     }
 }
 

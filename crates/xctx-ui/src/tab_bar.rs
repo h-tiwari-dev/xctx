@@ -79,7 +79,7 @@ type ShapeHandler = Rc<dyn Fn(Shape, &mut Window, &mut App)>;
 /// The shape selector, Ship and Discard appear only when [`TabBar::active_shape`] is set, which the app does
 /// while a space is shown. The Graph toggle (test selector `tab-graph`) appears next to the shape selector when
 /// a space is shown and [`TabBar::on_graph`] is set; the Plugins button (`tab-plugins`) next to it with
-/// [`TabBar::on_plugins`].
+/// [`TabBar::on_plugins`], and "+ Repo" (`tab-add-repo`) with [`TabBar::on_add_repo`].
 #[derive(IntoElement)]
 pub struct TabBar {
     home_active: bool,
@@ -94,6 +94,7 @@ pub struct TabBar {
     on_discard: Option<Handler>,
     on_graph: Option<Handler>,
     on_plugins: Option<Handler>,
+    on_add_repo: Option<Handler>,
 }
 
 impl Default for TabBar {
@@ -118,6 +119,7 @@ impl TabBar {
             on_discard: None,
             on_graph: None,
             on_plugins: None,
+            on_add_repo: None,
         }
     }
 
@@ -194,6 +196,12 @@ impl TabBar {
     /// clicked.
     pub fn on_plugins(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_plugins = Some(Rc::new(handler));
+        self
+    }
+
+    /// Offer "+ Repo" while a space is shown (add another repo to it), calling `handler` when it is clicked.
+    pub fn on_add_repo(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_add_repo = Some(Rc::new(handler));
         self
     }
 }
@@ -299,6 +307,12 @@ impl RenderOnce for TabBar {
                     .selector("tab-plugins")
                     .on_click(move |_, window, cx| handler(window, cx))
             });
+            let add_repo = self.on_add_repo.map(|handler| {
+                Button::new("tab-add-repo", "+ Repo")
+                    .variant(ButtonVariant::Ghost)
+                    .selector("tab-add-repo")
+                    .on_click(move |_, window, cx| handler(window, cx))
+            });
             let mut discard = Button::new("tab-discard", "Discard").variant(ButtonVariant::Danger);
             if let Some(handler) = self.on_discard {
                 discard = discard.on_click(move |_, window, cx| handler(window, cx));
@@ -325,6 +339,7 @@ impl RenderOnce for TabBar {
                         .children(pills),
                 )
                 .children(graph)
+                .children(add_repo)
                 .children(plugins)
                 .child(div().w(px(1.0)).h(px(16.0)).bg(theme.divider))
                 .child(discard)

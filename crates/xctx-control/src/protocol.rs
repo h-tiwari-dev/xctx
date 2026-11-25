@@ -301,13 +301,15 @@ impl Response {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Look at spaces, layouts, the Inbox, agent graphs, channels, contracts, loops, attempts and plugins.
+    /// Look at spaces, layouts, the Inbox, agent graphs, channels, contracts, loops, attempts, plugins, and what
+    /// a space's agents show in their terminals (`agent.list`, `agent.read`).
     Read,
     /// Rearrange a space: split, close, focus, zoom and reshape panes; pause, add and remove agent lanes; advance a
     /// loop; mount and unmount plugins; report plugin events (`plugin.emit`, whose actions can pass or fail the loop).
     Layout,
-    /// Propose work and tell the user things: draft or propose widening a space, post to the Inbox, the channel or
-    /// the contract, set the status line, and call plugin tools (writes become Inbox gates).
+    /// Propose work and tell the user and agents things: draft or propose widening a space, post to the Inbox, the
+    /// channel or the contract, set the status line, type a message to an agent (`agent.send`), and call plugin
+    /// tools (writes become Inbox gates).
     Propose,
     /// Steer on the user's behalf: resume a paused agent and set how far a loop runs without asking. These undo a
     /// user's pause or loosen a user's gate, so [`crate::ServerConfig::default`] (what pane agents get) leaves it
@@ -404,11 +406,21 @@ pub enum Method {
     /// [`Capability::Layout`]: a manifest action can pass or fail the loop's stage, moving the loop as
     /// `loop.advance` does.
     PluginEmit,
+    /// `agent.list`: every open space's agents with their graph state and whether their terminal runs.
+    AgentList,
+    /// `agent.read`: the last lines an agent's terminal shows, secrets masked.
+    AgentRead,
+    /// `agent.send`: type a message into an agent's terminal and submit it.
+    AgentSend,
+    /// `agent.start`: start an agent's pane when its terminal does not run it.
+    AgentStart,
+    /// `space.open`: open an active space's tab, starting its panes, and show it.
+    SpaceOpen,
 }
 
 impl Method {
     /// Every method, in the order `xctx-ctl help` lists them.
-    pub const ALL: [Method; 36] = [
+    pub const ALL: [Method; 41] = [
         Method::Ping,
         Method::SpaceList,
         Method::SpaceDraft,
@@ -445,6 +457,11 @@ impl Method {
         Method::PluginUnmount,
         Method::PluginCall,
         Method::PluginEmit,
+        Method::AgentList,
+        Method::AgentRead,
+        Method::AgentSend,
+        Method::AgentStart,
+        Method::SpaceOpen,
     ];
 
     /// The name on the wire.
@@ -486,6 +503,11 @@ impl Method {
             Method::PluginUnmount => "plugin.unmount",
             Method::PluginCall => "plugin.call",
             Method::PluginEmit => "plugin.emit",
+            Method::AgentList => "agent.list",
+            Method::AgentRead => "agent.read",
+            Method::AgentSend => "agent.send",
+            Method::AgentStart => "agent.start",
+            Method::SpaceOpen => "space.open",
         }
     }
 
@@ -504,7 +526,9 @@ impl Method {
             | Method::GraphGet
             | Method::ChannelList
             | Method::ContractGet
-            | Method::LoopStatus => Capability::Read,
+            | Method::LoopStatus
+            | Method::AgentList
+            | Method::AgentRead => Capability::Read,
             Method::SpaceReshape
             | Method::PaneSplit
             | Method::PaneClose
@@ -516,7 +540,9 @@ impl Method {
             | Method::LoopAdvance
             | Method::PluginMount
             | Method::PluginUnmount
-            | Method::PluginEmit => Capability::Layout,
+            | Method::PluginEmit
+            | Method::AgentStart
+            | Method::SpaceOpen => Capability::Layout,
             Method::GraphResume | Method::LoopSetAutonomy => Capability::Steer,
             Method::SpaceDraft
             | Method::InboxPost
@@ -527,7 +553,8 @@ impl Method {
             | Method::SpaceWidenPropose
             | Method::AttemptReport
             | Method::AttemptPropose
-            | Method::PluginCall => Capability::Propose,
+            | Method::PluginCall
+            | Method::AgentSend => Capability::Propose,
             Method::AttemptList
             | Method::AttemptDiff
             | Method::PluginList
@@ -596,6 +623,17 @@ impl Method {
             Method::PluginEmit => {
                 "report a plugin event (from the plugin's own tool) to the space's loop"
             }
+            Method::AgentList => {
+                "every open space's agents (or one space's): role, folder, graph state, pane and whether it runs"
+            }
+            Method::AgentRead => {
+                "the last lines an agent's terminal shows (default 40, at most 200), secrets masked"
+            }
+            Method::AgentSend => "type a message into an agent's terminal and press Enter",
+            Method::AgentStart => {
+                "start an agent that is not running in a pane of its own, with its role brief"
+            }
+            Method::SpaceOpen => "open an active space's tab (starting its panes) and show it",
         }
     }
 
@@ -653,6 +691,11 @@ impl Method {
                 "space=<slug> plugin=<name> tool=<name> [args:='{\"key\":\"value\"}']"
             }
             Method::PluginEmit => "space=<slug> plugin=<name> event=<name> [detail=<text>]",
+            Method::AgentList => "[space=<slug>]",
+            Method::AgentRead => "space=<slug> agent=<id> [lines=<1-200>]",
+            Method::AgentSend => "space=<slug> agent=<id> text=<message>",
+            Method::AgentStart => "space=<slug> agent=<id>",
+            Method::SpaceOpen => "space=<slug>",
         }
     }
 }
@@ -842,6 +885,9 @@ pub enum HelperKind {
     Reviewer,
     /// Exercises the running app.
     Probe,
+    /// Drives the space's in-app browser (the `browser` plugin): opens the app, clicks, screenshots, reads the
+    /// console.
+    Browser,
 }
 
 /// `graph.add_lane`.
@@ -1137,6 +1183,55 @@ pub struct PluginEmitParams {
     pub detail: Option<Value>,
 }
 
+/// `agent.list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentListParams {
+    /// Only this space, which must be active; every active space when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+}
+
+/// How many lines `agent.read` returns when `lines` is absent.
+pub const AGENT_READ_DEFAULT_LINES: u32 = 40;
+
+/// The most lines `agent.read` returns; [`Call::parse`] refuses a larger `lines`.
+pub const AGENT_READ_MAX_LINES: u32 = 200;
+
+/// `agent.read`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReadParams {
+    /// The space's slug.
+    pub space: String,
+    /// The agent's id in the space's graph.
+    pub agent: String,
+    /// How many of the screen's last lines to return, 1 to [`AGENT_READ_MAX_LINES`];
+    /// [`AGENT_READ_DEFAULT_LINES`] when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u32>,
+}
+
+impl AgentReadParams {
+    /// The number of lines asked for, with the default filled in.
+    pub fn line_count(&self) -> u32 {
+        self.lines.unwrap_or(AGENT_READ_DEFAULT_LINES)
+    }
+}
+
+/// `agent.send`. [`Call::parse`] refuses an empty or whitespace-only `text`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSendParams {
+    /// The space's slug.
+    pub space: String,
+    /// The agent's id in the space's graph.
+    pub agent: String,
+    /// The message. Control characters (newlines, escapes) are typed as spaces, so it is one line that cannot
+    /// press keys of its own; Enter is pressed after it.
+    pub text: String,
+}
+
 /// A parsed request: a method and its typed parameters.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
@@ -1212,6 +1307,16 @@ pub enum Call {
     PluginCall(PluginCallParams),
     /// See [`Method::PluginEmit`].
     PluginEmit(PluginEmitParams),
+    /// See [`Method::AgentList`].
+    AgentList(AgentListParams),
+    /// See [`Method::AgentRead`].
+    AgentRead(AgentReadParams),
+    /// See [`Method::AgentSend`].
+    AgentSend(AgentSendParams),
+    /// See [`Method::AgentStart`].
+    AgentStart(AgentParams),
+    /// See [`Method::SpaceOpen`].
+    SpaceOpen(SpaceParams),
 }
 
 fn params<P: DeserializeOwned>(method: Method, params: Option<Value>) -> Result<P, RpcError> {
@@ -1301,6 +1406,29 @@ impl Call {
             }
             Method::PluginCall => Call::PluginCall(params(m, raw)?),
             Method::PluginEmit => Call::PluginEmit(params(m, raw)?),
+            Method::AgentList => Call::AgentList(params(m, raw)?),
+            Method::AgentRead => {
+                let p: AgentReadParams = params(m, raw)?;
+                if !(1..=AGENT_READ_MAX_LINES).contains(&p.line_count()) {
+                    return Err(RpcError::invalid_params(format!(
+                        "{m}: lines must be 1 to {AGENT_READ_MAX_LINES}; usage: {m} {}",
+                        m.usage()
+                    )));
+                }
+                Call::AgentRead(p)
+            }
+            Method::AgentSend => {
+                let p: AgentSendParams = params(m, raw)?;
+                if p.text.trim().is_empty() {
+                    return Err(RpcError::invalid_params(format!(
+                        "{m}: text is empty; usage: {m} {}",
+                        m.usage()
+                    )));
+                }
+                Call::AgentSend(p)
+            }
+            Method::AgentStart => Call::AgentStart(params(m, raw)?),
+            Method::SpaceOpen => Call::SpaceOpen(params(m, raw)?),
         })
     }
 
@@ -1343,6 +1471,11 @@ impl Call {
             Call::PluginUnmount(_) => Method::PluginUnmount,
             Call::PluginCall(_) => Method::PluginCall,
             Call::PluginEmit(_) => Method::PluginEmit,
+            Call::AgentList(_) => Method::AgentList,
+            Call::AgentRead(_) => Method::AgentRead,
+            Call::AgentSend(_) => Method::AgentSend,
+            Call::AgentStart(_) => Method::AgentStart,
+            Call::SpaceOpen(_) => Method::SpaceOpen,
         }
     }
 
@@ -1379,6 +1512,11 @@ impl Call {
             Call::PluginUnmount(p) => to_value(p),
             Call::PluginCall(p) => to_value(p),
             Call::PluginEmit(p) => to_value(p),
+            Call::AgentList(p) => to_value(p),
+            Call::AgentRead(p) => to_value(p),
+            Call::AgentSend(p) => to_value(p),
+            Call::AgentStart(p) => to_value(p),
+            Call::SpaceOpen(p) => to_value(p),
         }
     }
 
@@ -1414,6 +1552,11 @@ impl Call {
             Call::PluginUnmount(p) => Some(&p.space),
             Call::PluginCall(p) => Some(&p.space),
             Call::PluginEmit(p) => Some(&p.space),
+            Call::AgentList(p) => p.space.as_deref(),
+            Call::AgentRead(p) => Some(&p.space),
+            Call::AgentSend(p) => Some(&p.space),
+            Call::AgentStart(p) => Some(&p.space),
+            Call::SpaceOpen(p) => Some(&p.space),
         }
     }
 }
@@ -1791,6 +1934,100 @@ pub struct PluginEmitResult {
     /// as a finding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<PluginEventAction>,
+}
+
+/// Whether an agent's program runs, in `agent.list` and `agent.read`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProcess {
+    /// Its terminal runs it.
+    Running,
+    /// It exited, or could not start; `exit_code` says how when it is known.
+    Exited,
+    /// It has no terminal: it is bound to no pane, or the space has no terminal for its pane.
+    NoPane,
+}
+
+/// One agent in `agent.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSummary {
+    /// The space's slug.
+    pub space: String,
+    /// Its id in the space's graph, which `agent.read` and `agent.send` take as `agent=`.
+    pub id: String,
+    /// The name the graph shows.
+    pub label: String,
+    /// `orchestrator`, `writer` or `helper:<kind>` (`helper:tests`, `helper:browser`, ...).
+    pub role: String,
+    /// The repo a writer writes to, by its name in the space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The folder a writer works in: the space's worktree of its repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Its graph state as `graph.get` reports it: `idle`, `running`, `paused`, `blocked`, `done` or `failed`.
+    pub state: String,
+    /// Why it is blocked or failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The pane it is bound to.
+    pub pane: Option<u64>,
+    /// Whether its program runs.
+    pub process: AgentProcess,
+    /// How it exited, when it did and the code is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// One active space in `agent.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSpaceSummary {
+    /// The space's slug.
+    pub space: String,
+    /// Whether its tab is open. A space that is not open runs no agents and lists none; `agent.list` never
+    /// opens it.
+    pub open: bool,
+    /// Its agents in graph order; empty when it is not open.
+    pub agents: Vec<AgentSummary>,
+}
+
+/// The result of `agent.list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentListResult {
+    /// The active spaces in the order Home shows them (or the one asked for).
+    pub spaces: Vec<AgentSpaceSummary>,
+}
+
+/// The result of `agent.read`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReadResult {
+    /// The space's slug.
+    pub space: String,
+    /// The agent's id.
+    pub agent: String,
+    /// Whether its program runs.
+    pub process: AgentProcess,
+    /// How it exited, when it did and the code is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The screen's last lines joined with `\n`, blank lines at the bottom dropped, secrets masked.
+    pub text: String,
+}
+
+/// The result of `agent.send`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSendResult {
+    /// Always `true`: the message was typed and submitted.
+    pub sent: bool,
+}
+
+/// The result of `agent.start`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStartResult {
+    /// The pane the agent runs in.
+    pub pane: PaneId,
+    /// `false` when it was already running there and nothing was started.
+    pub started: bool,
 }
 
 /// The result of methods that only report success: `pane.close`, `pane.focus`, `status.set`.
@@ -2420,5 +2657,216 @@ mod tests {
         for m in Method::ALL {
             assert!(!m.name().contains("approve"), "{m}");
         }
+    }
+
+    fn agent_calls() -> Vec<Call> {
+        vec![
+            Call::AgentList(AgentListParams {
+                space: Some("s".into()),
+            }),
+            Call::AgentRead(AgentReadParams {
+                space: "s".into(),
+                agent: "writer-api".into(),
+                lines: Some(200),
+            }),
+            Call::AgentSend(AgentSendParams {
+                space: "s".into(),
+                agent: "helper-browser-1".into(),
+                text: "Parent Agent here: check /login".into(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn agent_calls_round_trip_through_their_params_and_name_their_space() -> Result<(), RpcError> {
+        let calls = agent_calls();
+        let methods: Vec<Method> = calls.iter().map(Call::method).collect();
+        assert_eq!(
+            methods,
+            Method::ALL[36..39],
+            "every agent method is covered"
+        );
+        for call in calls {
+            let parsed = Call::parse(call.method().name(), Some(call.params()))?;
+            assert_eq!(parsed, call);
+            assert_eq!(call.space(), Some("s"), "{}", call.method());
+        }
+        let all = Call::parse("agent.list", None)?;
+        assert_eq!(all, Call::AgentList(AgentListParams::default()));
+        assert_eq!(all.space(), None);
+        let read = Call::parse(
+            "agent.read",
+            Some(json!({"space": "s", "agent": "orchestrator"})),
+        )?;
+        let Call::AgentRead(p) = &read else {
+            return Err(RpcError::internal(format!("not a read: {read:?}")));
+        };
+        assert_eq!(p.line_count(), AGENT_READ_DEFAULT_LINES);
+        assert_eq!(
+            read.params(),
+            json!({"space": "s", "agent": "orchestrator"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_params_refuse_too_many_lines_and_empty_text() {
+        for (method, params) in [
+            (
+                "agent.read",
+                json!({"space": "s", "agent": "a", "lines": 201}),
+            ),
+            (
+                "agent.read",
+                json!({"space": "s", "agent": "a", "lines": 0}),
+            ),
+            (
+                "agent.read",
+                json!({"space": "s", "agent": "a", "lines": -1}),
+            ),
+            ("agent.read", json!({"space": "s"})),
+            (
+                "agent.send",
+                json!({"space": "s", "agent": "a", "text": ""}),
+            ),
+            (
+                "agent.send",
+                json!({"space": "s", "agent": "a", "text": " \n\t "}),
+            ),
+            ("agent.send", json!({"space": "s", "agent": "a"})),
+            ("agent.list", json!({"space": "s", "all": true})),
+        ] {
+            let err = Call::parse(method, Some(params.clone())).err();
+            let err = err.map(|e| (e.kind(), e.message));
+            assert!(
+                matches!(&err, Some((Some(ErrorCode::InvalidParams), m)) if m.contains(&format!("usage: {method}"))),
+                "{method} {params}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_methods_read_or_propose_but_never_steer() {
+        assert_eq!(Method::AgentList.capability(), Capability::Read);
+        assert_eq!(Method::AgentRead.capability(), Capability::Read);
+        assert_eq!(Method::AgentSend.capability(), Capability::Propose);
+        for m in [Method::AgentList, Method::AgentRead, Method::AgentSend] {
+            assert!(!m.summary().is_empty(), "{m}");
+        }
+    }
+
+    #[test]
+    fn starting_agents_and_opening_spaces_parse_and_need_layout() -> Result<(), RpcError> {
+        let start = Call::AgentStart(AgentParams {
+            space: "s".into(),
+            agent: "orchestrator".into(),
+        });
+        let open = Call::SpaceOpen(SpaceParams { space: "s".into() });
+        let methods: Vec<Method> = [&start, &open].iter().map(|c| c.method()).collect();
+        assert_eq!(methods, Method::ALL[39..41]);
+        for call in [start, open] {
+            assert_eq!(
+                Call::parse(call.method().name(), Some(call.params()))?,
+                call
+            );
+            assert_eq!(call.space(), Some("s"));
+            assert_eq!(call.method().capability(), Capability::Layout);
+        }
+        for (method, params) in [
+            ("agent.start", json!({"space": "s"})),
+            ("space.open", json!({})),
+        ] {
+            let err = Call::parse(method, Some(params))
+                .err()
+                .and_then(|e| e.kind());
+            assert_eq!(err, Some(ErrorCode::InvalidParams), "{method}");
+        }
+        assert_eq!(
+            serde_json::to_value(AgentStartResult {
+                pane: PaneId(5),
+                started: true
+            })
+            .map_err(|e| RpcError::internal(e.to_string()))?,
+            json!({"pane": 5, "started": true})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_results_have_stable_field_names() -> Result<(), serde_json::Error> {
+        let list = AgentListResult {
+            spaces: vec![
+                AgentSpaceSummary {
+                    space: "s".into(),
+                    open: true,
+                    agents: vec![AgentSummary {
+                        space: "s".into(),
+                        id: "writer-api".into(),
+                        label: "api".into(),
+                        role: "writer".into(),
+                        repo: Some("api".into()),
+                        worktree: Some("/w/api".into()),
+                        state: "running".into(),
+                        reason: None,
+                        pane: Some(3),
+                        process: AgentProcess::Exited,
+                        exit_code: Some(1),
+                    }],
+                },
+                AgentSpaceSummary {
+                    space: "t".into(),
+                    open: false,
+                    agents: Vec::new(),
+                },
+            ],
+        };
+        let value = serde_json::to_value(&list)?;
+        assert_eq!(
+            value,
+            json!({"spaces": [
+                {"space": "s", "open": true, "agents": [{
+                    "space": "s", "id": "writer-api", "label": "api", "role": "writer", "repo": "api",
+                    "worktree": "/w/api", "state": "running", "pane": 3, "process": "exited", "exit_code": 1,
+                }]},
+                {"space": "t", "open": false, "agents": []},
+            ]})
+        );
+        assert_eq!(serde_json::from_value::<AgentListResult>(value)?, list);
+        let unbound = AgentSummary {
+            space: "s".into(),
+            id: "helper-browser-1".into(),
+            label: "Browser".into(),
+            role: "helper:browser".into(),
+            repo: None,
+            worktree: None,
+            state: "blocked".into(),
+            reason: Some("no app".into()),
+            pane: None,
+            process: AgentProcess::NoPane,
+            exit_code: None,
+        };
+        let value = serde_json::to_value(&unbound)?;
+        assert_eq!(
+            value.get("pane"),
+            Some(&Value::Null),
+            "an unbound agent says so"
+        );
+        assert_eq!(value["process"], "no_pane");
+        assert_eq!(value["reason"], "no app");
+        assert_eq!(
+            serde_json::to_value(AgentReadResult {
+                space: "s".into(),
+                agent: "orchestrator".into(),
+                process: AgentProcess::Running,
+                exit_code: None,
+                text: "done".into(),
+            })?,
+            json!({"space": "s", "agent": "orchestrator", "process": "running", "text": "done"})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentSendResult { sent: true })?,
+            json!({"sent": true})
+        );
+        Ok(())
     }
 }

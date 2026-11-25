@@ -46,7 +46,8 @@ pub use cdp::{Event, MAX_MESSAGE_BYTES};
 pub use chrome::{CHROME_APPS, CHROME_ENV, find_chrome};
 pub use error::{BrowserError, Result};
 pub use page::{
-    BoundedLog, Clip, ConsoleEntry, DEFAULT_PAGE_TIMEOUT, MAX_CONSOLE_ENTRIES, MAX_ENTRY_CHARS,
-    MAX_NETWORK_ERRORS, NetworkError, Page, ScreenshotOptions,
+    BoundedLog, Clicked, Clip, ConsoleEntry, DEFAULT_PAGE_TIMEOUT, MAX_CONSOLE_ENTRIES,
+    MAX_ENTRY_CHARS, MAX_NETWORK_ERRORS, MAX_PAGE_TEXT_CHARS, NetworkError, Page, PageText,
+    ScreenshotOptions, Typed,
 };
 pub use policy::{LOCAL_HOSTS, UrlPolicy};

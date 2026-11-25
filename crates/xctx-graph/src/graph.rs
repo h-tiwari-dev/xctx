@@ -45,6 +45,8 @@ pub enum HelperKind {
     Reviewer,
     /// Probes the running system (requests, logs, repros).
     Probe,
+    /// Drives the space's in-app browser (the `browser` plugin) to check the app as a user sees it.
+    Browser,
 }
 
 impl HelperKind {
@@ -53,6 +55,7 @@ impl HelperKind {
             HelperKind::Tests => "tests",
             HelperKind::Reviewer => "reviewer",
             HelperKind::Probe => "probe",
+            HelperKind::Browser => "browser",
         }
     }
 
@@ -61,6 +64,7 @@ impl HelperKind {
             HelperKind::Tests => "Tests",
             HelperKind::Reviewer => "Reviewer",
             HelperKind::Probe => "Probe",
+            HelperKind::Browser => "Browser",
         }
     }
 }
