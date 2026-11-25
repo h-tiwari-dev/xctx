@@ -29,6 +29,10 @@ pub struct SpaceGraphDocument {
     pub graph: AgentGraph,
     /// The space's loop.
     pub loop_run: LoopRun,
+    /// The agent runner the space's agents run (a runner manifest's name) unless their lane chose another
+    /// ([`crate::AgentNode::runner`]); `None` means `pi`. Absent from the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
 }
 
 impl SpaceGraphDocument {
@@ -38,6 +42,7 @@ impl SpaceGraphDocument {
             version: GRAPH_DOCUMENT_VERSION,
             graph,
             loop_run,
+            runner: None,
         }
     }
 }

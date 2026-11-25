@@ -5,17 +5,23 @@ edition.workspace = true
 
 [dependencies]
 futures = "0.3"
+libc = "0.2"
 gpui = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3" }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3", features = ["font-kit", "runtime_shaders"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 xctx-attempt = { path = "../xctx-attempt" }
+xctx-browser = { path = "../xctx-browser" }
 xctx-channel = { path = "../xctx-channel" }
+xctx-connectors = { path = "../xctx-connectors" }
 xctx-control = { path = "../xctx-control" }
 xctx-core = { path = "../xctx-core" }
 xctx-graph = { path = "../xctx-graph" }
+xctx-http = { path = "../xctx-http" }
 xctx-inbox = { path = "../xctx-inbox" }
 xctx-layout = { path = "../xctx-layout" }
+xctx-plugin = { path = "../xctx-plugin" }
 xctx-term = { path = "../xctx-term" }
 xctx-term-view = { path = "../xctx-term-view" }
 xctx-ui = { path = "../xctx-ui" }

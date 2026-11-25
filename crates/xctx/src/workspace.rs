@@ -11,6 +11,7 @@ use gpui::{
 use xctx_core::{Redactor, RepoIndex, Space, SpaceId, Store};
 use xctx_inbox::{Inbox, ItemId};
 use xctx_layout::{FocusDirection, SplitAxis};
+use xctx_plugin::RunnerRegistry;
 use xctx_term_view::{TerminalFont, TerminalTheme};
 use xctx_ui::{
     BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme,
@@ -31,6 +32,7 @@ use crate::keymap::{
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
+use crate::plugin_host::{PluginHost, load_runners, user_plugin_dir, user_runner_dir};
 use crate::space_graph::SpaceGraphs;
 use crate::space_layout::layout_shape;
 use crate::space_tab::SpaceTab;
@@ -135,6 +137,13 @@ pub(crate) struct Workspace {
     pub(crate) env_prompt: Option<EnvPrompt>,
     /// The Parent Agent on Home.
     pub(crate) parent: ParentAgent,
+    /// Every space's plugins: what can be mounted, what is, what it runs, and calls and mounts waiting in the
+    /// Inbox.
+    pub(crate) plugins: PluginHost,
+    /// The agent runners (built-in and the user's).
+    pub(crate) runners: RunnerRegistry,
+    /// Whether the task that redraws logs panes and fires their events is running.
+    pub(crate) plugin_ticker: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -210,6 +219,10 @@ impl Workspace {
                 for id in &ids {
                     this.persist(id, cx);
                 }
+                // Tails stop as they are dropped; Chrome quits unless a page action still holds it.
+                for browser in this.plugins.stop_all() {
+                    browser.close_if_idle();
+                }
                 async {}
             }),
         ];
@@ -250,7 +263,7 @@ impl Workspace {
             pending_masked_reads: Vec::new(),
             graphs: SpaceGraphs::new(data_dir.clone()),
             widen_approvals: HashSet::new(),
-            attempts: SpaceAttempts::new(data_dir),
+            attempts: SpaceAttempts::new(data_dir.clone()),
             attempt_jobs: HashSet::new(),
             unsaved_adoptions: HashMap::new(),
             sessions: SessionStorage::from_env(),
@@ -263,6 +276,9 @@ impl Workspace {
             plan_repo_input,
             env_prompt: None,
             parent: ParentAgent::default(),
+            plugins: PluginHost::new(data_dir, user_plugin_dir()),
+            runners: load_runners(user_runner_dir().as_deref()),
+            plugin_ticker: false,
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.

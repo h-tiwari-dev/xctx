@@ -207,6 +207,24 @@ impl SpaceLayout {
         Ok(RolePane { id, role })
     }
 
+    /// Split `target` along `axis` with a new pane of `role` (such as a plugin's, see
+    /// [`PaneRole::for_plugin`]), which takes the focus. Returns the new pane, which needs starting.
+    pub fn split_role(
+        &mut self,
+        target: PaneId,
+        axis: SplitAxis,
+        role: PaneRole,
+    ) -> Result<RolePane, LayoutError> {
+        if self.role(target).is_none() {
+            return Err(LayoutError::UnknownPane(target));
+        }
+        let id = PaneId(self.next_pane_id);
+        self.tree.split(target, axis, id, SPLIT_RATIO)?;
+        self.take_pane_id();
+        self.roles.insert(id, role.clone());
+        Ok(RolePane { id, role })
+    }
+
     /// Close `pane`. Returns the focused pane afterwards. Fails with [`LayoutError::LastPane`] for the only pane.
     pub fn close(&mut self, pane: PaneId) -> Result<PaneId, LayoutError> {
         let focused = self.tree.close(pane)?;

@@ -43,6 +43,20 @@ to let xctx pick from its index, or name the repos you found and say why in the 
 - xctx-ctl inbox.list shows what waits for the user; xctx-ctl inbox.post title=\"...\" tells them something; \
 xctx-ctl status.set message=\"...\" shows a short status line.
 
+Spaces can mount plugins: a pane the user sees plus tools agents call. Once a space is launched and open, \
+mount what its task calls for with xctx-ctl plugin.mount space=<slug> plugin=<name> (optionally repo=<name>):
+- building UI: browser (the app's page, screenshot, console and network errors) and terminal (a dev server or watcher);
+- an API change: api-client (send, replay and diff requests to the space's app) and logs;
+- a bug: logs (tail the app's log or command) and api-client (to reproduce it);
+- a data change: database (read-only queries; any write waits in the Inbox for the user);
+- a task that names a ticket: jira (read the issue; comments wait in the Inbox).
+xctx-ctl plugin.list space=<slug> shows the plugins a space can mount and where they are mounted; \
+xctx-ctl plugin.tools plugin=<name> shows a plugin's tools and their parameters; \
+xctx-ctl plugin.call space=<slug> plugin=<name> tool=<tool> args:='{\"key\":\"value\"}' calls a read tool, and a \
+write tool only posts a gate to the Inbox; xctx-ctl plugin.unmount space=<slug> plugin=<name> removes one. \
+Connectors with writes (jira) and a repo's own plugins ask the user in the Inbox before they mount; nothing you \
+run approves them.
+
 When the user describes a task, find the repositories it touches (the user's indexed folders are where their \
 repos live), then draft one space for it and tell the user it is waiting in the Inbox. Ask when the task is \
 unclear. Secret values are masked as [REDACTED:NAME]; never try to recover them.";
@@ -260,6 +274,25 @@ mod tests {
     fn the_prompt_names_the_gate_and_the_tool() {
         assert!(PARENT_AGENT_PROMPT.contains("xctx-ctl space.draft"));
         assert!(PARENT_AGENT_PROMPT.contains("cannot launch"));
+        for plugin in [
+            "browser",
+            "terminal",
+            "api-client",
+            "logs",
+            "database",
+            "jira",
+        ] {
+            assert!(PARENT_AGENT_PROMPT.contains(plugin), "{plugin}");
+        }
+        for method in [
+            "plugin.mount",
+            "plugin.list",
+            "plugin.tools",
+            "plugin.call",
+            "plugin.unmount",
+        ] {
+            assert!(PARENT_AGENT_PROMPT.contains(method), "{method}");
+        }
         assert!(!PARENT_AGENT_TOOLS.contains("edit") && !PARENT_AGENT_TOOLS.contains("write"));
     }
 }

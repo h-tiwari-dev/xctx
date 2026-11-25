@@ -15,8 +15,13 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use std::sync::OnceLock;
+
 use xctx_core::Space;
 use xctx_layout::{PaneId, PaneKind, PaneRole, RolePane};
+use xctx_plugin::{
+    Capability, RunnerError, RunnerManifest, RunnerSession, RunnerStart, build_args, stdin_task,
+};
 use xctx_term::TerminalConfig;
 
 use crate::agent_session::{AgentSession, agent_args};
@@ -331,6 +336,11 @@ pub struct PaneLaunch {
     pub config: TerminalConfig,
     /// Why the pane runs something other than its role's program, for the status bar.
     pub notice: Option<String>,
+    /// Text to type into the program once it started: the task, for a runner that reads it on standard input.
+    pub stdin: Option<String>,
+    /// Whether an agent pane runs the session it was asked to (so its id may be recorded on its agent); false when
+    /// its runner cannot name sessions and it runs an unnamed one instead.
+    pub session_named: bool,
 }
 
 /// The environment variable naming the agent a pane runs as, by its id in the space's graph.
@@ -416,22 +426,151 @@ pub fn pane_launch_with(
     session: &AgentSession,
     search: &ProgramSearch,
 ) -> PaneLaunch {
+    pane_launch_for_runner(space, role, agent, session, search, None)
+}
+
+/// The built-in `pi` runner, parsed once; `None` only if the built-in manifest failed to parse.
+pub fn pi_runner() -> Option<&'static RunnerManifest> {
+    static PI: OnceLock<Option<RunnerManifest>> = OnceLock::new();
+    PI.get_or_init(|| {
+        xctx_plugin::RunnerRegistry::with_builtins()
+            .default_runner()
+            .map(|r| r.manifest.clone())
+    })
+    .as_ref()
+}
+
+/// The runner's view of how an agent starts.
+pub fn runner_start(start: &AgentStart) -> RunnerStart {
+    match start {
+        AgentStart::Task(task) => RunnerStart::Task(task.clone()),
+        AgentStart::Continue => RunnerStart::Continue,
+        AgentStart::Fresh => RunnerStart::Fresh,
+    }
+}
+
+/// The runner's view of an agent's session.
+pub fn runner_session(session: &AgentSession) -> RunnerSession {
+    match session {
+        AgentSession::Unnamed => RunnerSession::Unnamed,
+        AgentSession::Open(id) => RunnerSession::Open(id.clone()),
+        AgentSession::Fork { source, id } => RunnerSession::Fork {
+            source: source.clone(),
+            id: id.clone(),
+        },
+    }
+}
+
+/// The arguments `runner` starts an agent with as `start` in `session` (see [`build_args`]), and whether it runs
+/// that session. A runner that cannot open or fork named sessions runs an unnamed one instead (resuming the
+/// worktree's last when it can and was asked to continue, else starting fresh), so its agent still starts; one
+/// that cannot resume starts fresh. Fails for what has no fallback, such as a task given to a runner that takes
+/// none.
+pub fn runner_args(
+    runner: &RunnerManifest,
+    start: &AgentStart,
+    session: &AgentSession,
+) -> Result<(Vec<String>, bool), RunnerError> {
+    let unsupported = |e: &RunnerError, wanted: &[Capability]| matches!(e, RunnerError::Unsupported { capability, .. } if wanted.contains(capability));
+    let start = runner_start(start);
+    match build_args(runner, &start, &runner_session(session)) {
+        Ok(args) => Ok((args, !matches!(session, AgentSession::Unnamed))),
+        Err(e)
+            if unsupported(
+                &e,
+                &[
+                    Capability::OpenSession,
+                    Capability::ForkSession,
+                    Capability::Resume,
+                ],
+            ) =>
+        {
+            let start = if start == RunnerStart::Continue && !runner.can_resume() {
+                RunnerStart::Fresh
+            } else {
+                start
+            };
+            build_args(runner, &start, &RunnerSession::Unnamed).map(|args| (args, false))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Where `program` (a runner's: a name on `PATH`, or an absolute path) is.
+pub fn find_runner_program(search: &ProgramSearch, program: &str) -> Option<PathBuf> {
+    if program.contains('/') {
+        let path = PathBuf::from(program);
+        return is_executable(&path).then_some(path);
+    }
+    search.find(program)
+}
+
+/// [`pane_launch_with`], an agent pane running `runner` (the built-in `pi` runner when `None`), whose arguments
+/// come from [`runner_args`]. With `pi` they are exactly the ones [`agent_args`] builds. A runner whose program is
+/// missing, or that cannot start as asked, falls back to the login shell with a notice.
+pub fn pane_launch_for_runner(
+    space: &Space,
+    role: &PaneRole,
+    agent: &AgentStart,
+    session: &AgentSession,
+    search: &ProgramSearch,
+    runner: Option<&RunnerManifest>,
+) -> PaneLaunch {
+    let mut stdin = None;
+    let mut session_named = false;
+    let mut runner_env: Vec<(String, String)> = Vec::new();
     let (program, args, notice) = match role.kind {
         PaneKind::Shell => (None, Vec::new(), None),
-        // Plugin panes get their renderer or command in Milestone 5, Wave 3; until then one opens a shell in
-        // its repo, so a layout saved with one still starts.
+        // A plugin pane's own command is chosen by the plugin (see `plugin_pane_launch`); without one it opens a
+        // shell in its repo.
         PaneKind::Plugin => (None, Vec::new(), None),
-        PaneKind::Agent => match search.find(AGENT_PROGRAM) {
-            Some(pi) => (Some(pi), agent_args(agent, session), None),
-            None => (
-                None,
-                Vec::new(),
-                Some(format!(
-                    "{AGENT_PROGRAM} was not found on PATH, in ~/.pi/agent/bin, /opt/homebrew/bin or \
-                     /usr/local/bin; opened a shell for the {} agent instead",
-                    role.repo
-                )),
-            ),
+        PaneKind::Agent => match runner.or(pi_runner()) {
+            Some(runner) => match find_runner_program(search, &runner.program) {
+                Some(path) => match runner_args(runner, agent, session) {
+                    Ok((args, named)) => {
+                        session_named = named;
+                        stdin = stdin_task(runner, &runner_start(agent)).map(str::to_owned);
+                        runner_env = runner
+                            .env
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        (Some(path), args, None)
+                    }
+                    Err(e) => (
+                        None,
+                        Vec::new(),
+                        Some(format!(
+                            "{e}; opened a shell for the {} agent instead",
+                            role.repo
+                        )),
+                    ),
+                },
+                None => (
+                    None,
+                    Vec::new(),
+                    Some(format!(
+                        "{} was not found on PATH, in ~/.pi/agent/bin, /opt/homebrew/bin or \
+                         /usr/local/bin; opened a shell for the {} agent instead",
+                        runner.program, role.repo
+                    )),
+                ),
+            },
+            None => match search.find(AGENT_PROGRAM) {
+                Some(pi) => {
+                    session_named = !matches!(session, AgentSession::Unnamed);
+                    (Some(pi), agent_args(agent, session), None)
+                }
+                None => (
+                    None,
+                    Vec::new(),
+                    Some(format!(
+                        "{AGENT_PROGRAM} was not found on PATH, in ~/.pi/agent/bin, /opt/homebrew/bin or \
+                         /usr/local/bin; opened a shell for the {} agent instead",
+                        role.repo
+                    )),
+                ),
+            },
         },
         PaneKind::Git => match search.find(GIT_PROGRAM) {
             Some(lazygit) => (Some(lazygit), Vec::new(), None),
@@ -452,6 +591,9 @@ pub fn pane_launch_with(
     if let Some(worktree) = pane_worktree(space, role) {
         config = config.cwd(worktree);
     }
+    for (key, value) in runner_env {
+        config = config.env(key, value);
+    }
     for (key, value) in space.env() {
         config = config.env(key, value);
     }
@@ -470,7 +612,44 @@ pub fn pane_launch_with(
         );
     }
     config = config.env("PATH", search.pane_path(program.as_deref()));
-    PaneLaunch { config, notice }
+    PaneLaunch {
+        config,
+        notice,
+        stdin,
+        session_named,
+    }
+}
+
+/// The config that starts terminal plugin pane `role` in `space`, running `argv` (the plugin's command, no shell)
+/// in the repo's worktree with the space's environment, as [`pane_launch`] sets it up for a shell; `None` runs
+/// the login shell. A program that cannot be found falls back to the login shell with a notice.
+pub fn plugin_pane_launch(
+    space: &Space,
+    role: &PaneRole,
+    argv: Option<&[String]>,
+    search: &ProgramSearch,
+) -> PaneLaunch {
+    let mut launch = pane_launch(space, role, &AgentStart::Fresh, search);
+    let Some((program, args)) = argv.and_then(<[String]>::split_first) else {
+        return launch;
+    };
+    match find_runner_program(search, program) {
+        Some(path) => {
+            launch.config.program = path.to_string_lossy().into_owned();
+            launch.config.args = args.to_vec();
+            launch
+                .config
+                .env
+                .insert("PATH".to_owned(), search.pane_path(Some(&path)));
+        }
+        None => {
+            launch.notice = Some(format!(
+                "{program} was not found; opened a shell for the {} plugin instead",
+                role.plugin.as_deref().unwrap_or("plugin")
+            ));
+        }
+    }
+    launch
 }
 
 /// What an attempt's agent pane runs: which attempt, where, as which agent and in which session.
@@ -500,13 +679,24 @@ pub struct AttemptPane {
 /// The config that starts an attempt's agent: as [`pane_launch_with`] for an agent in the attempt's repo, but run
 /// in the attempt's worktree with its own `PORT`, scratch directory, [`ATTEMPT_ID_ENV`] and [`ATTEMPT_TOKEN_ENV`],
 /// as its own agent. Its instruction is the first message only when the session is being forked.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn attempt_launch(space: &Space, attempt: &AttemptPane, search: &ProgramSearch) -> PaneLaunch {
+    attempt_launch_for_runner(space, attempt, search, None)
+}
+
+/// [`attempt_launch`] with the attempt's agent running `runner` (the writer's; `pi` when `None`).
+pub fn attempt_launch_for_runner(
+    space: &Space,
+    attempt: &AttemptPane,
+    search: &ProgramSearch,
+    runner: Option<&RunnerManifest>,
+) -> PaneLaunch {
     let role = PaneRole::new(PaneKind::Agent, attempt.repo.clone());
     let start = match (&attempt.session, &attempt.instruction) {
         (AgentSession::Fork { .. }, Some(instruction)) => AgentStart::Task(instruction.clone()),
         _ => AgentStart::Fresh,
     };
-    let mut launch = pane_launch_with(space, &role, &start, &attempt.session, search)
+    let mut launch = pane_launch_for_runner(space, &role, &start, &attempt.session, search, runner)
         .with_agent(Some(&attempt.agent));
     launch.config = launch
         .config
@@ -788,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_pane_opens_a_shell_in_its_repo_until_plugins_are_wired() -> TestResult {
+    fn a_plugin_pane_without_a_command_opens_a_shell_in_its_repo() -> TestResult {
         let root = tempfile::tempdir()?;
         executable(&root.path().join("bin/lazygit"))?;
         let space = space(root.path());
@@ -1100,6 +1290,102 @@ mod tests {
         assert_eq!(env(&shell, AGENT_ID_ENV), Some(""));
         assert_eq!(env(&shell, AGENT_ROLE_ENV), Some(""));
         assert_eq!(env(&shell, SCRATCH_DIR_ENV), scratch);
+        Ok(())
+    }
+
+    #[test]
+    fn the_pi_runner_builds_exactly_the_arguments_agents_always_had() -> TestResult {
+        let pi = pi_runner().ok_or("the built-in pi runner did not load")?;
+        let starts = [
+            AgentStart::Task("fix it".into()),
+            AgentStart::Continue,
+            AgentStart::Fresh,
+        ];
+        let sessions = [
+            AgentSession::Unnamed,
+            AgentSession::Open("xctx-s-writer-api".into()),
+            AgentSession::Fork {
+                source: "/sessions/a.jsonl".into(),
+                id: "xctx-s-writer-api-attempt-1".into(),
+            },
+        ];
+        for start in &starts {
+            for session in &sessions {
+                let (args, named) = runner_args(pi, start, session)?;
+                assert_eq!(args, agent_args(start, session), "{start:?} {session:?}");
+                assert_eq!(named, !matches!(session, AgentSession::Unnamed));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_runner_without_sessions_runs_unnamed_and_reads_its_task() -> TestResult {
+        let root = tempfile::tempdir()?;
+        executable(&root.path().join("bin/claude"))?;
+        executable(&root.path().join("bin/reader"))?;
+        let registry = xctx_plugin::RunnerRegistry::with_builtins();
+        let claude = &registry.get("claude").ok_or("no claude")?.manifest;
+        assert!(!claude.can_fork());
+        let space = space(root.path());
+        let launch = pane_launch_for_runner(
+            &space,
+            &role(PaneKind::Agent, "api"),
+            &AgentStart::Task("fix it".into()),
+            &AgentSession::Open("xctx-fix-retry-writer-api".into()),
+            &search(root.path()),
+            Some(claude),
+        );
+        assert_eq!(launch.notice, None);
+        assert!(launch.config.program.ends_with("bin/claude"));
+        assert_eq!(launch.config.args, ["--", "fix it"]);
+        assert!(!launch.session_named);
+        let resumed = pane_launch_for_runner(
+            &space,
+            &role(PaneKind::Agent, "api"),
+            &AgentStart::Continue,
+            &AgentSession::Open("xctx-fix-retry-writer-api".into()),
+            &search(root.path()),
+            Some(claude),
+        );
+        assert_eq!(resumed.config.args, ["--continue"]);
+
+        let stdin_runner = RunnerManifest::parse(
+            "name = \"reader\"\ndescription = \"reads\"\nprogram = \"reader\"\ntask = { style = \"stdin\" }\n[env]\nREADER_MODE = \"agent\"\n",
+            "test",
+        )?;
+        let launch = pane_launch_for_runner(
+            &space,
+            &role(PaneKind::Agent, "api"),
+            &AgentStart::Task("fix it".into()),
+            &AgentSession::Unnamed,
+            &search(root.path()),
+            Some(&stdin_runner),
+        );
+        assert!(launch.config.args.is_empty());
+        assert_eq!(launch.stdin.as_deref(), Some("fix it"));
+        assert_eq!(env(&launch, "READER_MODE"), Some("agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_plugin_runs_its_command_without_a_shell() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let lazydocker = root.path().join("bin/lazydocker");
+        executable(&lazydocker)?;
+        let space = space(root.path());
+        let role = PaneRole::for_plugin("docker", "web");
+        let argv = vec!["lazydocker".to_owned(), "--debug".to_owned()];
+        let launch = plugin_pane_launch(&space, &role, Some(&argv), &search(root.path()));
+        assert_eq!(launch.config.program, lazydocker.to_string_lossy());
+        assert_eq!(launch.config.args, ["--debug"]);
+        assert_space_env(&launch, &space.repos[1].worktree);
+        let missing = vec!["k9s".to_owned()];
+        let fallback = plugin_pane_launch(&space, &role, Some(&missing), &search(root.path()));
+        assert_eq!(fallback.config.program, "/bin/fish");
+        assert!(fallback.notice.is_some_and(|n| n.contains("k9s")));
+        let shell = plugin_pane_launch(&space, &role, None, &search(root.path()));
+        assert_eq!(shell.config.args, ["-l"]);
         Ok(())
     }
 }

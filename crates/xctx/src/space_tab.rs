@@ -23,7 +23,7 @@ use crate::persist::{restore_layout, save_layout};
 use crate::space_graph::{scratch_dir_for, writer_panes};
 use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
 use crate::spawn::{
-    AgentStart, pane_launch_with, restore_agent_starts, runs_pi, split_agent_start,
+    AgentStart, pane_launch_for_runner, restore_agent_starts, runs_pi, split_agent_start,
 };
 use crate::workspace::{View, Workspace, open_space_refusal, wait_message};
 
@@ -192,6 +192,13 @@ impl Workspace {
         self.tabs
             .insert(id.clone(), SpaceTab::new(space.clone(), restored.layout));
         self.sync_agent_panes(id);
+        if let Err(e) = self.plugins.reconcile(id, &panes) {
+            self.error(
+                format!("could not read the plugins mounted in {id}: {e}"),
+                cx,
+            );
+        }
+        self.show_plugin_problems(&space, cx);
         let preferred = self
             .graphs
             .get(id)
@@ -238,6 +245,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if pane.role.kind == PaneKind::Plugin {
+            self.start_plugin_pane(id, pane, window, cx);
+            return;
+        }
         let agent = self.pane_agent_of(id, pane);
         let session = match self.pane_session_of(id, pane, start) {
             Ok(session) => session,
@@ -256,11 +267,25 @@ impl Workspace {
             // Best effort: agents may write there with their own tools, which need the directory.
             let _ = std::fs::create_dir_all(scratch.root());
         }
-        let launch = pane_launch_with(&tab.space, &pane.role, start, &session, &self.search)
-            .with_agent(agent.as_ref());
+        let space = tab.space.clone();
+        let (runner, runner_notice) = if pane.role.kind == PaneKind::Agent {
+            self.pane_runner(&space, pane)
+        } else {
+            (None, None)
+        };
+        let launch = pane_launch_for_runner(
+            &space,
+            &pane.role,
+            start,
+            &session,
+            &self.search,
+            runner.as_ref(),
+        )
+        .with_agent(agent.as_ref());
         let program = launch.config.program.clone();
-        let runs_agent = runs_pi(pane.role.kind, &launch, true);
-        let notice = launch.notice;
+        let runs_agent = runs_pi(pane.role.kind, &launch, true) && launch.session_named;
+        let notice = launch.notice.or(runner_notice);
+        let stdin = launch.stdin;
         let spawned = TerminalView::spawn(
             launch.config,
             self.terminal_font.clone(),
@@ -272,6 +297,13 @@ impl Workspace {
             // Only now that pi itself runs it: a shell fallback or a failed start must not take the old session's
             // place on the agent.
             self.record_pane_session(id, pane, &session);
+        }
+        if let (Ok(view), Some(task)) = (&spawned, &stdin) {
+            // A runner that reads its task on standard input gets it typed in once it started.
+            let _ = view
+                .read(cx)
+                .session()
+                .write(format!("{task}\r").as_bytes());
         }
         let terminal = match spawned {
             Ok(view) => {
@@ -305,7 +337,7 @@ impl Workspace {
         }
     }
 
-    fn on_terminal_event(
+    pub(crate) fn on_terminal_event(
         &mut self,
         id: &SpaceId,
         pane: PaneId,
@@ -447,7 +479,12 @@ impl Workspace {
 
     /// After a layout change in `id`: save it, focus its focused pane if it may (see
     /// [`Workspace::may_focus_pane_of`]), and redraw.
-    fn layout_changed(&mut self, id: &SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn layout_changed(
+        &mut self,
+        id: &SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.persist(id, cx);
         if self.may_focus_pane_of(id) {
             self.focus_active_pane(window, cx);
@@ -521,7 +558,7 @@ impl Workspace {
     }
 
     /// The open tab of `id`, or an error saying the space is not open.
-    fn open_tab_mut(&mut self, id: &SpaceId) -> Result<&mut SpaceTab, RpcError> {
+    pub(crate) fn open_tab_mut(&mut self, id: &SpaceId) -> Result<&mut SpaceTab, RpcError> {
         self.tabs
             .get_mut(id)
             .ok_or_else(|| RpcError::conflict(format!("space {id} is not open")))
@@ -558,8 +595,15 @@ impl Workspace {
                 "This is the space's last pane; Discard or Ship the space to close it, or ⌘⇧W to close the window",
             ));
         }
+        let was_plugin = tab
+            .layout
+            .role(pane)
+            .is_some_and(|r| r.kind == PaneKind::Plugin);
         tab.layout.close(pane).map_err(|e| layout_error(id, e))?;
         tab.terminals.remove(&pane);
+        if was_plugin {
+            self.plugin_pane_closed(id, pane, cx);
+        }
         self.sync_agent_panes(id);
         self.layout_changed(id, window, cx);
         Ok(())
@@ -777,6 +821,7 @@ impl Workspace {
         if self.tabs.contains_key(id) {
             self.persist(id, cx);
         }
+        self.stop_space_plugins(id, cx);
         let sessions = self
             .tabs
             .remove(id)
@@ -837,6 +882,17 @@ impl Workspace {
                         .text_size(Theme::TEXT_SM)
                         .text_color(theme.danger)
                         .child(message.clone())
+                        .into_any_element(),
+                    // Plugin panes drawn by a first-party renderer have no terminal.
+                    None if pane.role.kind == PaneKind::Plugin => div()
+                        .size_full()
+                        .p(Theme::SPACE_3)
+                        .text_size(Theme::TEXT_SM)
+                        .text_color(theme.text_subtle)
+                        .child(format!(
+                            "{} plugin",
+                            pane.role.plugin.as_deref().unwrap_or("unknown")
+                        ))
                         .into_any_element(),
                     None => div()
                         .size_full()

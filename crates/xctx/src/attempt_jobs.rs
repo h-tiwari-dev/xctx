@@ -31,7 +31,7 @@ use crate::attempts::{
 };
 use crate::space_graph::{agent_role_name, graph_error, scratch_dir_for};
 use crate::space_tab::PaneTerminal;
-use crate::spawn::{AgentStart, AttemptPane, PaneAgent, attempt_launch, pane_worktree};
+use crate::spawn::{AgentStart, AttemptPane, PaneAgent, attempt_launch_for_runner, pane_worktree};
 use crate::workspace::{Workspace, in_flight_message, wait_message};
 
 /// How long a stopped attempt's agent gets to exit before its worktree is removed.
@@ -435,7 +435,11 @@ impl Workspace {
             instruction: attempt.instruction.clone(),
             scratch,
         };
-        let launch = attempt_launch(&space, &pane, &self.search);
+        let runner = self
+            .lane_runner(&space, &AgentNodeId::new(attempt.agent.clone()))
+            .ok()
+            .flatten();
+        let launch = attempt_launch_for_runner(&space, &pane, &self.search, runner.as_ref());
         let program = launch.config.program.clone();
         let terminal = match TerminalView::spawn(
             launch.config,
@@ -680,6 +684,9 @@ impl Workspace {
                 ));
             }
         };
+        if let Some(why) = self.fork_refusal(&space, agent) {
+            return Err(why);
+        }
         let worktree = space
             .repos
             .iter()
