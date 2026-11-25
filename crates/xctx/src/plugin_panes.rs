@@ -51,6 +51,10 @@ pub const LOGS_NOT_TAILING: &str = "This pane tails nothing: mount it with a com
 /// What a plugin pane says when it has no mount or its plugin cannot be used.
 pub const NO_MOUNT: &str = "This plugin pane has no mount, or its plugin is not installed or trusted. Close it (⌘W) and mount the plugin again from the Plugins menu (⌘⇧P).";
 
+/// What a space's second browser pane says: the space has one live page, shown in its first browser pane.
+pub const ONE_PAGE_PER_SPACE: &str =
+    "This space's live page is shown in its other browser pane. Close this one (⌘W) to keep one.";
+
 /// The kinds of plugin pane drawn by a first-party renderer (terminal plugins run in a terminal).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RendererKind {
@@ -1222,11 +1226,30 @@ impl Workspace {
             PaneState::Logs(ui) => render_logs(ui, &ws, &key).into_any_element(),
             PaneState::Sql(ui) => render_sql(ui, &ws, &key).into_any_element(),
             PaneState::Web(ui) => {
-                // A dialog draws over the pane, and the page would draw over the dialog: hide it then.
-                let page = self
-                    .browsers
-                    .view(id)
-                    .map(|view| page_area(view, self.dialog.is_none()));
+                // One live page per space: it shows in the space's first browser pane; the others say so.
+                let first = self
+                    .plugin_panes
+                    .panes
+                    .iter()
+                    .filter(|((s, _), p)| s == id && matches!(p.state, PaneState::Web(_)))
+                    .map(|((_, p), _)| *p)
+                    .min_by_key(|p| p.0);
+                let page = if first == Some(pane) {
+                    // A dialog draws over the pane, and the page would draw over the dialog: hide it then.
+                    self.browsers
+                        .view(id)
+                        .map(|view| page_area(view, self.dialog.is_none()))
+                } else {
+                    let theme = Theme::of(cx);
+                    Some(
+                        div()
+                            .m_auto()
+                            .text_size(Theme::TEXT_XS)
+                            .text_color(theme.text_subtle)
+                            .child(ONE_PAGE_PER_SPACE)
+                            .into_any_element(),
+                    )
+                };
                 render_web(ui, page, &ws, &key).into_any_element()
             }
             PaneState::Files(ui) => render_files(ui, &ws, &key).into_any_element(),

@@ -307,9 +307,22 @@ async fn run_page(
 ) -> Result<CallOutput, String> {
     match action {
         PageAction::Open { url } => {
+            let document = |u: &str| u.split('#').next().unwrap_or(u).to_owned();
+            let same_document = view
+                .url()
+                .is_some_and(|now| document(&now) == document(&url) && now != url);
             let settled = view.next_settle();
             view.load(&url).map_err(|e| e.to_string())?;
-            load(executor, settled).await?;
+            if same_document {
+                // Only the #fragment changes: WebKit scrolls within the page and reports no load.
+                executor.timer(ACTION_SETTLE).await;
+            } else {
+                load(executor, settled).await?;
+            }
+            if view.url().as_deref() == Some("about:blank") {
+                // WebKit answers a blocked load (a restricted port, say) with a blank page and no error.
+                return Err(format!("{url} could not be loaded: WebKit refused it"));
+            }
             let url = current(view, env)?;
             Ok(page_output(&reading(view, url), false, "opened", redactor))
         }
