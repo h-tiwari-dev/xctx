@@ -48,7 +48,7 @@ actions!(
         ToggleGraph,
         /// Show Home.
         ShowHome,
-        /// Launch the draft shown on Home.
+        /// Launch the Parent Agent's draft shown on Home.
         LaunchDraft,
         /// Close the open dialog.
         DismissDialog,
@@ -129,7 +129,6 @@ pub fn space_key_hints(fork: bool) -> Vec<KeyHint> {
 /// The hints shown on Home.
 pub fn home_key_hints() -> Vec<KeyHint> {
     vec![
-        KeyHint::new("⏎", "draft"),
         KeyHint::new("⌘⏎", "launch"),
         KeyHint::new("⌘1-9", "spaces"),
         KeyHint::new("⌘Q", "quit"),

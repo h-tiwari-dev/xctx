@@ -369,8 +369,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show Plan Gate `id` under the Parent Agent on Home, unless another pending plan is already shown there
+    /// (that one stays; the new one waits in the Inbox). Returns whether `id` is the one shown.
+    pub(crate) fn offer_plan(&mut self, id: ItemId) -> bool {
+        if self.reviewed_plan().is_some_and(|item| item.id != id) {
+            return false;
+        }
+        self.plan_review = Some(id);
+        true
+    }
+
     /// The Plan Gate under review, while it is still pending.
-    fn reviewed_plan(&self) -> Option<&InboxItem> {
+    pub(crate) fn reviewed_plan(&self) -> Option<&InboxItem> {
         let id = self.plan_review.as_ref()?;
         self.inbox
             .as_ref()?
@@ -410,7 +420,7 @@ impl Workspace {
 
     /// Approve the plan being reviewed: launch it, and mark it approved once the space exists. Does nothing while
     /// a plan launches, and refuses a plan launched already (see [`PlanLaunches`]).
-    fn approve_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn approve_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.plan_launches.is_launching() {
             return;
         }
@@ -648,52 +658,52 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Home's Inbox section: the plan under review, the Set value input, and the entries.
+    /// The Plan Gate under review, drawn under the Parent Agent on Home so its draft is launched where it was
+    /// asked for (⌘↵ or Launch); `None` while no plan is under review.
+    pub(crate) fn render_plan_review(&self, cx: &mut Context<Self>) -> Option<PlanGateCard> {
+        let view = plan_view(self.reviewed_plan()?, &self.redactor)?;
+        let entity = cx.entity().downgrade();
+        let (shape, drop, approve, reject, later) = (
+            entity.clone(),
+            entity.clone(),
+            entity.clone(),
+            entity.clone(),
+            entity,
+        );
+        Some(
+            PlanGateCard::new(view)
+                .busy(self.plan_launches.is_launching() || self.busy.is_some())
+                .add_repo(div().pt(Theme::SPACE_1).child(self.plan_repo_input.clone()))
+                .on_shape(move |s: Shape, _, cx| {
+                    let _ = shape.update(cx, |this, cx| {
+                        this.edit_reviewed_plan(cx, |draft| draft.shape = space_shape(s));
+                    });
+                })
+                .on_drop_repo(move |path, _, cx| {
+                    let path = path.to_string();
+                    let _ = drop.update(cx, |this, cx| {
+                        this.edit_reviewed_plan(cx, |draft| drop_repo_by_display(draft, &path));
+                    });
+                })
+                .on_approve(move |window, cx| {
+                    let _ = approve.update(cx, |this, cx| this.approve_plan(window, cx));
+                })
+                .on_reject(move |_, cx| {
+                    let _ = reject.update(cx, |this, cx| this.reject_plan(cx));
+                })
+                .on_close(move |_, cx| {
+                    let _ = later.update(cx, |this, cx| {
+                        this.plan_review = None;
+                        cx.notify();
+                    });
+                }),
+        )
+    }
+
+    /// Home's Inbox section: the Set value input and the entries.
     pub(crate) fn render_inbox(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::of(cx);
         let mut section = div().flex().flex_col().gap(Theme::SPACE_3);
-
-        if let Some(view) = self
-            .reviewed_plan()
-            .and_then(|item| plan_view(item, &self.redactor))
-        {
-            let entity = cx.entity().downgrade();
-            let (shape, drop, approve, reject, later) = (
-                entity.clone(),
-                entity.clone(),
-                entity.clone(),
-                entity.clone(),
-                entity,
-            );
-            section = section.child(
-                PlanGateCard::new(view)
-                    .busy(self.plan_launches.is_launching() || self.busy.is_some())
-                    .add_repo(div().pt(Theme::SPACE_1).child(self.plan_repo_input.clone()))
-                    .on_shape(move |s: Shape, _, cx| {
-                        let _ = shape.update(cx, |this, cx| {
-                            this.edit_reviewed_plan(cx, |draft| draft.shape = space_shape(s));
-                        });
-                    })
-                    .on_drop_repo(move |path, _, cx| {
-                        let path = path.to_string();
-                        let _ = drop.update(cx, |this, cx| {
-                            this.edit_reviewed_plan(cx, |draft| drop_repo_by_display(draft, &path));
-                        });
-                    })
-                    .on_approve(move |window, cx| {
-                        let _ = approve.update(cx, |this, cx| this.approve_plan(window, cx));
-                    })
-                    .on_reject(move |_, cx| {
-                        let _ = reject.update(cx, |this, cx| this.reject_plan(cx));
-                    })
-                    .on_close(move |_, cx| {
-                        let _ = later.update(cx, |this, cx| {
-                            this.plan_review = None;
-                            cx.notify();
-                        });
-                    }),
-            );
-        }
 
         if let Some(prompt) = &self.env_prompt {
             let file = mise::mise_file_name(prompt.space.as_str());

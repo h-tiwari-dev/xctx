@@ -18,9 +18,9 @@
 //! elements, and no shell is involved, so a session id or path can never become extra arguments.
 //!
 //! A runner can fork when it has `fork_session`; attempts (Milestone 4) are only offered for such runners. The
-//! built-in runners ([`BUILTIN_RUNNERS`]) are `pi`, the default, whose arguments are exactly the ones xctx built
-//! for pi before runners existed, and `claude`, which cannot name or fork sessions. User runners are loaded from
-//! `<dir>/<name>/runner.toml` by [`RunnerRegistry::add_user_dir`].
+//! built-in runners ([`BUILTIN_RUNNERS`]) are `omp`, the default, which cannot name or fork sessions; `pi`, whose
+//! arguments are exactly the ones xctx built for pi before runners existed and which can; and `claude`, which
+//! cannot. User runners are loaded from `<dir>/<name>/runner.toml` by [`RunnerRegistry::add_user_dir`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,10 +36,11 @@ use crate::template::{self, Piece};
 pub const RUNNER_FILE: &str = "runner.toml";
 
 /// The runner agent panes use unless a space or lane picks another.
-pub const DEFAULT_RUNNER: &str = "pi";
+pub const DEFAULT_RUNNER: &str = "omp";
 
 /// The built-in runner manifests as `(name, TOML text)`, the default first.
 pub const BUILTIN_RUNNERS: &[(&str, &str)] = &[
+    ("omp", include_str!("builtin/runners/omp.toml")),
     ("pi", include_str!("builtin/runners/pi.toml")),
     ("claude", include_str!("builtin/runners/claude.toml")),
 ];
@@ -865,42 +866,45 @@ mod tests {
     }
 
     #[test]
-    fn a_runner_without_sessions_cannot_fork_or_open() -> TestResult {
-        let claude = builtin("claude")?;
-        assert!(!claude.can_fork() && !claude.can_open());
-        assert!(claude.can_resume() && claude.takes_task());
-        let task = RunnerStart::Task("fix it".into());
-        assert_eq!(
-            args(&claude, &task, &RunnerSession::Unnamed),
-            ["--", "fix it"]
-        );
-        assert_eq!(
-            args(&claude, &RunnerStart::Continue, &RunnerSession::Unnamed),
-            ["--continue"]
-        );
-        let fork = build_args(
-            &claude,
-            &RunnerStart::Fresh,
-            &RunnerSession::Fork {
-                source: "a".into(),
-                id: "b".into(),
-            },
-        );
-        match fork {
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "runner claude cannot fork sessions, so attempts are not available"
-            ),
-            Ok(a) => panic!("forked: {a:?}"),
+    fn runners_without_sessions_cannot_fork_or_open() -> TestResult {
+        for name in ["omp", "claude"] {
+            let runner = builtin(name)?;
+            assert_eq!(runner.program, name);
+            assert!(!runner.can_fork() && !runner.can_open());
+            assert!(runner.can_resume() && runner.takes_task());
+            let task = RunnerStart::Task("fix it".into());
+            assert_eq!(
+                args(&runner, &task, &RunnerSession::Unnamed),
+                ["--", "fix it"]
+            );
+            assert_eq!(
+                args(&runner, &RunnerStart::Continue, &RunnerSession::Unnamed),
+                ["--continue"]
+            );
+            let fork = build_args(
+                &runner,
+                &RunnerStart::Fresh,
+                &RunnerSession::Fork {
+                    source: "a".into(),
+                    id: "b".into(),
+                },
+            );
+            match fork {
+                Err(e) => assert_eq!(
+                    e.to_string(),
+                    format!("runner {name} cannot fork sessions, so attempts are not available")
+                ),
+                Ok(a) => panic!("forked: {a:?}"),
+            }
+            let open = build_args(&runner, &task, &RunnerSession::Open("a".into()));
+            assert!(matches!(
+                open,
+                Err(RunnerError::Unsupported {
+                    capability: Capability::OpenSession,
+                    ..
+                })
+            ));
         }
-        let open = build_args(&claude, &task, &RunnerSession::Open("a".into()));
-        assert!(matches!(
-            open,
-            Err(RunnerError::Unsupported {
-                capability: Capability::OpenSession,
-                ..
-            })
-        ));
         Ok(())
     }
 
@@ -1077,12 +1081,12 @@ AGENT_MODE = "xctx"
 
         let mut registry = RunnerRegistry::with_builtins();
         assert!(registry.problems().is_empty());
-        assert_eq!(registry.default_runner().map(Runner::name), Some("pi"));
+        assert_eq!(registry.default_runner().map(Runner::name), Some("omp"));
         registry.add_user_dir(runners);
         registry.add_user_dir(&runners.join("missing"));
 
         let names: Vec<&str> = registry.runners().iter().map(Runner::name).collect();
-        assert_eq!(names, ["pi", "claude", "codex"]);
+        assert_eq!(names, ["omp", "pi", "claude", "codex"]);
         assert_eq!(
             registry.get("codex").map(|r| &r.source),
             Some(&Source::User { path: codex })
@@ -1125,7 +1129,7 @@ AGENT_MODE = "xctx"
             "name = \"codex\"\nprogram = \"codex2\"\ntask = { style = \"none\" }\n",
         )?;
         registry.add_user_dir(more.path());
-        assert_eq!(registry.runners().len(), 3);
+        assert_eq!(registry.runners().len(), 4);
         assert!(registry.problems().iter().any(|p| matches!(
             &p.error,
             RunnerError::Clash { name, .. } if name == "codex"

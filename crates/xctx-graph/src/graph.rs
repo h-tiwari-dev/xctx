@@ -158,8 +158,9 @@ pub struct AgentNode {
     /// whose pane has not started under an xctx-chosen id yet (agents from before Milestone 4, or new ones).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// The agent runner this agent's pane runs (a runner manifest's name, such as `pi` or `claude`), when one was
-    /// chosen for this lane; `None` uses the space's runner ([`crate::SpaceGraphDocument::runner`]), else `pi`.
+    /// The agent runner this agent's pane runs (a runner manifest's name, such as `omp`, `pi` or `claude`), when one
+    /// was chosen for this lane; `None` uses the space's runner ([`crate::SpaceGraphDocument::runner`]), else the
+    /// default, `omp`.
     /// Absent from the JSON when `None`, so graphs saved before runners existed load and save unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<String>,

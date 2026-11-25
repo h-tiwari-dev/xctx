@@ -18,6 +18,7 @@ use xctx_term::TerminalSession;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
 use xctx_ui::{PaneView, SharedTab, SplitView, Theme, pane_kind_label};
 
+use crate::agent_session::AgentSession;
 use crate::lifecycle::reshape_space;
 use crate::persist::{restore_layout, save_layout};
 use crate::space_graph::{scratch_dir_for, writer_panes};
@@ -47,6 +48,9 @@ pub(crate) enum PaneTerminal {
         view: Entity<TerminalView>,
         title: Option<String>,
         exited: Option<Option<i32>>,
+        /// Whether this is the login shell opened in an agent pane after its agent exited on its own (see
+        /// [`Workspace::open_shell_after_agent`]), rather than the pane's own program.
+        after_agent: bool,
         _subscription: Subscription,
     },
     /// The program could not be started.
@@ -98,12 +102,19 @@ impl SpaceTab {
 }
 
 impl SpaceTab {
-    /// Whether any agent pane's program is still running.
+    /// Whether any agent pane's agent is still running; the shell opened after an agent exited does not count.
     pub(crate) fn agent_running(&self, cx: &App) -> bool {
         self.layout.agent_panes().iter().any(|pane| {
-            self.terminals
-                .get(pane)
-                .is_some_and(|terminal| terminal.is_alive(cx))
+            self.terminals.get(pane).is_some_and(|terminal| {
+                terminal.is_alive(cx)
+                    && !matches!(
+                        terminal,
+                        PaneTerminal::Running {
+                            after_agent: true,
+                            ..
+                        }
+                    )
+            })
         })
     }
 }
@@ -311,23 +322,7 @@ impl Workspace {
                 .write(crate::spawn::typed_task(task).as_bytes());
         }
         let terminal = match spawned {
-            Ok(view) => {
-                let space_id = id.clone();
-                let pane_id = pane.id;
-                let subscription = cx.subscribe_in(
-                    &view,
-                    window,
-                    move |this, _view, event: &TerminalViewEvent, window, cx| {
-                        this.on_terminal_event(&space_id, pane_id, event, window, cx);
-                    },
-                );
-                PaneTerminal::Running {
-                    view,
-                    title: None,
-                    exited: None,
-                    _subscription: subscription,
-                }
-            }
+            Ok(view) => self.running_terminal(id, pane.id, view, false, window, cx),
             Err(e) => {
                 let message = format!("could not start {program} for {}: {e}", pane.role.repo);
                 self.error(message.clone(), cx);
@@ -342,12 +337,103 @@ impl Workspace {
         }
     }
 
+    /// `view`, running in `pane` of space `id`, as a pane terminal whose events reach
+    /// [`Workspace::on_terminal_event`]. `after_agent` marks the shell opened after the pane's agent exited.
+    fn running_terminal(
+        &mut self,
+        id: &SpaceId,
+        pane: PaneId,
+        view: Entity<TerminalView>,
+        after_agent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PaneTerminal {
+        let space_id = id.clone();
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            move |this, _view, event: &TerminalViewEvent, window, cx| {
+                this.on_terminal_event(&space_id, pane, event, window, cx);
+            },
+        );
+        PaneTerminal::Running {
+            view,
+            title: None,
+            exited: None,
+            after_agent,
+            _subscription: subscription,
+        }
+    }
+
+    /// Open the login shell in agent pane `pane` of space `id` in place of its agent, which exited on its own with
+    /// `code`: the pane keeps a usable terminal in its repo's worktree, with the space's environment but not the
+    /// agent's identity. The pane's role stays an agent, so the agent starts again the next time the space opens.
+    /// When the shell cannot start, the exited agent's screen stays.
+    pub(crate) fn open_shell_after_agent(
+        &mut self,
+        id: &SpaceId,
+        pane: PaneId,
+        code: Option<i32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(id) else {
+            return;
+        };
+        let Some(repo) = tab.layout.role(pane).map(|role| role.repo.clone()) else {
+            return;
+        };
+        let role = PaneRole::new(PaneKind::Shell, repo.clone());
+        let launch = pane_launch_for_runner(
+            &tab.space,
+            &role,
+            &AgentStart::Fresh,
+            &AgentSession::Unnamed,
+            &self.search,
+            None,
+        );
+        let spawned = TerminalView::spawn(
+            launch.config,
+            self.terminal_font.clone(),
+            self.terminal_theme,
+            window,
+            cx,
+        );
+        let view = match spawned {
+            Ok(view) => view,
+            Err(e) => {
+                self.error(
+                    format!(
+                        "the {repo} agent exited, and a shell could not start in its pane: {e}"
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+        let terminal = self.running_terminal(id, pane, view, true, window, cx);
+        let Some(tab) = self.tabs.get_mut(id) else {
+            return;
+        };
+        tab.terminals.insert(pane, terminal);
+        let focused = tab.layout.focused() == pane;
+        let exit = code.map_or_else(|| "exited".to_owned(), |c| format!("exited ({c})"));
+        self.info(
+            format!("the {repo} agent {exit}; opened a shell in its pane"),
+            cx,
+        );
+        if focused && self.may_focus_pane_of(id) {
+            self.focus_active_pane(window, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn on_terminal_event(
         &mut self,
         id: &SpaceId,
         pane: PaneId,
         event: &TerminalViewEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(tab) = self.tabs.get_mut(id) else {
@@ -360,8 +446,27 @@ impl Workspace {
                 }
             }
             TerminalViewEvent::Exited(code) => {
-                if let Some(PaneTerminal::Running { exited, .. }) = tab.terminals.get_mut(&pane) {
+                let is_agent = tab
+                    .layout
+                    .role(pane)
+                    .is_some_and(|role| role.kind == PaneKind::Agent);
+                // An agent xctx stopped (to adopt an attempt, say) is started again by whoever stopped it; one
+                // that ended on its own leaves a shell behind, as quitting it in a terminal would.
+                let mut reopen = false;
+                if let Some(PaneTerminal::Running {
+                    view,
+                    exited,
+                    after_agent,
+                    ..
+                }) = tab.terminals.get_mut(&pane)
+                {
                     *exited = Some(*code);
+                    reopen =
+                        is_agent && !*after_agent && !view.read(cx).session().is_shutting_down();
+                }
+                if reopen {
+                    self.open_shell_after_agent(id, pane, *code, window, cx);
+                    return;
                 }
             }
             TerminalViewEvent::Focused => {

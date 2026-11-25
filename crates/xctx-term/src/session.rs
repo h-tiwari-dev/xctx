@@ -193,6 +193,12 @@ impl TerminalSession {
         !self.shared.process().exited
     }
 
+    /// Whether the owner has called [`TerminalSession::shutdown_and_wait`], so an exit is one it asked for rather
+    /// than the program ending on its own.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shared.discard_output.load(Ordering::Acquire)
+    }
+
     /// The program's exit status, once it has exited and the status was collected.
     pub fn exit_status(&self) -> Option<ExitStatus> {
         self.shared.process().status

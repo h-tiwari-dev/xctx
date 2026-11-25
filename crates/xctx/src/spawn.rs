@@ -1,5 +1,6 @@
-//! What runs in each pane of a space: finding `pi`, `lazygit` and the user's shell, and building the
-//! [`TerminalConfig`] that starts them in the right worktree with the space's environment.
+//! What runs in each pane of a space: finding the agent runner's program (`omp` by default), `lazygit` and the
+//! user's shell, and building the [`TerminalConfig`] that starts them in the right worktree with the space's
+//! environment.
 //!
 //! Everything here is decided from a [`ProgramSearch`] rather than the process environment directly, so it can be
 //! tested without touching the user's `PATH` or home directory. The one exception is the scratch directory, which
@@ -15,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use xctx_core::Space;
 use xctx_layout::{PaneId, PaneKind, PaneRole, RolePane};
@@ -24,14 +25,11 @@ use xctx_plugin::{
 };
 use xctx_term::TerminalConfig;
 
-use crate::agent_session::{AgentSession, agent_args};
+use crate::agent_session::AgentSession;
 use crate::space_graph::scratch_dir_for;
 
 /// The shell used when `$SHELL` is unset or empty.
 pub const DEFAULT_SHELL: &str = "/bin/zsh";
-
-/// The agent program.
-pub const AGENT_PROGRAM: &str = "pi";
 
 /// The git program for review panes.
 pub const GIT_PROGRAM: &str = "lazygit";
@@ -401,13 +399,13 @@ pub fn pane_worktree<'a>(space: &'a Space, role: &PaneRole) -> Option<&'a Path> 
         .map(|r| r.worktree.as_path())
 }
 
-/// The config that starts a pane of `role` in `space`: its program (`pi` for agents, `lazygit` for git panes,
-/// the login shell for shells), run in the repo's worktree with the space's `PORT`, `XCTX_SPACE` and
-/// `MISE_ENV`, the space's scratch directory as [`SCRATCH_DIR_ENV`], and `XCTX_CONTROL_SOCKET` when the control
-/// socket is serving. A missing `pi` or `lazygit` falls back to the login shell with a notice. [`AGENT_ID_ENV`],
-/// [`AGENT_ROLE_ENV`] and [`ATTEMPT_ID_ENV`] are set empty, so the agent identity of an xctx this one runs inside
-/// never leaks into its panes; the agent a pane runs as is added with [`PaneLaunch::with_agent`]. The agent runs
-/// no session of xctx's naming; see [`pane_launch_with`].
+/// The config that starts a pane of `role` in `space`: its program (the default runner's, `omp`, for agents,
+/// `lazygit` for git panes, the login shell for shells), run in the repo's worktree with the space's `PORT`,
+/// `XCTX_SPACE` and `MISE_ENV`, the space's scratch directory as [`SCRATCH_DIR_ENV`], and `XCTX_CONTROL_SOCKET`
+/// when the control socket is serving. A missing agent program or `lazygit` falls back to the login shell with a
+/// notice. [`AGENT_ID_ENV`], [`AGENT_ROLE_ENV`] and [`ATTEMPT_ID_ENV`] are set empty, so the agent identity of an
+/// xctx this one runs inside never leaks into its panes; the agent a pane runs as is added with
+/// [`PaneLaunch::with_agent`]. The agent runs no session of xctx's naming; see [`pane_launch_with`].
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn pane_launch(
     space: &Space,
@@ -418,7 +416,8 @@ pub fn pane_launch(
     pane_launch_with(space, role, agent, &AgentSession::Unnamed, search)
 }
 
-/// [`pane_launch`], with an agent pane's `pi` running `session` (see [`agent_args`]).
+/// [`pane_launch`], with an agent pane's default runner running `session` when it can name sessions (see
+/// [`runner_args`]).
 pub fn pane_launch_with(
     space: &Space,
     role: &PaneRole,
@@ -429,15 +428,15 @@ pub fn pane_launch_with(
     pane_launch_for_runner(space, role, agent, session, search, None)
 }
 
-/// The built-in `pi` runner, parsed once; `None` only if the built-in manifest failed to parse.
-pub fn pi_runner() -> Option<&'static RunnerManifest> {
-    static PI: OnceLock<Option<RunnerManifest>> = OnceLock::new();
-    PI.get_or_init(|| {
+/// The built-in default runner ([`xctx_plugin::DEFAULT_RUNNER`]); `None` only if its built-in manifest failed to
+/// parse.
+pub fn default_runner() -> Option<&'static RunnerManifest> {
+    static DEFAULT: LazyLock<Option<RunnerManifest>> = LazyLock::new(|| {
         xctx_plugin::RunnerRegistry::with_builtins()
             .default_runner()
             .map(|r| r.manifest.clone())
-    })
-    .as_ref()
+    });
+    DEFAULT.as_ref()
 }
 
 /// The runner's view of how an agent starts.
@@ -505,9 +504,9 @@ pub fn find_runner_program(search: &ProgramSearch, program: &str) -> Option<Path
     search.find(program)
 }
 
-/// [`pane_launch_with`], an agent pane running `runner` (the built-in `pi` runner when `None`), whose arguments
-/// come from [`runner_args`]. With `pi` they are exactly the ones [`agent_args`] builds. A runner whose program is
-/// missing, or that cannot start as asked, falls back to the login shell with a notice.
+/// [`pane_launch_with`], an agent pane running `runner` (the built-in default runner, `omp`, when `None`), whose
+/// arguments come from [`runner_args`]. A runner whose program is missing, or that cannot start as asked, falls
+/// back to the login shell with a notice.
 pub fn pane_launch_for_runner(
     space: &Space,
     role: &PaneRole,
@@ -524,7 +523,7 @@ pub fn pane_launch_for_runner(
         // A plugin pane's own command is chosen by the plugin (see `plugin_pane_launch`); without one it opens a
         // shell in its repo.
         PaneKind::Plugin => (None, Vec::new(), None),
-        PaneKind::Agent => match runner.or(pi_runner()) {
+        PaneKind::Agent => match runner.or(default_runner()) {
             Some(runner) => match find_runner_program(search, &runner.program) {
                 Some(path) => match runner_args(runner, agent, session) {
                     Ok((args, named)) => {
@@ -550,27 +549,21 @@ pub fn pane_launch_for_runner(
                     None,
                     Vec::new(),
                     Some(format!(
-                        "{} was not found on PATH, in ~/.pi/agent/bin, /opt/homebrew/bin or \
+                        "{} was not found on PATH, in ~/.pi/agent/bin, ~/.local/bin, /opt/homebrew/bin or \
                          /usr/local/bin; opened a shell for the {} agent instead",
                         runner.program, role.repo
                     )),
                 ),
             },
-            None => match search.find(AGENT_PROGRAM) {
-                Some(pi) => {
-                    session_named = !matches!(session, AgentSession::Unnamed);
-                    (Some(pi), agent_args(agent, session), None)
-                }
-                None => (
-                    None,
-                    Vec::new(),
-                    Some(format!(
-                        "{AGENT_PROGRAM} was not found on PATH, in ~/.pi/agent/bin, /opt/homebrew/bin or \
-                         /usr/local/bin; opened a shell for the {} agent instead",
-                        role.repo
-                    )),
-                ),
-            },
+            None => (
+                None,
+                Vec::new(),
+                Some(format!(
+                    "the built-in {} runner did not load; opened a shell for the {} agent instead",
+                    xctx_plugin::DEFAULT_RUNNER,
+                    role.repo
+                )),
+            ),
         },
         PaneKind::Git => match search.find(GIT_PROGRAM) {
             Some(lazygit) => (Some(lazygit), Vec::new(), None),
@@ -687,15 +680,10 @@ pub struct AttemptPane {
     pub scratch: Option<PathBuf>,
 }
 
-/// The config that starts an attempt's agent: as [`pane_launch_with`] for an agent in the attempt's repo, but run
-/// in the attempt's worktree with its own `PORT`, scratch directory, [`ATTEMPT_ID_ENV`] and [`ATTEMPT_TOKEN_ENV`],
-/// as its own agent. Its instruction is the first message only when the session is being forked.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn attempt_launch(space: &Space, attempt: &AttemptPane, search: &ProgramSearch) -> PaneLaunch {
-    attempt_launch_for_runner(space, attempt, search, None)
-}
-
-/// [`attempt_launch`] with the attempt's agent running `runner` (the writer's; `pi` when `None`).
+/// The config that starts an attempt's agent: as [`pane_launch_for_runner`] for an agent in the attempt's repo
+/// running `runner` (the writer's; the default runner when `None`), but run in the attempt's worktree with its own
+/// `PORT`, scratch directory, [`ATTEMPT_ID_ENV`] and [`ATTEMPT_TOKEN_ENV`], as its own agent. Its instruction is
+/// the first message only when the session is being forked.
 pub fn attempt_launch_for_runner(
     space: &Space,
     attempt: &AttemptPane,
@@ -730,6 +718,7 @@ mod tests {
     use xctx_core::{SpaceId, SpaceRepo, SpaceShape, SpaceStatus};
 
     use super::*;
+    use crate::agent_session::agent_args;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -831,10 +820,10 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_agent_runs_pi_with_the_task_in_its_worktree() -> TestResult {
+    fn a_fresh_agent_runs_omp_with_the_task_in_its_worktree() -> TestResult {
         let root = tempfile::tempdir()?;
-        let pi = root.path().join("home/.pi/agent/bin/pi");
-        executable(&pi)?;
+        let omp = root.path().join("home/.local/bin/omp");
+        executable(&omp)?;
         let space = space(root.path());
         let task = AgentStart::Task(space.task.clone());
         let launch = pane_launch(
@@ -844,17 +833,17 @@ mod tests {
             &search(root.path()),
         );
         assert_eq!(launch.notice, None);
-        assert_eq!(launch.config.program, pi.to_string_lossy());
+        assert_eq!(launch.config.program, omp.to_string_lossy());
         assert_eq!(launch.config.args, ["--", "fix retry when we rate limit"]);
         assert_space_env(&launch, &space.repos[1].worktree);
         let path = env(&launch, "PATH").unwrap_or_default().to_owned();
-        let pi_dir = root.path().join("home/.pi/agent/bin");
+        let omp_dir = root.path().join("home/.local/bin");
         assert!(
             path.starts_with(&format!("{}:", root.path().join("bin").display())),
             "{path}"
         );
         assert!(
-            path.contains(&pi_dir.to_string_lossy().into_owned()),
+            path.contains(&omp_dir.to_string_lossy().into_owned()),
             "{path}"
         );
         Ok(())
@@ -863,7 +852,7 @@ mod tests {
     #[test]
     fn a_restored_agent_continues_its_session() -> TestResult {
         let root = tempfile::tempdir()?;
-        executable(&root.path().join("bin/pi"))?;
+        executable(&root.path().join("bin/omp"))?;
         let space = space(root.path());
         let launch = pane_launch(
             &space,
@@ -877,10 +866,10 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_agent_runs_plain_pi_without_a_session_flag() -> TestResult {
+    fn a_fresh_agent_runs_plain_omp_without_a_session_flag() -> TestResult {
         let root = tempfile::tempdir()?;
-        let pi = root.path().join("bin/pi");
-        executable(&pi)?;
+        let omp = root.path().join("bin/omp");
+        executable(&omp)?;
         let space = space(root.path());
         let launch = pane_launch(
             &space,
@@ -889,7 +878,7 @@ mod tests {
             &search(root.path()),
         );
         assert_eq!(launch.notice, None);
-        assert_eq!(launch.config.program, pi.to_string_lossy());
+        assert_eq!(launch.config.program, omp.to_string_lossy());
         assert!(launch.config.args.is_empty(), "{:?}", launch.config.args);
         assert_space_env(&launch, &space.repos[1].worktree);
         Ok(())
@@ -973,7 +962,7 @@ mod tests {
     #[test]
     fn panes_that_run_no_agent_get_an_empty_agent_identity() -> TestResult {
         let root = tempfile::tempdir()?;
-        executable(&root.path().join("bin/pi"))?;
+        executable(&root.path().join("bin/omp"))?;
         executable(&root.path().join("bin/lazygit"))?;
         let space = space(root.path());
         let search = search(root.path());
@@ -1003,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_pi_opens_the_login_shell_with_a_notice() -> TestResult {
+    fn a_missing_agent_program_opens_the_login_shell_with_a_notice() -> TestResult {
         let root = tempfile::tempdir()?;
         let space = space(root.path());
         let launch = pane_launch(
@@ -1014,11 +1003,11 @@ mod tests {
         );
         assert_eq!(launch.config.program, "/bin/fish");
         assert_eq!(launch.config.args, ["-l"]);
-        assert!(launch.notice.as_deref().unwrap_or_default().contains("pi"));
+        assert!(launch.notice.as_deref().unwrap_or_default().contains("omp"));
         // The shell it fell back to runs no session, so none is recorded for the agent.
         assert!(!runs_pi(PaneKind::Agent, &launch, true));
         assert_space_env(&launch, &space.repos[0].worktree);
-        executable(&root.path().join("bin/pi"))?;
+        executable(&root.path().join("bin/omp"))?;
         let found = pane_launch(
             &space,
             &role(PaneKind::Agent, "api"),
@@ -1198,24 +1187,37 @@ mod tests {
     fn agents_open_their_named_session_and_attempts_fork_in_their_worktree() -> TestResult {
         let root = tempfile::tempdir()?;
         executable(&root.path().join("bin/pi"))?;
+        executable(&root.path().join("bin/omp"))?;
+        let registry = xctx_plugin::RunnerRegistry::with_builtins();
+        let pi = &registry.get("pi").ok_or("no pi")?.manifest;
         let space = space(root.path());
         let mut search = search(root.path());
         search.control = Some(ControlEnv {
             socket: root.path().join("control.sock"),
             ctl_dir: None,
         });
-        let named = pane_launch_with(
+        let open = AgentSession::Open("xctx-fix-retry-writer-api".into());
+        let task = AgentStart::Task("fix it".into());
+        let named = pane_launch_for_runner(
             &space,
             &role(PaneKind::Agent, "api"),
-            &AgentStart::Task("fix it".into()),
-            &AgentSession::Open("xctx-fix-retry-writer-api".into()),
+            &task,
+            &open,
             &search,
+            Some(pi),
         );
         assert_eq!(
             named.config.args,
             ["--session-id", "xctx-fix-retry-writer-api", "--", "fix it"]
         );
+        assert!(named.session_named);
         assert_eq!(env(&named, ATTEMPT_ID_ENV), Some(""));
+
+        // The default runner, omp, cannot name sessions: it is given the task in an unnamed one.
+        let default =
+            pane_launch_with(&space, &role(PaneKind::Agent, "api"), &task, &open, &search);
+        assert_eq!(default.config.args, ["--", "fix it"]);
+        assert!(!default.session_named);
 
         let worktree = root.path().join("api-worktrees/fix-retry--attempt-2");
         let mut attempt = AttemptPane {
@@ -1235,7 +1237,7 @@ mod tests {
             instruction: Some("use a token bucket".into()),
             scratch: Some(root.path().join("scratch/attempts/2")),
         };
-        let launch = attempt_launch(&space, &attempt, &search);
+        let launch = attempt_launch_for_runner(&space, &attempt, &search, Some(pi));
         assert_eq!(
             launch.config.args,
             [
@@ -1260,7 +1262,7 @@ mod tests {
 
         // Reopened, it opens its own session and is not told its instruction again.
         attempt.session = AgentSession::Open("xctx-fix-retry-writer-api-attempt-2".into());
-        let reopened = attempt_launch(&space, &attempt, &search);
+        let reopened = attempt_launch_for_runner(&space, &attempt, &search, Some(pi));
         assert_eq!(
             reopened.config.args,
             ["--session-id", "xctx-fix-retry-writer-api-attempt-2"]
@@ -1271,7 +1273,7 @@ mod tests {
     #[test]
     fn panes_get_their_agent_and_the_spaces_scratch_dir() -> TestResult {
         let root = tempfile::tempdir()?;
-        executable(&root.path().join("bin/pi"))?;
+        executable(&root.path().join("bin/omp"))?;
         let space = space(root.path());
         let search = search(root.path());
         let agent = PaneAgent {
@@ -1306,7 +1308,11 @@ mod tests {
 
     #[test]
     fn the_pi_runner_builds_exactly_the_arguments_agents_always_had() -> TestResult {
-        let pi = pi_runner().ok_or("the built-in pi runner did not load")?;
+        let registry = xctx_plugin::RunnerRegistry::with_builtins();
+        let pi = &registry
+            .get("pi")
+            .ok_or("the built-in pi runner did not load")?
+            .manifest;
         let starts = [
             AgentStart::Task("fix it".into()),
             AgentStart::Continue,

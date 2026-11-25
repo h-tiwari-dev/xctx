@@ -69,18 +69,6 @@ pub fn scan_index(roots: Vec<PathBuf>) -> RepoIndex {
     index
 }
 
-/// The indexed repos that are not in `draft`, to offer for adding.
-pub fn addable_repos<'a>(
-    index: &'a RepoIndex,
-    draft: &SpaceDraft,
-) -> Vec<&'a xctx_core::IndexedRepo> {
-    index
-        .repos()
-        .iter()
-        .filter(|repo| draft.repos.iter().all(|r| r.path != repo.path))
-        .collect()
-}
-
 /// A space [`launch_space`] made, ready to open.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaunchedSpace {

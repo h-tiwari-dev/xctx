@@ -230,10 +230,7 @@ impl Workspace {
         self.dialog = None;
         self.dialog_subscription = None;
         match self.view {
-            View::Home => {
-                let focus = self.task_prompt.focus_handle(cx);
-                focus.focus(window, cx);
-            }
+            View::Home => self.focus_home(window, cx),
             View::Space(_) => self.focus_active_pane(window, cx),
         }
         cx.notify();
@@ -418,8 +415,7 @@ impl Workspace {
                         }
                         done(this, value, cx);
                         if this.dialog.is_none() {
-                            let focus = this.task_prompt.focus_handle(cx);
-                            focus.focus(window, cx);
+                            this.focus_home(window, cx);
                         } else {
                             this.dialog_focus.focus(window, cx);
                         }

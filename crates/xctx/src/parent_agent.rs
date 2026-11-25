@@ -1,9 +1,9 @@
-//! The Parent Agent: an always-on `pi` session in a drawer on Home that turns tasks into Plan Gates and keeps
+//! The Parent Agent: an always-on `omp` session in a drawer on Home that turns tasks into Plan Gates and keeps
 //! the user's spaces arranged, through `xctx-ctl`.
 //!
 //! Nothing on the control socket can launch or approve, so its drafts always wait at the Plan Gate. Its "writes
-//! no code" rule is advisory: `pi` gets only its read and bash tools and a prompt saying not to change anything,
-//! but bash is a full shell (and MCP tools and the user's pi extensions still load), so the prompt, not a
+//! no code" rule is advisory: `omp` gets only its read and bash tools and a prompt saying not to change anything,
+//! but bash is a full shell (and MCP tools and the user's omp extensions still load), so the prompt, not a
 //! sandbox, keeps it from editing files. It runs in its own folder beside the data directory, not inside it, so
 //! the store and the Inbox file are not in its working directory.
 
@@ -14,18 +14,21 @@ use xctx_term::TerminalConfig;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
 use xctx_ui::AgentStatus;
 
-use crate::spawn::{AGENT_PROGRAM, ProgramSearch};
-use crate::workspace::Workspace;
+use crate::spawn::ProgramSearch;
+use crate::workspace::{View, Workspace};
+
+/// The program the Parent Agent runs: `omp`, looked up like an agent pane's (see [`ProgramSearch::find`]).
+pub const PARENT_AGENT_PROGRAM: &str = "omp";
 
 /// What the name of the folder the Parent Agent runs in adds to the data directory's name: it runs in
-/// `<data dir>-parent-agent` beside the data directory, and `pi --continue` resumes its session there.
+/// `<data dir>-parent-agent` beside the data directory, and `omp --continue` resumes its session there.
 pub const PARENT_AGENT_DIR_SUFFIX: &str = "-parent-agent";
 
-/// The only `pi` tools the Parent Agent gets: read, and bash for `xctx-ctl`. Without `edit` and `write` it has
+/// The only `omp` tools the Parent Agent gets: read, and bash for `xctx-ctl`. Without `edit` and `write` it has
 /// no file-editing tools, but bash can still change files; only the prompt asks it not to.
 pub const PARENT_AGENT_TOOLS: &str = "read,bash";
 
-/// What the Parent Agent is told about its role, appended to `pi`'s system prompt.
+/// What the Parent Agent is told about its role, appended to `omp`'s system prompt.
 pub const PARENT_AGENT_PROMPT: &str = "\
 You are the xctx Parent Agent. You run on xctx's Home screen and help the user turn tasks into spaces. \
 A space is a task with one git worktree per repository, its own PORT and MISE_ENV, and agents and shells in panes.
@@ -37,8 +40,9 @@ happens in the spaces, by their own agents. Use bash only to run xctx-ctl and to
 Drive xctx with the xctx-ctl command (run `xctx-ctl help` for every method):
 - xctx-ctl space.list and xctx-ctl layout.get space=<slug> show what exists.
 - xctx-ctl space.draft task=\"<the task>\" repos=<name>,<name> rationale=\"<why these repos>\" proposes a space. \
-It goes to the user's Inbox as a Plan Gate; you cannot launch it, the user approves it there. Leave repos out \
-to let xctx pick from its index, or name the repos you found and say why in the rationale.
+It appears on the user's Home screen right under you as a Plan Gate card; you cannot launch it, the user presses \
+Launch (or ⌘↵) there, after dropping or adding repos and picking a shape if they want. Leave repos out to let \
+xctx pick from its index, or name the repos you found and say why in the rationale.
 - xctx-ctl space.reshape space=<slug> shape=dev|debug|review, pane.split, pane.focus and pane.zoom arrange a space.
 - xctx-ctl inbox.list shows what waits for the user; xctx-ctl inbox.post title=\"...\" tells them something; \
 xctx-ctl status.set message=\"...\" shows a short status line.
@@ -57,14 +61,14 @@ write tool only posts a gate to the Inbox; xctx-ctl plugin.unmount space=<slug> 
 Connectors with writes (jira) and a repo's own plugins ask the user in the Inbox before they mount; nothing you \
 run approves them.
 
-When the user describes a task, find the repositories it touches (the user's indexed folders are where their \
-repos live), then draft one space for it and tell the user it is waiting in the Inbox. Ask when the task is \
-unclear. Secret values are masked as [REDACTED:NAME]; never try to recover them.";
+When the user describes a task, draft its space quickly: find the repositories it touches (the user's indexed \
+folders are where their repos live; a quick look is enough), call space.draft once, then tell the user in one \
+line that the draft is ready under you and ⌘↵ launches it. Ask first only when you cannot tell what the task is \
+or which repos it needs. Secret values are masked as [REDACTED:NAME]; never try to recover them.";
 
 /// The Parent Agent's terminal and state.
 pub(crate) struct ParentAgent {
     pub(crate) status: AgentStatus,
-    pub(crate) open: bool,
     pub(crate) view: Option<Entity<TerminalView>>,
     _subscription: Option<Subscription>,
 }
@@ -73,24 +77,23 @@ impl Default for ParentAgent {
     fn default() -> Self {
         ParentAgent {
             status: AgentStatus::Starting,
-            open: true,
             view: None,
             _subscription: None,
         }
     }
 }
 
-/// The config that starts the Parent Agent: `pi --continue` with only [`PARENT_AGENT_TOOLS`] and
-/// [`PARENT_AGENT_PROMPT`], in `dir`, with the control socket and `xctx-ctl` from `search`. `None` when `pi`
-/// cannot be found, with why.
+/// The config that starts the Parent Agent: `omp --continue` with only [`PARENT_AGENT_TOOLS`] and
+/// [`PARENT_AGENT_PROMPT`], in `dir`, with the control socket and `xctx-ctl` from `search`. Fails, saying why,
+/// when `omp` cannot be found.
 pub fn parent_agent_config(search: &ProgramSearch, dir: &Path) -> Result<TerminalConfig, String> {
-    let Some(pi) = search.find(AGENT_PROGRAM) else {
+    let Some(program) = search.find(PARENT_AGENT_PROGRAM) else {
         return Err(format!(
-            "{AGENT_PROGRAM} was not found on PATH, in ~/.pi/agent/bin, /opt/homebrew/bin or /usr/local/bin, \
-             so the Parent Agent cannot run. Install pi and press Restart."
+            "{PARENT_AGENT_PROGRAM} was not found on PATH, in ~/.pi/agent/bin, ~/.local/bin, /opt/homebrew/bin or \
+             /usr/local/bin, so the Parent Agent cannot run. Install {PARENT_AGENT_PROGRAM} and press Restart."
         ));
     };
-    let mut config = TerminalConfig::new(pi.to_string_lossy()).args([
+    let mut config = TerminalConfig::new(program.to_string_lossy()).args([
         "--continue",
         "--tools",
         PARENT_AGENT_TOOLS,
@@ -104,7 +107,7 @@ pub fn parent_agent_config(search: &ProgramSearch, dir: &Path) -> Result<Termina
             control.socket.to_string_lossy(),
         );
     }
-    config = config.env("PATH", search.pane_path(Some(&pi)));
+    config = config.env("PATH", search.pane_path(Some(&program)));
     Ok(config)
 }
 
@@ -171,6 +174,10 @@ impl Workspace {
                 self.parent.status = AgentStatus::Running;
                 self.parent.view = Some(view);
                 self.parent._subscription = Some(subscription);
+                // A restart from Home gives the new terminal the keys, as Home's only input.
+                if self.view == View::Home && self.dialog.is_none() {
+                    self.focus_home(window, cx);
+                }
             }
             Err(e) => {
                 self.parent.status = AgentStatus::Unavailable(
@@ -179,12 +186,6 @@ impl Workspace {
                 self.parent.view = None;
             }
         }
-        cx.notify();
-    }
-
-    /// Show or hide the Parent Agent's terminal.
-    pub(crate) fn toggle_parent_agent(&mut self, cx: &mut Context<Self>) {
-        self.parent.open = !self.parent.open;
         cx.notify();
     }
 }
@@ -210,21 +211,21 @@ mod tests {
     }
 
     #[test]
-    fn without_pi_the_agent_says_how_to_fix_it() -> TestResult {
+    fn without_omp_the_agent_says_how_to_fix_it() -> TestResult {
         let root = tempfile::tempdir()?;
         let err = parent_agent_config(&search(root.path()), root.path()).err();
-        assert!(err.is_some_and(|e| e.contains("Install pi")));
+        assert!(err.is_some_and(|e| e.contains("Install omp")));
         Ok(())
     }
 
     #[test]
-    fn the_agent_runs_pi_without_edit_tools_with_the_socket_and_xctx_ctl() -> TestResult {
+    fn the_agent_runs_omp_without_edit_tools_with_the_socket_and_xctx_ctl() -> TestResult {
         let root = tempfile::tempdir()?;
         let bin = root.path().join("bin");
         fs::create_dir_all(&bin)?;
-        let pi = bin.join("pi");
-        fs::write(&pi, "#!/bin/sh\n")?;
-        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755))?;
+        let omp = bin.join("omp");
+        fs::write(&omp, "#!/bin/sh\n")?;
+        fs::set_permissions(&omp, fs::Permissions::from_mode(0o755))?;
         let ctl_dir = root.path().join("app");
         let mut search = search(root.path());
         search.control = Some(ControlEnv {
@@ -233,7 +234,7 @@ mod tests {
         });
         let dir = parent_agent_dir_for(&root.path().join("data"))?;
         let config = parent_agent_config(&search, &dir)?;
-        assert_eq!(config.program, pi.to_string_lossy());
+        assert_eq!(config.program, omp.to_string_lossy());
         let tools = config.args.iter().position(|a| a == "--tools");
         assert_eq!(
             tools
