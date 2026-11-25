@@ -10,8 +10,8 @@ use xctx_core::{ShipOptions, SpaceShape, SpaceStatus, Store};
 use xctx_layout::{PaneKind, Shape};
 
 use crate::lifecycle::{
-    dirty_repos, discard_message, discard_space, launch_space, repo_for_draft, reshape_space,
-    scan_index, ship_report_lines, ship_space,
+    dirty_repos, discard_message, discard_space, launch_space, repo_for_draft, repos_in_folders,
+    reshape_space, scan_index, ship_report_lines, ship_space,
 };
 use crate::persist::restore_layout;
 use crate::spawn::{AgentStart, ProgramSearch, pane_launch};
@@ -510,5 +510,32 @@ fn attempts_fork_report_diff_and_go_without_a_trace() -> TestResult {
     assert!(git(&fixture.payments, &["rev-parse", "--verify", &backup]).is_err());
     assert_eq!(delete_pre_adopt_refs(&fixture.payments, slug)?, 0);
     assert_eq!(delete_pre_adopt_refs(&fixture.root.join("gone"), slug)?, 0);
+    Ok(())
+}
+
+#[test]
+fn chosen_folders_give_their_repos_once_and_name_the_empty_ones() -> TestResult {
+    let fixture = Fixture::new()?;
+    let empty = fixture.root.join("empty");
+    fs::create_dir_all(&empty)?;
+    let inside_web = fixture.web.join("src");
+    fs::create_dir_all(&inside_web)?;
+
+    let (repos, problems) = repos_in_folders(&[
+        fixture.root.join("code"),
+        fixture.payments.clone(),
+        inside_web,
+        empty.clone(),
+    ]);
+    let paths: Vec<PathBuf> = repos.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        paths,
+        [fixture.payments.clone(), fixture.web.clone()],
+        "a folder of repos gives each; a repo or a folder inside one gives that repo, once"
+    );
+    assert_eq!(
+        problems,
+        [format!("no git repository in {}", empty.display())]
+    );
     Ok(())
 }

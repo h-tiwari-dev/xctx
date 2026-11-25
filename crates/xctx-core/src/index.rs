@@ -414,6 +414,39 @@ impl RepoIndex {
         matches
     }
 
+    /// The repositories whose name or path contains `query`, ignoring case, for a picker the user types into: an
+    /// exact name first, then names that start with it, names that contain it, and paths that contain it; ties go
+    /// to the most recently used. A blank query lists every repository, most recently used first. At most `limit`.
+    pub fn lookup(&self, query: &str, limit: usize) -> Vec<&IndexedRepo> {
+        let query = query.trim().to_lowercase();
+        let mut found: Vec<(u8, &IndexedRepo)> = self
+            .repos
+            .iter()
+            .filter_map(|repo| {
+                let name = repo.name.to_lowercase();
+                let rank = if query.is_empty() || name == query {
+                    0
+                } else if name.starts_with(&query) {
+                    1
+                } else if name.contains(&query) {
+                    2
+                } else if repo.path.to_string_lossy().to_lowercase().contains(&query) {
+                    3
+                } else {
+                    return None;
+                };
+                Some((rank, repo))
+            })
+            .collect();
+        // `repos` is already most recently used first, and the sort is stable.
+        found.sort_by_key(|(rank, _)| *rank);
+        found
+            .into_iter()
+            .take(limit)
+            .map(|(_, repo)| repo)
+            .collect()
+    }
+
     /// A draft for `task` with the best matching repositories (at most [`DRAFT_LIMIT`]) and why each is there.
     /// Nothing runs until the draft is launched; the user can add and drop repositories first.
     pub fn draft(&self, task: &str) -> SpaceDraft {

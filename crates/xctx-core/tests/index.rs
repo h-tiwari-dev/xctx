@@ -155,3 +155,32 @@ fn space_worktrees_hidden_and_dependency_folders_are_not_indexed() -> TestResult
     );
     Ok(())
 }
+
+#[test]
+fn lookup_matches_names_before_paths_ignoring_case() -> TestResult {
+    let root = temp_root()?;
+    let repos = make_repos(&root.path)?;
+    let mut index = RepoIndex::new(vec![repos.code.clone()]);
+    index.scan();
+    let names = |query: &str| -> Vec<String> {
+        index
+            .lookup(query, 10)
+            .iter()
+            .map(|r| r.name.clone())
+            .collect()
+    };
+
+    assert_eq!(names("PAY"), ["payments"]);
+    assert_eq!(names(" web "), ["checkout-web"], "inside the name, trimmed");
+    assert!(names("zzz").is_empty());
+    assert_eq!(names("").len(), 2, "blank lists every repo");
+    let code = repos
+        .code
+        .file_name()
+        .ok_or("code folder has no name")?
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(names(&code).len(), 2, "both live under the code folder");
+    assert_eq!(index.lookup("", 1).len(), 1, "limited");
+    Ok(())
+}

@@ -62,6 +62,35 @@ pub fn repo_for_draft(input: &str, home: Option<&Path>) -> Result<DraftRepo, Str
     Ok(DraftRepo::new(root, ADDED_BY_HAND))
 }
 
+/// `path` with links resolved (`/tmp` and `/private/tmp` are one folder on macOS), to tell whether two paths are
+/// one repo; `path` itself when it cannot be resolved.
+pub fn repo_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The repos in folders the user picked: a picked repo itself, the repos under a picked folder that is not one (as
+/// deep as indexing looks), or the repo a picked subfolder belongs to. Each repo once, in the order picked. Also
+/// the picked folders that hold no repo, as messages for the user. Runs git: call it off the UI thread.
+pub fn repos_in_folders(folders: &[PathBuf]) -> (Vec<DraftRepo>, Vec<String>) {
+    let mut repos: Vec<DraftRepo> = Vec::new();
+    let mut problems = Vec::new();
+    for folder in folders {
+        let mut found = xctx_core::index::find_repos(folder, xctx_core::index::DEFAULT_SCAN_DEPTH);
+        if found.is_empty() {
+            found.extend(git::repo_root(folder).ok());
+        }
+        if found.is_empty() {
+            problems.push(format!("no git repository in {}", folder.display()));
+        }
+        for path in found {
+            if !repos.iter().any(|r| r.path == path) {
+                repos.push(DraftRepo::new(path, ADDED_BY_HAND));
+            }
+        }
+    }
+    (repos, problems)
+}
+
 /// An index of `roots`, scanned. Slow for large folders: run it off the UI thread.
 pub fn scan_index(roots: Vec<PathBuf>) -> RepoIndex {
     let mut index = RepoIndex::new(roots);

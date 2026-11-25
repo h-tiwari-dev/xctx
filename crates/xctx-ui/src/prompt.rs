@@ -311,8 +311,8 @@ impl PromptBuffer {
 /// What the user asked of a [`PromptInput`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptEvent {
-    /// Enter was pressed with non-blank text, given here as typed. The input keeps the text; call
-    /// [`PromptInput::clear`] once it has been used.
+    /// Enter was pressed with non-blank text (or any text, with [`PromptInput::submit_blank`]), given here as
+    /// typed. The input keeps the text; call [`PromptInput::clear`] once it has been used.
     Submit(String),
     /// Escape was pressed.
     Cancel,
@@ -392,6 +392,8 @@ pub struct PromptInput {
     placeholder: SharedString,
     /// Whether a mouse drag that started in the text is extending the selection.
     selecting: bool,
+    /// Whether Enter on blank text still emits [`PromptEvent::Submit`] (with an empty string).
+    submit_blank: bool,
 }
 
 impl EventEmitter<PromptEvent> for PromptInput {}
@@ -410,6 +412,7 @@ impl PromptInput {
             buffer: PromptBuffer::new(),
             placeholder: SharedString::default(),
             selecting: false,
+            submit_blank: false,
         }
     }
 
@@ -422,6 +425,13 @@ impl PromptInput {
     /// Let Shift+Enter insert a line break (Enter still submits).
     pub fn multiline(mut self, multiline: bool) -> Self {
         self.buffer.set_multiline(multiline);
+        self
+    }
+
+    /// Let Enter on blank text emit [`PromptEvent::Submit`] with an empty string, for an input whose Enter also
+    /// confirms what was chosen beside it.
+    pub fn submit_blank(mut self, submit_blank: bool) -> Self {
+        self.submit_blank = submit_blank;
         self
     }
 
@@ -464,7 +474,7 @@ impl PromptInput {
         cx.stop_propagation();
         match command {
             PromptCommand::Submit => {
-                if !self.buffer.text().trim().is_empty() {
+                if self.submit_blank || !self.buffer.text().trim().is_empty() {
                     cx.emit(PromptEvent::Submit(self.buffer.text().to_owned()));
                 }
                 return;

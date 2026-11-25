@@ -22,6 +22,7 @@ pub mod parent_agent;
 pub mod plan_gate;
 pub mod plugin_menu;
 pub mod prompt;
+pub mod repo_picker;
 pub mod review_sheet;
 pub mod shared_space;
 pub mod spinner;
@@ -66,6 +67,7 @@ pub use plugin_menu::{
     PluginMenu, PluginMenuView, PluginProblemRow, PluginSource,
 };
 pub use prompt::{PromptBuffer, PromptEvent, PromptInput};
+pub use repo_picker::{RepoChoice, RepoPicker};
 pub use review_sheet::{
     DIFF_CHAR_LIMIT, DIFF_LINE_CHARS, DIFF_LINE_LIMIT, DiffExcerpt, DiffView, FILE_ROW_LIMIT,
     FileRow, REVIEW_CHANGES_PENDING, REVIEW_EMPTY, REVIEW_NO_SUMMARY, REVIEW_WORKTREE_REMOVED,

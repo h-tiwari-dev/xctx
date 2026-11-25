@@ -189,9 +189,11 @@ impl Workspace {
         let root_input =
             cx.new(|cx| PromptInput::new(cx).placeholder("A folder with your repos, e.g. ~/code"));
         let plan_repo_input = cx.new(|cx| {
-            PromptInput::new(cx).placeholder("Add a repo to the plan: an indexed name or a path")
+            PromptInput::new(cx)
+                .placeholder("Add repos: type to search yours, or a folder such as ~/code/web")
         });
         let subscriptions = vec![
+            cx.observe(&plan_repo_input, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.apply_appearance(window.appearance(), cx);
             }),

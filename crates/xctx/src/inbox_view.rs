@@ -16,10 +16,10 @@ use xctx_inbox::{Filter, Inbox, InboxItem, ItemBody, ItemId, ItemKind, Source, S
 use xctx_layout::{PaneKind, Shape, SplitAxis};
 use xctx_ui::{
     Button, ButtonVariant, InboxAction, InboxEntry, InboxKind, InboxPanel, PlanGateCard,
-    PlanGateView, PlanRepo, PromptEvent, PromptInput, Theme,
+    PlanGateView, PlanRepo, PromptEvent, PromptInput, RepoChoice, RepoPicker, Theme,
 };
 
-use crate::lifecycle::{ADDED_BY_HAND, home_dir, repo_for_draft};
+use crate::lifecycle::{ADDED_BY_HAND, home_dir, repo_for_draft, repo_key};
 use crate::space_graph::add_writer_lanes;
 use crate::space_layout::{layout_shape, space_shape};
 use crate::workspace::Workspace;
@@ -172,17 +172,30 @@ pub fn plan_view(item: &InboxItem, redactor: &Redactor) -> Option<PlanGateView> 
     })
 }
 
-/// The repo the user typed under a plan: an indexed repo's name, else the path of a git repository.
+/// The repo the user typed under a plan or in "+ Repo": an indexed repo's exact name; a folder path (anything
+/// with a `/` or starting with `~`) of a git repository; else the best indexed repo whose name or path contains
+/// the text (see [`RepoIndex::lookup`]) that `skip` does not rule out, such as a repo already in the plan.
 pub fn repo_from_input(
     index: &RepoIndex,
     input: &str,
     home: Option<&Path>,
+    skip: impl Fn(&Path) -> bool,
 ) -> Result<DraftRepo, String> {
     let input = input.trim();
     if let Some(found) = index.repos().iter().find(|r| r.name == input) {
         return Ok(DraftRepo::new(found.path.clone(), ADDED_BY_HAND));
     }
-    repo_for_draft(input, home)
+    if input.contains('/') || input.starts_with('~') {
+        return repo_for_draft(input, home);
+    }
+    index
+        .lookup(input, usize::MAX)
+        .into_iter()
+        .find(|r| !skip(&r.path))
+        .map(|r| DraftRepo::new(r.path.clone(), ADDED_BY_HAND))
+        .ok_or_else(|| {
+            format!("no indexed repo matches \"{input}\"; type its folder, such as ~/code/{input}")
+        })
 }
 
 /// Drop the repo whose path displays as `path` from `draft`.
@@ -399,23 +412,94 @@ impl Workspace {
         self.change_inbox(cx, |inbox| inbox.edit_plan(&id, edit));
     }
 
-    /// Add the repo typed under the plan being reviewed. Does nothing while a plan launches.
+    /// The draft of the plan being reviewed.
+    fn reviewed_draft(&self) -> Option<&SpaceDraft> {
+        match &self.reviewed_plan()?.body {
+            ItemBody::PlanGate(plan) => Some(&plan.draft),
+            _ => None,
+        }
+    }
+
+    /// The resolved paths (see [`repo_key`]) of the repos in the plan being reviewed.
+    fn plan_repo_keys(&self) -> HashSet<PathBuf> {
+        self.reviewed_draft()
+            .map(|draft| draft.repos.iter().map(|r| repo_key(&r.path)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Add the repo typed under the plan being reviewed: its name (or part of it) or its folder. Does nothing
+    /// while a plan launches.
     pub(crate) fn add_plan_repo(&mut self, input: String, cx: &mut Context<Self>) {
         if self.plan_launches.is_launching() {
             return;
         }
-        match repo_from_input(&self.index, &input, home_dir().as_deref()) {
-            Ok(repo) => {
-                self.plan_repo_input.update(cx, |input, cx| input.clear(cx));
-                let name = repo.name.clone();
-                let mut added = true;
-                self.edit_reviewed_plan(cx, |draft| added = draft.add_repo(repo));
-                if !added {
-                    self.info(format!("{name} is already in the plan"), cx);
-                }
-            }
+        let taken = self.plan_repo_keys();
+        let found = repo_from_input(&self.index, &input, home_dir().as_deref(), |path| {
+            taken.contains(&repo_key(path))
+        });
+        match found {
+            Ok(repo) => self.add_plan_repos(vec![repo], cx),
             Err(e) => self.error(e, cx),
         }
+    }
+
+    /// Add `repos` to the plan being reviewed and clear the repo search, saying which were there already.
+    fn add_plan_repos(&mut self, repos: Vec<DraftRepo>, cx: &mut Context<Self>) {
+        if self.plan_launches.is_launching() || repos.is_empty() {
+            return;
+        }
+        self.plan_repo_input.update(cx, |input, cx| input.clear(cx));
+        let (mut added, mut present) = (Vec::new(), Vec::new());
+        self.edit_reviewed_plan(cx, |draft| {
+            for repo in repos {
+                let name = repo.name.clone();
+                if draft.add_repo(repo) {
+                    added.push(name);
+                } else {
+                    present.push(name);
+                }
+            }
+        });
+        if !present.is_empty() {
+            self.info(format!("{} already in the plan", present.join(", ")), cx);
+        } else if added.len() > 1 {
+            self.info(format!("added {} to the plan", added.join(", ")), cx);
+        }
+    }
+
+    /// "Choose folders…" under the plan: add every repo in the folders chosen.
+    fn browse_plan_repos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plan_launches.is_launching() {
+            return;
+        }
+        self.choose_repo_folders(
+            window,
+            cx,
+            Box::new(|this, repos, problems, _, cx| {
+                this.add_plan_repos(repos, cx);
+                if !problems.is_empty() {
+                    this.error(problems.join("; "), cx);
+                }
+            }),
+        );
+    }
+
+    /// The indexed repos offered under the plan: those matching the search (a few recent ones while it is blank)
+    /// that the plan does not have.
+    fn plan_repo_choices(&self, query: &str) -> Vec<RepoChoice> {
+        let limit = if query.is_empty() { 5 } else { 8 };
+        let taken = self.plan_repo_keys();
+        self.index
+            .lookup(query, usize::MAX)
+            .into_iter()
+            .filter(|r| !taken.contains(&repo_key(&r.path)))
+            .take(limit)
+            .map(|r| RepoChoice {
+                name: r.name.clone().into(),
+                path: r.path.to_string_lossy().into_owned().into(),
+                picked: false,
+            })
+            .collect()
     }
 
     /// Approve the plan being reviewed: launch it, and mark it approved once the space exists. Does nothing while
@@ -663,17 +747,47 @@ impl Workspace {
     pub(crate) fn render_plan_review(&self, cx: &mut Context<Self>) -> Option<PlanGateCard> {
         let view = plan_view(self.reviewed_plan()?, &self.redactor)?;
         let entity = cx.entity().downgrade();
-        let (shape, drop, approve, reject, later) = (
+        let (shape, drop, approve, reject, later, pick, browse) = (
+            entity.clone(),
+            entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
             entity,
         );
+        let query = self.plan_repo_input.read(cx).value().trim().to_owned();
+        let empty = if self.index.repos().is_empty() {
+            "No repos indexed yet: choose folders, type a folder path, or index a folder on Home."
+                .to_owned()
+        } else if query.is_empty() || query.contains('/') || query.starts_with('~') {
+            String::new()
+        } else {
+            format!("No indexed repo matches \"{query}\". Type its folder, or choose folders.")
+        };
+        let busy = self.plan_launches.is_launching() || self.busy.is_some();
+        let picker = RepoPicker::new("plan-repos", self.plan_repo_choices(&query))
+            .empty(empty)
+            .disabled(busy)
+            .on_toggle(move |path, _, cx| {
+                let repo = DraftRepo::new(PathBuf::from(path.as_ref()), ADDED_BY_HAND);
+                let _ = pick.update(cx, |this, cx| this.add_plan_repos(vec![repo], cx));
+            })
+            .on_browse(move |window, cx| {
+                let _ = browse.update(cx, |this, cx| this.browse_plan_repos(window, cx));
+            });
         Some(
             PlanGateCard::new(view)
-                .busy(self.plan_launches.is_launching() || self.busy.is_some())
-                .add_repo(div().pt(Theme::SPACE_1).child(self.plan_repo_input.clone()))
+                .busy(busy)
+                .add_repo(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(Theme::SPACE_2)
+                        .pt(Theme::SPACE_1)
+                        .child(self.plan_repo_input.clone())
+                        .child(picker),
+                )
                 .on_shape(move |s: Shape, _, cx| {
                     let _ = shape.update(cx, |this, cx| {
                         this.edit_reviewed_plan(cx, |draft| draft.shape = space_shape(s));
@@ -983,6 +1097,8 @@ mod tests {
         drop_repo_by_display(&mut draft, "/code/api");
         assert_eq!(draft.repos.len(), 1);
         assert_eq!(draft.repos[0].name, "web");
-        assert!(repo_from_input(&RepoIndex::default(), "nope-not-a-repo", None).is_err());
+        assert!(
+            repo_from_input(&RepoIndex::default(), "nope-not-a-repo", None, |_| false).is_err()
+        );
     }
 }
