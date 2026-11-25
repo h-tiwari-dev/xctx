@@ -706,7 +706,7 @@ impl Workspace {
                     .rounded(Theme::RADIUS_MD)
                     .border_1()
                     .border_color(theme.danger.alpha(0.5))
-                    .bg(theme.elevated)
+                    .bg(theme.raised)
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)

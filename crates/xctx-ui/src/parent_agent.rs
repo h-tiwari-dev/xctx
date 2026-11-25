@@ -154,7 +154,7 @@ impl RenderOnce for ParentAgentDrawer {
                 .w_full()
                 .overflow_hidden()
                 .border_t_1()
-                .border_color(theme.divider)
+                .border_color(theme.border_subtle)
                 .child(content)
         });
         div()

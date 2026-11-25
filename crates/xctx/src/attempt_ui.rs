@@ -644,7 +644,7 @@ impl Workspace {
                     .px(Theme::SPACE_2)
                     .py(Theme::SPACE_1)
                     .border_b_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.border_subtle)
                     .truncate()
                     .text_size(Theme::TEXT_SM)
                     .font_weight(FontWeight::MEDIUM)

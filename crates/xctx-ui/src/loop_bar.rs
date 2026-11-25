@@ -384,7 +384,7 @@ impl RenderOnce for LoopBar {
                     .rounded(Theme::RADIUS_FULL)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.bg)
+                    .bg(theme.chrome)
                     .children(autonomy_pills),
             )
             .child(

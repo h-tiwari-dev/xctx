@@ -25,8 +25,8 @@ pub mod tab_bar;
 pub mod theme;
 
 pub use agent_graph::{
-    AgentGraphView, HELPER_KINDS, agent_state_label, agent_state_tone, can_pause, can_resume,
-    helper_kind_label, helper_kind_name,
+    AgentGraphView, HELPER_KINDS, agent_identity_color, agent_state_label, agent_state_tone,
+    can_pause, can_resume, helper_kind_label, helper_kind_name,
 };
 pub use attempt_strip::{
     AttemptChip, AttemptChipState, AttemptStrip, CHIP_LABEL_MAX, truncate_label,

@@ -371,8 +371,8 @@ impl Workspace {
         let (select_tab, resolve) = (entity.clone(), entity);
         let shared = state.shared();
         let shared_panel = SharedSpacePanel::new()
+            .graph(state.graph().clone())
             .tab(tab.shared_tab)
-            .contract(shared.contract(&self.redactor))
             .messages(shared.list_messages(None, None, None, None, &self.redactor))
             .findings(shared.findings(false, &self.redactor))
             .notes(shared.notes(&self.redactor))

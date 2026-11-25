@@ -509,7 +509,7 @@ impl RenderOnce for ReviewSheet {
                                     (Some(added), Some(removed)) => diffstat_label(added, removed),
                                     _ => "binary".into(),
                                 };
-                                let hover = theme.surface_hover;
+                                let hover = theme.raised;
                                 let mut row = div()
                                     .id(SharedString::from(selector.clone()))
                                     .debug_selector(move || selector)
@@ -543,7 +543,7 @@ impl RenderOnce for ReviewSheet {
                                             .child(stat),
                                     );
                                 if selected {
-                                    row = row.bg(theme.accent_muted);
+                                    row = row.bg(theme.selection);
                                 }
                                 if let Some(handler) = self.on_file.clone() {
                                     let path = file.path.clone();
@@ -685,7 +685,7 @@ impl RenderOnce for ReviewSheet {
                             .gap(Theme::SPACE_2)
                             .pt(Theme::SPACE_2)
                             .border_t_1()
-                            .border_color(theme.divider)
+                            .border_color(theme.border_subtle)
                             .children(keep)
                             .children(discard)
                             .children(adopt),
@@ -772,7 +772,7 @@ impl RenderOnce for ReviewSheet {
                         .rounded(Theme::RADIUS_SM)
                         .border_1()
                         .border_color(theme.border)
-                        .bg(theme.bg)
+                        .bg(theme.chrome)
                         .font_family("Menlo")
                         .text_size(Theme::TEXT_XS)
                         .children(rows)
@@ -813,7 +813,7 @@ impl RenderOnce for ReviewSheet {
             .rounded(Theme::RADIUS_LG)
             .border_1()
             .border_color(theme.accent.alpha(0.55))
-            .bg(theme.elevated)
+            .bg(theme.overlay)
             .child(
                 div()
                     .flex()

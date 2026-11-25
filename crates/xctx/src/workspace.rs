@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, SharedString,
-    Styled, Subscription, Task, Window, div, prelude::*,
+    Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, ParentElement, Render,
+    SharedString, Styled, Subscription, Task, Window, WindowAppearance, div, prelude::*,
 };
 use xctx_core::{Redactor, RepoIndex, Space, SpaceId, Store};
 use xctx_inbox::{Inbox, ItemId};
@@ -155,9 +155,31 @@ impl Focusable for Workspace {
     }
 }
 
+/// Build the terminal palette from the active window [`Theme`].
+pub(crate) fn terminal_theme(theme: &Theme) -> TerminalTheme {
+    TerminalTheme {
+        foreground: theme.text.to_rgb(),
+        background: theme.surface.to_rgb(),
+        cursor: theme.text.to_rgb(),
+        cursor_text: theme.surface.to_rgb(),
+        selection: theme.accent.alpha(0.33).to_rgb(),
+        scrollback_indicator: theme.text_muted.alpha(0.40).to_rgb(),
+        ansi: theme.ansi.map(Hsla::to_rgb),
+    }
+}
+
+fn theme_for_appearance(appearance: WindowAppearance) -> Theme {
+    match appearance {
+        WindowAppearance::Light | WindowAppearance::VibrantLight => Theme::light(),
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => Theme::dark(),
+    }
+}
+
 impl Workspace {
     /// The workspace over the store in the default data directory, with its active spaces as tabs.
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let theme = theme_for_appearance(window.appearance());
+        cx.set_global(theme);
         let (mut store, store_error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
             Err(e) => (None, Some(format!("could not open the xctx store: {e}"))),
@@ -180,6 +202,9 @@ impl Workspace {
             PromptInput::new(cx).placeholder("Add a repo to the plan: an indexed name or a path")
         });
         let subscriptions = vec![
+            cx.observe_window_appearance(window, |this, window, cx| {
+                this.apply_appearance(window.appearance(), cx);
+            }),
             cx.subscribe_in(
                 &task_prompt,
                 window,
@@ -258,7 +283,7 @@ impl Workspace {
             persist_task: None,
             search: ProgramSearch::from_login_shell(),
             terminal_font: TerminalFont::default(),
-            terminal_theme: TerminalTheme::default(),
+            terminal_theme: terminal_theme(&theme),
             control: None,
             pending_control_drafts: Vec::new(),
             mise_ready: false,
@@ -310,6 +335,28 @@ impl Workspace {
         let prompt_focus = workspace.task_prompt.focus_handle(cx);
         prompt_focus.focus(window, cx);
         workspace
+    }
+
+    /// Update the global [`Theme`] and every live terminal when the system appearance changes.
+    fn apply_appearance(&mut self, appearance: WindowAppearance, cx: &mut Context<Self>) {
+        let theme = theme_for_appearance(appearance);
+        cx.set_global(theme);
+        self.terminal_theme = terminal_theme(&theme);
+        for tab in self.tabs.values() {
+            for pane in tab.terminals.values().chain(tab.attempt_terminals.values()) {
+                if let crate::space_tab::PaneTerminal::Running { view, .. } = pane {
+                    view.update(cx, |terminal, cx| {
+                        terminal.set_theme(self.terminal_theme, cx);
+                    });
+                }
+            }
+        }
+        if let Some(view) = &self.parent.view {
+            view.update(cx, |terminal, cx| {
+                terminal.set_theme(self.terminal_theme, cx);
+            });
+        }
+        cx.notify();
     }
 
     /// Re-read the active spaces from the store.
@@ -740,7 +787,7 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme.bg)
+            .bg(theme.chrome)
             .text_color(theme.text)
             .text_size(Theme::TEXT_MD)
             .child(self.render_tab_bar(cx))

@@ -919,7 +919,19 @@ impl Workspace {
                         .into_any_element(),
                 };
                 let kind: PaneKind = pane.role.kind;
-                PaneView::new(pane.id, title, content).kind(kind)
+                let mut view = PaneView::new(pane.id, title, content).kind(kind);
+                if let Some(state) = self.graphs.get(&tab.space.id)
+                    && let Some(node) = state
+                        .graph()
+                        .nodes()
+                        .iter()
+                        .find(|node| node.pane_id == Some(pane.id.0))
+                    && let Some(color) =
+                        xctx_ui::agent_identity_color(state.graph(), node.id.as_str(), &theme)
+                {
+                    view = view.agent_color(color);
+                }
+                view
             })
             .collect();
         let entity = cx.entity().downgrade();
