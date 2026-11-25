@@ -28,6 +28,9 @@ use xctx_plugin::{Manifest, match_events};
 /// How often a tailed file is read for new lines.
 pub const FILE_POLL: Duration = Duration::from_millis(300);
 
+/// The viewport, in pixels, of the headless Chrome behind a space's browser pane: what its screenshots show.
+pub const BROWSER_VIEWPORT: (u32, u32) = (1280, 800);
+
 /// How much of a tailed file's end is read when the tail starts.
 pub const FILE_TAIL_START_BYTES: u64 = 64 * 1024;
 
@@ -366,9 +369,9 @@ pub struct BrowserSnapshot {
     pub error: Option<String>,
 }
 
-/// The Chrome of one space, started on first use with its own profile under the data directory. Not headless:
-/// the page opens in a normal Chrome window the user can use, and the pane shows its screenshot, console and
-/// failed requests. Closed (Chrome quit) when the browser plugin is unmounted, the space closes, or xctx quits.
+/// The Chrome of one space, started on first use with its own profile under the data directory. Headless: it has
+/// no window of its own, so the page is only seen inside xctx, in the browser pane (its screenshot, console and
+/// failed requests). Closed (Chrome quit) when the browser plugin is unmounted, the space closes, or xctx quits.
 pub struct BrowserSession {
     profile_dir: PathBuf,
     browser: Option<Browser>,
@@ -442,7 +445,13 @@ impl BrowserHandle {
         let result = (|| {
             if session.browser.is_none() {
                 let chrome = find_chrome().map_err(|e| PageFailure::NotFound(e.to_string()))?;
-                let options = LaunchOptions::new(chrome, session.profile_dir.clone());
+                // No window of its own: the page is only ever seen through the space's browser pane, so it stays
+                // inside xctx. The size is the viewport screenshots are taken at.
+                let options = LaunchOptions {
+                    headless: true,
+                    window_size: Some(BROWSER_VIEWPORT),
+                    ..LaunchOptions::new(chrome, session.profile_dir.clone())
+                };
                 session.browser = Some(
                     Browser::launch(options).map_err(|e| PageFailure::Transport(e.to_string()))?,
                 );
