@@ -46,6 +46,7 @@ See [`docs/m4.md`](m4.md).
   winner.
 
 ### Milestone 5 — Plugins & connectors as live panes + agent tools (next)
+See [`docs/m5.md`](m5.md).
 - **Plugin manifest contract**: every plugin provides a live GPUI pane, agent tools over the harness, and events that
   trigger or stop loops.
 - **First-party plugins**: Browser pane, API client (Postman-style replay), Logs & read-only DB pane (write-gated),
