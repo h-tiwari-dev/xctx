@@ -1,0 +1,72 @@
+crates/xctx-plugin-view/src/browser.rs
+  h_5a0a1d6be5b4d2 251,343
+crates/xctx-plugin-view/src/common.rs
+  h_5a0a1d6be5b4d2 117
+crates/xctx-plugin-view/src/http.rs
+  h_5a0a1d6be5b4d2 337,439,502
+crates/xctx-plugin-view/src/logs.rs
+  h_5a0a1d6be5b4d2 398
+crates/xctx-plugin-view/src/sql.rs
+  h_5a0a1d6be5b4d2 153,296,335
+crates/xctx-term-view/src/view.rs
+  h_5a0a1d6be5b4d2 147-154
+crates/xctx-ui/src/agent_graph.rs
+  h_5a0a1d6be5b4d2 74-97,241,338-339,343-347,350-370,374-383,385-386,389-398,433-437,450-451,453-454,469-474,532,548,566
+crates/xctx-ui/src/attempt_strip.rs
+  h_5a0a1d6be5b4d2 172,174,211,260,296
+crates/xctx-ui/src/components.rs
+  h_5a0a1d6be5b4d2 48,57-58,62-63,69,383,391-392
+crates/xctx-ui/src/fork_dialog.rs
+  h_5a0a1d6be5b4d2 247,319,330
+crates/xctx-ui/src/inbox.rs
+  h_5a0a1d6be5b4d2 316,383
+crates/xctx-ui/src/lib.rs
+  h_5a0a1d6be5b4d2 28-29
+crates/xctx-ui/src/loop_bar.rs
+  h_5a0a1d6be5b4d2 387
+crates/xctx-ui/src/parent_agent.rs
+  h_5a0a1d6be5b4d2 157
+crates/xctx-ui/src/plan_gate.rs
+  h_5a0a1d6be5b4d2 271,341
+crates/xctx-ui/src/plugin_menu.rs
+  h_5a0a1d6be5b4d2 213,346
+crates/xctx-ui/src/prompt.rs
+  h_5a0a1d6be5b4d2 540,634
+crates/xctx-ui/src/review_sheet.rs
+  h_5a0a1d6be5b4d2 512,546,688,775,816
+crates/xctx-ui/src/shared_space.rs
+  h_5a0a1d6be5b4d2 127,147,153-157,261,298-300,313,315-318,322-323,325,327-345,349-350,352-361,474,547
+crates/xctx-ui/src/split_view.rs
+  h_5a0a1d6be5b4d2 60-61,72,82-87,173-180,200,203,205,207,404,445
+crates/xctx-ui/src/status_bar.rs
+  h_5a0a1d6be5b4d2 313,315
+crates/xctx-ui/src/tab_bar.rs
+  h_5a0a1d6be5b4d2 208,223,329,343,345,347-353
+crates/xctx-ui/src/theme.rs
+  h_5a0a1d6be5b4d2 10-12,14-20,22-25,28,30,32,34-42,44,46,48-51,144,146-198,200-210,212-244,253-257,265,276-277,281,283,318,320,325-366,370-372,383,396
+crates/xctx/src/attempt_ui.rs
+  h_5a0a1d6be5b4d2 647
+crates/xctx/src/dialogs.rs
+  h_5a0a1d6be5b4d2 8,530
+crates/xctx/src/graph_panel.rs
+  h_5a0a1d6be5b4d2 374
+crates/xctx/src/home.rs
+  h_5a0a1d6be5b4d2 491,645
+crates/xctx/src/inbox_view.rs
+  h_5a0a1d6be5b4d2 709
+crates/xctx/src/space_tab.rs
+  h_5a0a1d6be5b4d2 922-934
+crates/xctx/src/workspace.rs
+  h_5a0a1d6be5b4d2 8-9,158-177,181-182,205-207,286,340-361,790
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "1f9eb7f7d907d326280ac904feb905ae6750250b",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
