@@ -6639,6 +6639,7 @@ name = "xctx-ui"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "gpui_platform",
  "xctx-channel",
  "xctx-graph",
  "xctx-layout",
