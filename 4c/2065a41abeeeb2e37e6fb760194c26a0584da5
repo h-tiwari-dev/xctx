@@ -1,0 +1,104 @@
+Cargo.lock
+  h_5a0a1d6be5b4d2 6642
+Cargo.toml
+  h_5a0a1d6be5b4d2 8-11
+crates/xctx-ui/Cargo.toml
+  h_5a0a1d6be5b4d2 8
+crates/xctx-ui/assets/icons/check.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/chevron-down.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/chevron-right.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/close.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/error.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/external-link.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/fork.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/git.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/helper.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/home.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/idle.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/inbox.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/inspector.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/maximize.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/more.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/orchestrator.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/pause.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/paused.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/play.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/plugin.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/plus.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/refresh.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/running.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/search.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/settings.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/ship.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/sidebar.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/split-h.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/split-v.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/terminal.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/trash.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/warning.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/assets/icons/writer.svg
+  h_5a0a1d6be5b4d2 1
+crates/xctx-ui/src/bin/gallery.rs
+  h_5a0a1d6be5b4d2 1-790
+crates/xctx-ui/src/frame_overlay.rs
+  h_5a0a1d6be5b4d2 1-538
+crates/xctx-ui/src/icon.rs
+  h_5a0a1d6be5b4d2 1-491
+crates/xctx-ui/src/lib.rs
+  h_5a0a1d6be5b4d2 1-6,15-16,19-20,27,32,46-50,56-61,79,86-89
+crates/xctx-ui/src/motion.rs
+  h_5a0a1d6be5b4d2 1-216
+crates/xctx-ui/src/overlay.rs
+  h_5a0a1d6be5b4d2 1-413
+crates/xctx-ui/src/spinner.rs
+  h_5a0a1d6be5b4d2 1-180
+crates/xctx-ui/src/toast.rs
+  h_5a0a1d6be5b4d2 1-581
+crates/xctx-ui/tests/m6_kit_render.rs
+  h_5a0a1d6be5b4d2 1-286
+mise.toml
+  h_5a0a1d6be5b4d2 17-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "4c2065a41abeeeb2e37e6fb760194c26a0584da5",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
