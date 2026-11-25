@@ -1,0 +1,14 @@
+docs/m6.md
+  h_5a0a1d6be5b4d2 289-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "69bf24dfee2d7439d4e60450b891a60589ef3f56",
+  "prompts": {},
+  "humans": {
+    "h_5a0a1d6be5b4d2": {
+      "author": "sjha2048 <sjha200000@gmail.com>"
+    }
+  }
+}
