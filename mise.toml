@@ -14,6 +14,10 @@ run = "cargo run -q -p xctx-control --bin xctx-ctl --"
 description = "Build the xctx app and xctx-ctl in release mode"
 run = "cargo build -p xctx -p xctx-control --bins --release"
 
+[tasks.gallery]
+description = "Run the xctx-ui component gallery"
+run = "cargo run -p xctx-ui --bin gallery"
+
 [tasks.test]
 description = "Run tests across the workspace"
 run = "cargo test --workspace"
