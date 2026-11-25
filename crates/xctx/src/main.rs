@@ -16,6 +16,11 @@ mod lifecycle;
 mod lifecycle_tests;
 mod parent_agent;
 mod persist;
+mod plugin_backend;
+mod plugin_host;
+mod plugin_jobs;
+#[cfg(test)]
+mod plugin_tests;
 mod space_graph;
 mod space_layout;
 mod space_tab;

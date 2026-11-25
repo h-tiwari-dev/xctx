@@ -15,11 +15,13 @@ use xctx_control::protocol::{
     Ack, AttemptDiffParams, AttemptListParams, AttemptListResult, AttemptProposeParams,
     AttemptProposeResult, AttemptReportParams, DraftRepoSummary, InboxItemSummary, InboxListParams,
     InboxListResult, InboxPostParams, InboxPostResult, LayoutInfo, PaneSplitResult, PaneZoomResult,
-    PingResult, RepoSummary, SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary,
+    PingResult, PluginCallParams, PluginCallResult, PluginEmitParams, PluginEmitResult,
+    PluginListResult, PluginMountResult, PluginSummary, PluginToolsResult, PluginUnmountResult,
+    RepoSummary, SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary,
     SpaceWidenProposeParams, SpaceWidenProposeResult, StatusSetParams,
 };
 use xctx_control::{
-    Call, Incoming, Method, Responder, RpcError, Server, ServerConfig, StatusLevel, socket_path,
+    Call, Incoming, Responder, RpcError, Server, ServerConfig, StatusLevel, socket_path,
 };
 use xctx_core::{
     DraftRepo, EnvReport, MiseRunner, Redactor, RepoIndex, Space, SpaceDraft, SpaceId,
@@ -38,6 +40,8 @@ use crate::attempts::{
 };
 use crate::lifecycle::{home_dir, repo_for_draft};
 use crate::persist::restore_layout;
+use crate::plugin_host::{MountSettings, event_action, plugin_summary, tool_specs};
+use crate::plugin_jobs::{MountOutcome, ToolCallResult, UnmountTarget};
 use crate::space_graph::{
     SpaceGraphState, add_lane, channel_list, channel_post, contract_agree, contract_get,
     contract_set, loop_advance, loop_approval_notice, loop_set_autonomy, remove_lane,
@@ -388,13 +392,6 @@ struct MiseFindings {
     checks: Vec<(MiseCheck, xctx_core::Result<EnvReport>)>,
 }
 
-/// The refusal every plugin method gets until plugins are wired into the app (Milestone 5, Wave 3).
-fn plugins_not_wired(method: Method) -> RpcError {
-    RpcError::conflict(format!(
-        "{method}: plugins are not wired into this xctx yet (Milestone 5, Wave 3)"
-    ))
-}
-
 // -------------------------------------------------------------------------------------------------------------
 // The workspace side
 
@@ -530,6 +527,7 @@ impl Workspace {
                 }
             }
             call @ (Call::InboxList(_)
+            | Call::PluginCall(_)
             | Call::ChannelList(_)
             | Call::ContractGet(_)
             | Call::ContractSet(_)
@@ -595,14 +593,51 @@ impl Workspace {
             Call::SpaceWidenPropose(p) => to_json(self.control_widen_propose(&p, cx)),
             Call::AttemptReport(p) => to_json(self.control_attempt_report(&p, cx)),
             Call::AttemptPropose(p) => to_json(self.control_attempt_propose(&p, cx)),
-            // The plugin registry, tool runner and plugin panes come in Milestone 5, Wave 3. Until then every
-            // plugin method is refused, so an agent learns plugins are not available rather than guessing.
-            call @ (Call::PluginList(_)
-            | Call::PluginTools(_)
-            | Call::PluginMount(_)
-            | Call::PluginUnmount(_)
-            | Call::PluginCall(_)
-            | Call::PluginEmit(_)) => Err(plugins_not_wired(call.method())),
+            Call::PluginList(p) => to_json(self.control_plugin_list(p.space.as_deref())),
+            Call::PluginTools(p) => {
+                to_json(self.control_plugin_tools(&p.plugin, p.space.as_deref()))
+            }
+            Call::PluginMount(p) => to_json(self.in_open_space(
+                &p.space,
+                window,
+                cx,
+                |this, id, window, cx| match this.mount_plugin(
+                    id,
+                    &p.plugin,
+                    p.repo,
+                    MountSettings::default(),
+                    true,
+                    window,
+                    cx,
+                )? {
+                    MountOutcome::Mounted(pane) => Ok(PluginMountResult {
+                        pane: Some(pane),
+                        inbox_item: None,
+                    }),
+                    MountOutcome::Gated(item) => Ok(PluginMountResult {
+                        pane: None,
+                        inbox_item: Some(item.as_str().to_owned()),
+                    }),
+                },
+            )),
+            Call::PluginUnmount(p) => {
+                to_json(
+                    self.in_open_space(&p.space, window, cx, |this, id, window, cx| {
+                        let target = match (p.plugin, p.pane) {
+                            (Some(plugin), None) => UnmountTarget::Plugin(plugin),
+                            (None, Some(pane)) => UnmountTarget::Pane(pane),
+                            _ => {
+                                return Err(RpcError::invalid_params(
+                                    "plugin.unmount: name exactly one of plugin= and pane=",
+                                ));
+                            }
+                        };
+                        let closed = this.unmount_plugin(id, target, window, cx)?;
+                        Ok(PluginUnmountResult { closed })
+                    }),
+                )
+            }
+            Call::PluginEmit(p) => to_json(self.control_plugin_emit(&p, cx)),
         };
         responder.respond(result);
     }
@@ -612,6 +647,10 @@ impl Workspace {
     fn answer_masked_read(&mut self, call: Call, responder: Responder, cx: &mut Context<Self>) {
         if let Call::AttemptDiff(p) = call {
             self.control_attempt_diff(p, responder, cx);
+            return;
+        }
+        if let Call::PluginCall(p) = call {
+            self.control_plugin_call(p, responder, cx);
             return;
         }
         let result = self.masked_read(call, cx);
@@ -828,6 +867,9 @@ impl Workspace {
             vec![None; proposal.count as usize],
         )
         .map_err(|e| attempt_rpc_error(&id, e))?;
+        if let Some(why) = self.fork_refusal(&space, &AgentNodeId::new(proposal.agent.clone())) {
+            return Err(RpcError::conflict(format!("{id}: {why}")));
+        }
         let title = format!(
             "A request to fork {} of {} in {id} is waiting in the Inbox for your approval",
             if proposal.count == 1 {
@@ -889,6 +931,170 @@ impl Workspace {
             responder.respond(result);
         })
         .detach();
+    }
+
+    /// `plugin.list`: the plugins `space` can use (every active space's, merged, when `None`), where each comes
+    /// from and where it is mounted.
+    fn control_plugin_list(&mut self, space: Option<&str>) -> Result<PluginListResult, RpcError> {
+        let spaces: Vec<Space> = match space {
+            Some(name) => {
+                let id =
+                    resolve_space(&self.spaces, |id| self.in_flight_spaces.contains(id), name)?;
+                self.active_space(&id).into_iter().collect()
+            }
+            None => self.spaces.clone(),
+        };
+        let all = self.spaces.clone();
+        let mut plugins: Vec<PluginSummary> = Vec::new();
+        let mut add = |summary: PluginSummary| {
+            if !plugins
+                .iter()
+                .any(|p| p.name == summary.name && p.repo == summary.repo)
+            {
+                plugins.push(summary);
+            }
+        };
+        if spaces.is_empty() {
+            for plugin in self.plugins.base_registry().plugins() {
+                let mounted = self.plugins.mounted_in(&all, plugin.name());
+                add(plugin_summary(plugin, None, mounted));
+            }
+        }
+        for space in &spaces {
+            let registry = self.plugins.registry(space);
+            for plugin in registry.plugins() {
+                let mounted = match plugin.source {
+                    xctx_plugin::Source::Repo { .. } => self
+                        .plugins
+                        .mounted_in(std::slice::from_ref(space), plugin.name()),
+                    _ => self.plugins.mounted_in(&all, plugin.name()),
+                };
+                add(plugin_summary(plugin, Some(space), mounted));
+            }
+        }
+        Ok(PluginListResult { plugins })
+    }
+
+    /// `plugin.tools`: `plugin`'s tools, with their parameters and effects.
+    fn control_plugin_tools(
+        &mut self,
+        plugin: &str,
+        space: Option<&str>,
+    ) -> Result<PluginToolsResult, RpcError> {
+        let registry = match space {
+            Some(name) => {
+                let id =
+                    resolve_space(&self.spaces, |id| self.in_flight_spaces.contains(id), name)?;
+                let space = self
+                    .active_space(&id)
+                    .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+                self.plugins.registry(&space)
+            }
+            None => self.plugins.base_registry(),
+        };
+        let found = registry.get(plugin).ok_or_else(|| {
+            RpcError::not_found(format!(
+                "no plugin named {plugin}{}",
+                if space.is_none() {
+                    "; name the space (space=<slug>) to see its repos' plugins"
+                } else {
+                    ""
+                }
+            ))
+        })?;
+        Ok(tool_specs(&found.manifest))
+    }
+
+    /// `plugin.call`: run a read tool and answer with its masked output, or post a write to the Inbox and answer
+    /// with its gate. Answered once the call finishes.
+    fn control_plugin_call(
+        &mut self,
+        params: PluginCallParams,
+        responder: Responder,
+        cx: &mut Context<Self>,
+    ) {
+        let id = match resolve_space(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            &params.space,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                responder.respond(Err(e));
+                return;
+            }
+        };
+        self.call_plugin_tool(
+            &id,
+            &params.plugin,
+            &params.tool,
+            params.args,
+            None,
+            false,
+            cx,
+            move |_, result, _| {
+                let answer = result.map(|result| match result {
+                    ToolCallResult::Output(output) => PluginCallResult {
+                        output: Some(output.json),
+                        inbox_item: None,
+                    },
+                    ToolCallResult::Gated(item) => PluginCallResult {
+                        output: None,
+                        inbox_item: Some(item.as_str().to_owned()),
+                    },
+                });
+                responder.respond(to_json(answer));
+            },
+        );
+    }
+
+    /// `plugin.emit`: an event from a plugin's own tool. The plugin must be mounted in the space and declare the
+    /// event; it then fires as the manifest maps it.
+    fn control_plugin_emit(
+        &mut self,
+        params: &PluginEmitParams,
+        cx: &mut Context<Self>,
+    ) -> Result<PluginEmitResult, RpcError> {
+        let id = resolve_space(
+            &self.spaces,
+            |id| self.in_flight_spaces.contains(id),
+            &params.space,
+        )?;
+        let space = self
+            .active_space(&id)
+            .ok_or_else(|| RpcError::not_found(format!("no active space named {id}")))?;
+        let registry = self.plugins.registry(&space);
+        let plugin = registry.usable(&params.plugin).ok_or_else(|| {
+            RpcError::not_found(format!("no usable plugin named {}", params.plugin))
+        })?;
+        if plugin.manifest.event(&params.event).is_none() {
+            let names: Vec<&str> = plugin
+                .manifest
+                .events
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect();
+            return Err(RpcError::invalid_params(format!(
+                "{} declares no event {}; its events are {}",
+                params.plugin,
+                params.event,
+                if names.is_empty() {
+                    "none".to_owned()
+                } else {
+                    names.join(", ")
+                }
+            )));
+        }
+        self.plugins.mount_of(&id, &params.plugin, None)?;
+        let detail = match &params.detail {
+            None => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        };
+        let report = self.fire_plugin_event(&id, &params.plugin, &params.event, &detail, cx)?;
+        Ok(PluginEmitResult {
+            action: report.action.map(event_action),
+        })
     }
 
     /// Answer the drafts that waited for the repo index.
@@ -1113,6 +1319,7 @@ impl Workspace {
                 Err(_) => continue,
             };
             self.redactor.extend(report.secrets.clone());
+            self.plugins.learn_secrets(&check.space, &report.secrets);
             missing += report.missing.len();
             if let Some(inbox) = self.inbox.as_mut()
                 && let Err(e) = inbox.sync_missing(
@@ -1154,19 +1361,6 @@ mod tests {
     use xctx_control::ErrorCode;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    #[test]
-    fn plugin_methods_are_refused_until_wave_3() {
-        for method in Method::ALL
-            .into_iter()
-            .filter(|m| m.name().starts_with("plugin."))
-        {
-            let error = plugins_not_wired(method);
-            assert_eq!(error.kind(), Some(ErrorCode::Conflict), "{method}");
-            assert!(error.message.starts_with(method.name()), "{method}");
-            assert!(error.message.contains("not wired"), "{method}");
-        }
-    }
 
     fn space(slug: &str) -> Space {
         Space {
