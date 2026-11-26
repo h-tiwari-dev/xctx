@@ -534,12 +534,10 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_port_is_not_listening() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_port_with_a_listener_is_listening() -> Result<(), Box<dyn std::error::Error>> {
+        // Only the open case: after the listener drops, another test may take the freed port at once.
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let port = listener.local_addr()?.port();
-        assert!(is_listening(port));
-        drop(listener);
-        assert!(!is_listening(port));
+        assert!(is_listening(listener.local_addr()?.port()));
         Ok(())
     }
 }

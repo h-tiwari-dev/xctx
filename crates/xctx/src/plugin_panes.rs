@@ -46,10 +46,10 @@ pub(crate) type PaneKey = (SpaceId, PaneId);
 pub const VIEW_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// What a logs pane says when it tails nothing (it could not start, or was mounted with no command or file).
-pub const LOGS_NOT_TAILING: &str = "This pane tails nothing: mount it with a command or a log file (settings `command` or `log_file`).";
+pub const LOGS_NOT_TAILING: &str = "This pane tails nothing: close it (⌘W) and open Logs from the tool dock with a command or a log file.";
 
 /// What a plugin pane says when it has no mount or its plugin cannot be used.
-pub const NO_MOUNT: &str = "This plugin pane has no mount, or its plugin is not installed or trusted. Close it (⌘W) and mount the plugin again from the Plugins menu (⌘⇧P).";
+pub const NO_MOUNT: &str = "This tool pane has no tool behind it, or the tool is not installed or trusted. Close it (⌘W) and open the tool again from the dock on the right.";
 
 /// What a space's second browser pane says: the space has one live page, shown in its first browser pane.
 pub const ONE_PAGE_PER_SPACE: &str =
@@ -729,7 +729,7 @@ impl Workspace {
             return missing(NO_MOUNT.to_owned());
         };
         let Some(renderer) = RendererKind::from_name(kind) else {
-            return missing(format!("a {kind} plugin pane has no renderer"));
+            return missing(format!("a {kind} tool pane has no renderer"));
         };
         let settings = settings.unwrap_or_default();
         // URLs with their credentials (user info, token-like query values) masked too.
@@ -1235,10 +1235,11 @@ impl Workspace {
                     .map(|((_, p), _)| *p)
                     .min_by_key(|p| p.0);
                 let page = if first == Some(pane) {
-                    // A dialog draws over the pane, and the page would draw over the dialog: hide it then.
+                    // A dialog or a tool dock popover draws over the pane, and the page would draw over it: hide it
+                    // then.
                     self.browsers
                         .view(id)
-                        .map(|view| page_area(view, self.dialog.is_none()))
+                        .map(|view| page_area(view, self.pages_may_show()))
                 } else {
                     let theme = Theme::of(cx);
                     Some(

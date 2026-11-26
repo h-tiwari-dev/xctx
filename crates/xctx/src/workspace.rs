@@ -25,9 +25,9 @@ use crate::dialogs::Dialog;
 use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
-    FocusRight, FocusUp, ForkAttempts, LaunchDraft, OpenPlugins, Quit, ResizeDown, ResizeLeft,
-    ResizeRight, ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph,
-    ToggleZoom, WORKSPACE_CONTEXT, home_key_hints, space_key_hints,
+    FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
+    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph, ToggleZoom,
+    WORKSPACE_CONTEXT, home_key_hints, space_key_hints,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
@@ -144,6 +144,8 @@ pub(crate) struct Workspace {
     pub(crate) browsers: crate::plugin_browser::Browsers,
     /// The hint bubbles for local servers seen in the open spaces' terminals.
     pub(crate) serve_hints: crate::serve_hints::ServeHints,
+    /// The tool dock's popovers and what each open space's dock lists.
+    pub(crate) tool_dock: crate::tool_dock::DockState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -287,6 +289,7 @@ impl Workspace {
             plugin_panes: Default::default(),
             browsers: Default::default(),
             serve_hints: Default::default(),
+            tool_dock: Default::default(),
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -588,8 +591,7 @@ impl Workspace {
         let shape = self.active_tab().map(|tab| layout_shape(tab.space.shape));
         let graph_open = self.active_tab().is_some_and(|tab| tab.graph_open);
         let entity = cx.entity().downgrade();
-        let (home, select, reshape, ship, discard, graph, plugins, add_repo, add_agent) = (
-            entity.clone(),
+        let (home, select, reshape, ship, discard, graph, add_repo, add_agent) = (
             entity.clone(),
             entity.clone(),
             entity.clone(),
@@ -608,13 +610,6 @@ impl Workspace {
                 let _ = graph.update(cx, |this, cx| {
                     if this.dialog.is_none() {
                         this.toggle_graph(window, cx);
-                    }
-                });
-            })
-            .on_plugins(move |window, cx| {
-                let _ = plugins.update(cx, |this, cx| {
-                    if this.dialog.is_none() {
-                        this.open_plugins_menu(window, cx);
                     }
                 });
             })
@@ -700,8 +695,10 @@ impl Render for Workspace {
         self.browsers.attach(window);
         self.sync_plugin_panes(window, cx);
         self.refresh_plugin_panes(cx);
+        // The dock reads what is open every frame, so a tool an agent opens lights up at once.
+        let dock = self.active_space_id().map(|id| self.tool_dock_view(&id));
         let body = match self.active_tab() {
-            Some(tab) => self.render_space(tab, cx),
+            Some(tab) => self.render_space(tab, dock, cx),
             None => self.render_home(window, cx),
         };
         let dialog = self.render_dialog(cx);
@@ -762,10 +759,6 @@ impl Render for Workspace {
             .on_action(Self::pane_shortcut::<ForkAttempts>(
                 cx,
                 |this, window, cx| this.fork_from_keys(window, cx),
-            ))
-            .on_action(Self::pane_shortcut::<OpenPlugins>(
-                cx,
-                |this, window, cx| this.open_plugins_menu(window, cx),
             ))
             .on_action(Self::pane_shortcut::<ReviewAttempts>(
                 cx,

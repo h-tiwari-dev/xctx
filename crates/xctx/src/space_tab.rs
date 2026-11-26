@@ -226,10 +226,7 @@ impl Workspace {
             .insert(id.clone(), SpaceTab::new(space.clone(), restored.layout));
         self.sync_agent_panes(id);
         if let Err(e) = self.plugins.reconcile(id, &panes) {
-            self.error(
-                format!("could not read the plugins mounted in {id}: {e}"),
-                cx,
-            );
+            self.error(format!("could not read the tools open in {id}: {e}"), cx);
         }
         self.show_plugin_problems(&space, cx);
         let preferred = self
@@ -1023,17 +1020,20 @@ impl Workspace {
     }
 
     /// The pane area of the space being shown (its split view, under the attempt strip when it has attempts),
-    /// with the agent graph panel beside it when open.
-    pub(crate) fn render_space(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
+    /// with the agent graph panel beside it when open, and the tool dock (drawn from `dock`) on the right edge.
+    pub(crate) fn render_space(
+        &self,
+        tab: &SpaceTab,
+        dock: Option<xctx_ui::ToolDockView>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let split = self.render_space_body(tab, cx);
-        if !tab.graph_open {
-            return split;
-        }
         div()
             .flex()
             .size_full()
             .child(div().flex_1().min_w_0().h_full().child(split))
-            .child(self.render_graph_panel(tab, cx))
+            .children(tab.graph_open.then(|| self.render_graph_panel(tab, cx)))
+            .children(dock.map(|view| self.render_tool_dock(view, cx)))
             .into_any_element()
     }
 
@@ -1071,7 +1071,7 @@ impl Workspace {
                                 .text_size(Theme::TEXT_SM)
                                 .text_color(theme.text_subtle)
                                 .child(format!(
-                                    "{} plugin",
+                                    "{} tool",
                                     pane.role.plugin.as_deref().unwrap_or("unknown")
                                 ))
                                 .into_any_element()

@@ -93,6 +93,24 @@ pub enum IconName {
     ExternalLink,
     /// Overflow menu (`…`).
     More,
+
+    // Tools
+    /// Locked: a tool waiting for the user's approval.
+    Lock,
+    /// A web page: the browser tool.
+    Globe,
+    /// A database tool.
+    Database,
+    /// A folder: the files tool.
+    Folder,
+    /// A text file: the logs tool.
+    FileText,
+    /// Sending a request: the API client tool.
+    Send,
+    /// A ticket: an issue tracker connector.
+    Ticket,
+    /// A pen tool: a design connector.
+    PenTool,
 }
 
 impl IconName {
@@ -131,6 +149,14 @@ impl IconName {
         Self::Refresh,
         Self::ExternalLink,
         Self::More,
+        Self::Lock,
+        Self::Globe,
+        Self::Database,
+        Self::Folder,
+        Self::FileText,
+        Self::Send,
+        Self::Ticket,
+        Self::PenTool,
     ];
 
     /// The asset path used with [`UiAssets`] and [`gpui::svg`].
@@ -169,6 +195,14 @@ impl IconName {
             Self::Refresh => "icons/refresh.svg",
             Self::ExternalLink => "icons/external-link.svg",
             Self::More => "icons/more.svg",
+            Self::Lock => "icons/lock.svg",
+            Self::Globe => "icons/globe.svg",
+            Self::Database => "icons/database.svg",
+            Self::Folder => "icons/folder.svg",
+            Self::FileText => "icons/file-text.svg",
+            Self::Send => "icons/send.svg",
+            Self::Ticket => "icons/ticket.svg",
+            Self::PenTool => "icons/pen-tool.svg",
         }
     }
 
@@ -208,6 +242,14 @@ impl IconName {
             Self::Refresh => "refresh",
             Self::ExternalLink => "external-link",
             Self::More => "more",
+            Self::Lock => "lock",
+            Self::Globe => "globe",
+            Self::Database => "database",
+            Self::Folder => "folder",
+            Self::FileText => "file-text",
+            Self::Send => "send",
+            Self::Ticket => "ticket",
+            Self::PenTool => "pen-tool",
         }
     }
 
@@ -247,6 +289,14 @@ impl IconName {
             Self::Refresh => include_bytes!("../assets/icons/refresh.svg"),
             Self::ExternalLink => include_bytes!("../assets/icons/external-link.svg"),
             Self::More => include_bytes!("../assets/icons/more.svg"),
+            Self::Lock => include_bytes!("../assets/icons/lock.svg"),
+            Self::Globe => include_bytes!("../assets/icons/globe.svg"),
+            Self::Database => include_bytes!("../assets/icons/database.svg"),
+            Self::Folder => include_bytes!("../assets/icons/folder.svg"),
+            Self::FileText => include_bytes!("../assets/icons/file-text.svg"),
+            Self::Send => include_bytes!("../assets/icons/send.svg"),
+            Self::Ticket => include_bytes!("../assets/icons/ticket.svg"),
+            Self::PenTool => include_bytes!("../assets/icons/pen-tool.svg"),
         }
     }
 

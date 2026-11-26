@@ -659,8 +659,8 @@ pub fn plugin_pane_launch(
         }
         None => {
             launch.notice = Some(format!(
-                "{program} was not found; opened a shell for the {} plugin instead",
-                role.plugin.as_deref().unwrap_or("plugin")
+                "{program} was not found; opened a shell for the {} tool instead",
+                role.plugin.as_deref().unwrap_or("tool")
             ));
         }
     }

@@ -1,17 +1,17 @@
-//! The Milestone 5 Plugins menu in GPUI's headless test window: one click adds a plugin with no setting, a plugin
-//! with a setting opens inline and mounts with what its input holds, mounted plugins offer Show and Remove,
-//! nothing reacts while busy, and its badges, groups, problems, caps and error line.
+//! The Milestone 5 tool dock in GPUI's headless test window: a click opens a closed tool and closes an open one, a
+//! tool with no usable default asks in a popover, a right-click or the hover chevron opens the popover, a locked
+//! tool shows its lock, the problems item lists the manifests that could not be read, and nothing reacts while busy.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    Context, Entity, IntoElement, Modifiers, Render, SharedString, TestAppContext,
+    Context, Entity, IntoElement, Modifiers, MouseButton, Render, SharedString, TestAppContext,
     VisualTestContext, Window, div, prelude::*,
 };
 use xctx_ui::{
-    IconName, MountedEntry, PLUGIN_PROBLEM_LIMIT, PLUGIN_ROW_LIMIT, PluginEntry, PluginGroup,
-    PluginMenu, PluginMenuView, PluginProblemRow, PluginSetting, PluginSource, PromptInput, Theme,
+    DockItem, IconName, PromptInput, TOOL_PROBLEM_LIMIT, Theme, ToolDock, ToolDockView, ToolGroup,
+    ToolProblem, ToolSetting,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -21,6 +21,17 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) -> bool {
         return false;
     };
     cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    true
+}
+
+fn right_click(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+    let Some(bounds) = cx.debug_bounds(selector) else {
+        return false;
+    };
+    cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
     true
 }
 
@@ -28,58 +39,62 @@ fn drawn(cx: &mut VisualTestContext, selector: &'static str) -> bool {
     cx.debug_bounds(selector).is_some()
 }
 
-/// A host like the app's: it opens a setting row with the setting's default in its input, and mounts with what
-/// the input holds.
-struct MenuHost {
-    view: PluginMenuView,
+/// A host like the app's: it opens a popover with the setting's default in its input, opens tools with what the
+/// input holds, and toggles the problems list.
+struct DockHost {
+    view: ToolDockView,
     input: Entity<PromptInput>,
     log: Log,
 }
 
-impl Render for MenuHost {
+impl Render for DockHost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let log = self.log.clone();
-        let (add, show, remove, close) = (log.clone(), log.clone(), log.clone(), log.clone());
+        let (open, close) = (self.log.clone(), self.log.clone());
         let host = cx.entity().downgrade();
-        let submit_host = host.clone();
-        let mut menu = PluginMenu::new(self.view.clone())
-            .on_add(move |name, _, _| add.borrow_mut().push(format!("add {name}")))
-            .on_expand(move |name, _, cx| {
+        let (submit_host, problems_host) = (host.clone(), host.clone());
+        let mut dock = ToolDock::new(self.view.clone())
+            .on_open(move |name, _, _| open.borrow_mut().push(format!("open {name}")))
+            .on_close(move |name, _, _| close.borrow_mut().push(format!("close {name}")))
+            .on_popover(move |name, _, cx| {
                 let name = name.cloned();
-                let _ = host.update(cx, |host, cx| host.expand(name, cx));
+                let _ = host.update(cx, |host, cx| host.popover(name, cx));
             })
             .on_submit(move |name, _, cx| {
                 let name = name.clone();
                 let _ = submit_host.update(cx, |host, cx| {
                     let value = host.input.read(cx).value().to_owned();
-                    host.log.borrow_mut().push(format!("add {name}: {value}"));
+                    host.log.borrow_mut().push(format!("open {name}: {value}"));
                 });
             })
-            .on_show(move |name, _, _| show.borrow_mut().push(format!("show {name}")))
-            .on_remove(move |name, _, _| remove.borrow_mut().push(format!("remove {name}")))
-            .on_close(move |_, _| close.borrow_mut().push("close".to_owned()));
-        if self.view.expanded.is_some() {
-            menu = menu.setting_input(self.input.clone());
+            .on_problems(move |open, _, cx| {
+                let _ = problems_host.update(cx, |host, cx| {
+                    host.log.borrow_mut().push(format!("problems {open}"));
+                    host.view.problems_open = open;
+                    cx.notify();
+                });
+            });
+        if self.view.popover.is_some() {
+            dock = dock.setting_input(self.input.clone());
         }
-        div().size_full().child(menu)
+        div().size_full().flex().justify_end().child(dock)
     }
 }
 
-impl MenuHost {
-    fn expand(&mut self, name: Option<SharedString>, cx: &mut Context<Self>) {
+impl DockHost {
+    fn popover(&mut self, name: Option<SharedString>, cx: &mut Context<Self>) {
         let default = name.as_ref().and_then(|name| {
             self.view
-                .plugins
+                .items
                 .iter()
-                .find(|p| &p.name == name)
-                .and_then(|p| p.setting.as_ref())
+                .find(|item| &item.name == name)
+                .and_then(|item| item.setting.as_ref())
                 .map(|s| s.default.to_string())
         });
         self.log.borrow_mut().push(match &name {
-            Some(name) => format!("expand {name}"),
-            None => "collapse".to_owned(),
+            Some(name) => format!("popover {name}"),
+            None => "popover closed".to_owned(),
         });
-        self.view.expanded = name;
+        self.view.popover = name;
         if let Some(default) = default {
             self.input
                 .update(cx, |input, cx| input.set_value(&default, cx));
@@ -88,69 +103,63 @@ impl MenuHost {
     }
 }
 
-fn entry(name: &str, group: PluginGroup, source: PluginSource, needs_trust: bool) -> PluginEntry {
-    PluginEntry {
+fn item(name: &str, group: ToolGroup) -> DockItem {
+    DockItem {
         name: name.to_owned().into(),
         title: name.to_uppercase().into(),
-        description: format!("the {name} plugin").into(),
+        detail: Some(format!("the {name} tool").into()),
         icon: IconName::Plugin,
-        source,
         group,
-        needs_trust,
+        open: false,
+        locked: false,
         setting: None,
+        needs_input: false,
     }
 }
 
-fn with_setting(mut entry: PluginEntry, default: &str) -> PluginEntry {
-    entry.setting = Some(PluginSetting {
+fn with_setting(mut item: DockItem, default: &str) -> DockItem {
+    item.setting = Some(ToolSetting {
         label: "Command".into(),
         default: default.to_owned().into(),
         hint: Some("blank for your shell".into()),
     });
-    entry
+    item.needs_input = default.is_empty();
+    item
 }
 
-fn menu_view() -> PluginMenuView {
-    PluginMenuView {
-        mounted: vec![MountedEntry {
-            name: "browser".into(),
-            title: "Browser".into(),
-            icon: IconName::ExternalLink,
-            showing: Some("http://localhost:4011/".into()),
-        }],
-        plugins: vec![
-            with_setting(
-                entry("terminal", PluginGroup::Panes, PluginSource::Builtin, false),
-                "npm run dev",
-            ),
-            entry("files", PluginGroup::Panes, PluginSource::Builtin, false),
-            entry(
-                "jira",
-                PluginGroup::Connectors,
-                PluginSource::Builtin,
-                false,
-            ),
-            entry("mine", PluginGroup::Tools, PluginSource::User, false),
-            entry("seed", PluginGroup::Other, PluginSource::Repo, true),
+fn dock_view() -> ToolDockView {
+    let mut browser = item("browser", ToolGroup::Panes);
+    browser.open = true;
+    let mut seed = item("seed", ToolGroup::Other);
+    seed.locked = true;
+    ToolDockView {
+        items: vec![
+            with_setting(item("terminal", ToolGroup::Panes), "npm run dev"),
+            with_setting(item("logs", ToolGroup::Panes), ""),
+            browser,
+            item("files", ToolGroup::Panes),
+            item("database", ToolGroup::Tools),
+            item("jira", ToolGroup::Connectors),
+            seed,
         ],
-        expanded: None,
-        problems: vec![PluginProblemRow {
+        problems: vec![ToolProblem {
             path: "/repo/.xctx/plugins/bad/plugin.toml".into(),
             message: "missing field `name`".into(),
         }],
+        popover: None,
+        problems_open: false,
         busy: false,
-        error: None,
     }
 }
 
-fn menu_host(
+fn dock_host(
     cx: &mut TestAppContext,
-    view: PluginMenuView,
-) -> (Log, Entity<MenuHost>, &mut VisualTestContext) {
+    view: ToolDockView,
+) -> (Log, Entity<DockHost>, &mut VisualTestContext) {
     cx.update(|cx| cx.set_global(Theme::dark()));
     let events: Log = Rc::default();
     let log = events.clone();
-    let (host, cx) = cx.add_window_view(move |_, cx| MenuHost {
+    let (host, cx) = cx.add_window_view(move |_, cx| DockHost {
         view,
         input: cx.new(PromptInput::new),
         log,
@@ -160,151 +169,130 @@ fn menu_host(
 }
 
 #[gpui::test]
-fn one_click_adds_a_plugin_with_no_setting(cx: &mut TestAppContext) {
-    let (events, _host, cx) = menu_host(cx, menu_view());
+fn a_click_opens_a_closed_tool_and_closes_an_open_one(cx: &mut TestAppContext) {
+    let (events, _host, cx) = dock_host(cx, dock_view());
     for selector in [
-        "plugin-group-panes",
-        "plugin-group-tools",
-        "plugin-group-connectors",
-        "plugin-group-other",
-        "plugin-source-mine",
-        "plugin-source-seed",
-        "plugin-trust-seed",
-        "plugin-problem-0",
+        "tool-dock",
+        "tool-open-browser",
+        "tool-divider-0",
+        "tool-divider-1",
+        "tool-divider-2",
     ] {
         assert!(drawn(cx, selector), "{selector} is drawn");
     }
-    // Built-ins carry no source badge, and only the untrusted plugin needs approval.
-    assert!(!drawn(cx, "plugin-source-files"));
-    assert!(!drawn(cx, "plugin-trust-mine"));
-    for selector in ["plugin-add-files", "plugin-add-jira", "plugin-add-seed"] {
+    // Only the open tool shows the dot; four groups, three dividers.
+    assert!(!drawn(cx, "tool-open-files"));
+    assert!(!drawn(cx, "tool-divider-3"));
+    for selector in ["tool-files", "tool-browser", "tool-terminal", "tool-jira"] {
         assert!(click(cx, selector), "{selector} is drawn");
     }
-    assert_eq!(*events.borrow(), ["add files", "add jira", "add seed"]);
+    assert_eq!(
+        *events.borrow(),
+        ["open files", "close browser", "open terminal", "open jira"]
+    );
 }
 
 #[gpui::test]
-fn a_plugin_with_a_setting_opens_inline_and_mounts_with_its_value(cx: &mut TestAppContext) {
-    let (events, host, cx) = menu_host(cx, menu_view());
-    assert!(!drawn(cx, "plugin-setting-terminal"));
-    assert!(click(cx, "plugin-add-terminal"));
-    cx.run_until_parked();
-    assert!(drawn(cx, "plugin-setting-terminal"));
-    assert!(click(cx, "plugin-submit-terminal"));
-    // What the user typed replaces the default.
+fn a_tool_with_no_default_asks_in_a_popover(cx: &mut TestAppContext) {
+    let (events, host, cx) = dock_host(cx, dock_view());
+    assert!(!drawn(cx, "tool-popover-logs"));
+    assert!(click(cx, "tool-logs"));
+    assert!(drawn(cx, "tool-popover-logs"));
+    assert!(drawn(cx, "tool-setting-logs"));
     host.update(cx, |host, cx| {
         host.input
-            .update(cx, |input, cx| input.set_value("k9s", cx))
+            .update(cx, |input, cx| input.set_value("tail -F log/app.log", cx))
     });
     cx.run_until_parked();
-    assert!(click(cx, "plugin-submit-terminal"));
-    // Clicking the open row again closes it.
-    assert!(click(cx, "plugin-add-terminal"));
-    cx.run_until_parked();
-    assert!(!drawn(cx, "plugin-setting-terminal"));
+    assert!(click(cx, "tool-submit-logs"));
+    assert_eq!(
+        *events.borrow(),
+        ["popover logs", "open logs: tail -F log/app.log"]
+    );
+}
+
+#[gpui::test]
+fn a_right_click_or_the_chevron_opens_the_popover(cx: &mut TestAppContext) {
+    let (events, _host, cx) = dock_host(cx, dock_view());
+    // Only tools with a setting have the chevron.
+    assert!(drawn(cx, "tool-more-terminal"));
+    assert!(!drawn(cx, "tool-more-files"));
+    assert!(right_click(cx, "tool-terminal"));
+    assert!(drawn(cx, "tool-popover-terminal"));
+    // It opens with the default; Open submits it.
+    assert!(click(cx, "tool-submit-terminal"));
+    // A click outside closes it.
+    assert!(click(cx, "tool-database"));
+    assert!(!drawn(cx, "tool-popover-terminal"));
+    assert!(click(cx, "tool-more-terminal"));
+    assert!(drawn(cx, "tool-popover-terminal"));
+    // A right-click on a tool with no setting does nothing.
+    assert!(right_click(cx, "tool-files"));
     assert_eq!(
         *events.borrow(),
         [
-            "expand terminal",
-            "add terminal: npm run dev",
-            "add terminal: k9s",
-            "collapse"
+            "popover terminal",
+            "open terminal: npm run dev",
+            "popover closed",
+            "open database",
+            "popover terminal",
+            "popover closed",
         ]
     );
 }
 
 #[gpui::test]
-fn mounted_plugins_can_be_shown_or_removed(cx: &mut TestAppContext) {
-    let (events, host, cx) = menu_host(cx, menu_view());
-    assert!(drawn(cx, "plugin-mounted-browser"));
-    for selector in [
-        "plugin-show-browser",
-        "plugin-remove-browser",
-        "plugin-menu-close",
-    ] {
-        assert!(click(cx, selector), "{selector} is drawn");
-    }
-    assert_eq!(
-        *events.borrow(),
-        ["show browser", "remove browser", "close"]
-    );
-    // Nothing mounted: the section is gone.
-    host.update(cx, |host, cx| {
-        host.view.mounted.clear();
-        cx.notify();
-    });
-    cx.run_until_parked();
-    assert!(!drawn(cx, "plugin-mounted-browser"));
-    assert!(!drawn(cx, "plugin-show-browser"));
+fn an_untrusted_tool_shows_a_lock_and_still_asks_on_click(cx: &mut TestAppContext) {
+    let (events, _host, cx) = dock_host(cx, dock_view());
+    assert!(drawn(cx, "tool-lock-seed"));
+    assert!(!drawn(cx, "tool-lock-files"));
+    assert!(click(cx, "tool-seed"));
+    assert_eq!(*events.borrow(), ["open seed"]);
 }
 
 #[gpui::test]
-fn a_busy_plugins_menu_does_nothing(cx: &mut TestAppContext) {
-    let mut view = menu_view();
-    view.expanded = Some("terminal".into());
-    let (events, host, cx) = menu_host(cx, view);
-    host.update(cx, |host, cx| {
-        host.view.busy = true;
-        host.view.error = Some("plugin http is out of scope for production".into());
-        cx.notify();
-    });
-    cx.run_until_parked();
-    assert!(drawn(cx, "plugin-menu-error"));
-    for selector in [
-        "plugin-add-files",
-        "plugin-add-terminal",
-        "plugin-submit-terminal",
-        "plugin-show-browser",
-        "plugin-remove-browser",
-    ] {
-        assert!(click(cx, selector), "{selector} is drawn");
-    }
-    // Positive control: Close still works in the same window.
-    assert!(click(cx, "plugin-menu-close"));
-    assert_eq!(*events.borrow(), ["close"]);
-}
-
-#[gpui::test]
-fn the_plugins_menu_caps_long_lists_and_says_when_empty(cx: &mut TestAppContext) {
-    let mut view = menu_view();
-    view.plugins = (0..PLUGIN_ROW_LIMIT + 2)
-        .map(|i| {
-            entry(
-                &format!("p{i}"),
-                PluginGroup::Other,
-                PluginSource::User,
-                false,
-            )
-        })
-        .collect();
-    view.mounted = (0..PLUGIN_ROW_LIMIT + 1)
-        .map(|i| MountedEntry {
-            name: format!("m{i}").into(),
-            title: format!("M{i}").into(),
-            icon: IconName::Plugin,
-            showing: None,
-        })
-        .collect();
-    view.problems = (0..PLUGIN_PROBLEM_LIMIT + 1)
-        .map(|i| PluginProblemRow {
+fn the_problems_item_lists_what_could_not_be_loaded(cx: &mut TestAppContext) {
+    let mut view = dock_view();
+    view.problems = (0..TOOL_PROBLEM_LIMIT + 1)
+        .map(|i| ToolProblem {
             path: format!("/p{i}/plugin.toml").into(),
             message: "bad".into(),
         })
         .collect();
-    let (_events, host, cx) = menu_host(cx, view);
-    assert!(drawn(cx, "plugin-more"));
-    assert!(drawn(cx, "plugin-mounted-more"));
-    assert!(drawn(cx, "plugin-problems-more"));
-    assert!(!drawn(cx, "plugin-menu-empty"));
+    let (events, host, cx) = dock_host(cx, view);
+    assert!(drawn(cx, "tool-problems"));
+    assert!(!drawn(cx, "tool-problems-list"));
+    assert!(click(cx, "tool-problems"));
+    assert!(drawn(cx, "tool-problems-list"));
+    assert!(drawn(cx, "tool-problem-0"));
+    assert!(drawn(cx, "tool-problems-more"));
+    assert!(click(cx, "tool-problems"));
+    assert!(!drawn(cx, "tool-problems-list"));
+    assert_eq!(*events.borrow(), ["problems true", "problems false"]);
+    // No problems, no item.
     host.update(cx, |host, cx| {
-        host.view.plugins.clear();
-        host.view.mounted.clear();
         host.view.problems.clear();
         cx.notify();
     });
     cx.run_until_parked();
-    assert!(drawn(cx, "plugin-menu-empty"));
-    assert!(!drawn(cx, "plugin-more"));
-    assert!(!drawn(cx, "plugin-group-other"));
-    assert!(!drawn(cx, "plugin-problem-0"));
+    assert!(!drawn(cx, "tool-problems"));
+}
+
+#[gpui::test]
+fn a_busy_dock_does_nothing(cx: &mut TestAppContext) {
+    let mut view = dock_view();
+    view.busy = true;
+    let (events, _host, cx) = dock_host(cx, view);
+    for selector in [
+        "tool-files",
+        "tool-browser",
+        "tool-logs",
+        "tool-seed",
+        "tool-problems",
+    ] {
+        assert!(click(cx, selector), "{selector} is drawn");
+    }
+    assert!(right_click(cx, "tool-terminal"));
+    assert!(!drawn(cx, "tool-more-terminal"));
+    assert!(events.borrow().is_empty());
 }

@@ -227,8 +227,12 @@ impl Workspace {
             .map_err(|e| RpcError::internal(format!("could not post to the Inbox: {e}")))?;
         let what = match &gate.kind {
             PluginGateKind::WriteCall { tool, .. } => format!("{tool} ({})", gate.plugin),
-            PluginGateKind::Mount { .. } => format!("mounting {}", gate.plugin),
-            PluginGateKind::TrustRepoPlugin { .. } => format!("trusting {}", gate.plugin),
+            PluginGateKind::Mount { .. } => {
+                format!("opening {}", crate::tool_dock::display_name(&gate.plugin))
+            }
+            PluginGateKind::TrustRepoPlugin { .. } => {
+                format!("trusting {}", crate::tool_dock::display_name(&gate.plugin))
+            }
         };
         self.info(
             format!(
@@ -278,7 +282,10 @@ impl Workspace {
         }
         self.start_plugin_pane(id, &pane, window, cx);
         self.layout_changed(id, window, cx);
-        self.info(format!("Mounted {plugin} in {id}"), cx);
+        self.info(
+            format!("Opened {} in {id}", crate::tool_dock::display_name(plugin)),
+            cx,
+        );
         self.plugins_changed(id);
         Ok(pane.id)
     }

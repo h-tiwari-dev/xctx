@@ -34,7 +34,7 @@ impl InboxKind {
             Self::PlanGate => "PLAN",
             Self::SpaceWiden => "WIDEN",
             Self::AttemptProposal => "FORK",
-            Self::PluginGate => "PLUGIN",
+            Self::PluginGate => "TOOL",
             Self::MissingEnvVar => "ENV",
             Self::Notice => "NOTE",
         }

@@ -78,9 +78,8 @@ type ShapeHandler = Rc<dyn Fn(Shape, &mut Window, &mut App)>;
 ///
 /// The shape selector, Ship and Discard appear only when [`TabBar::active_shape`] is set, which the app does
 /// while a space is shown. The Graph toggle (test selector `tab-graph`) appears next to the shape selector when
-/// a space is shown and [`TabBar::on_graph`] is set; the Plugins button (`tab-plugins`) next to it with
-/// [`TabBar::on_plugins`], "+ Agent" (`tab-add-agent`) with [`TabBar::on_add_agent`] and "+ Repo"
-/// (`tab-add-repo`) with [`TabBar::on_add_repo`].
+/// a space is shown and [`TabBar::on_graph`] is set; "+ Agent" (`tab-add-agent`) next to it with
+/// [`TabBar::on_add_agent`] and "+ Repo" (`tab-add-repo`) with [`TabBar::on_add_repo`].
 #[derive(IntoElement)]
 pub struct TabBar {
     home_active: bool,
@@ -94,7 +93,6 @@ pub struct TabBar {
     on_ship: Option<Handler>,
     on_discard: Option<Handler>,
     on_graph: Option<Handler>,
-    on_plugins: Option<Handler>,
     on_add_repo: Option<Handler>,
     on_add_agent: Option<Handler>,
 }
@@ -120,7 +118,6 @@ impl TabBar {
             on_ship: None,
             on_discard: None,
             on_graph: None,
-            on_plugins: None,
             on_add_repo: None,
             on_add_agent: None,
         }
@@ -192,13 +189,6 @@ impl TabBar {
     /// Offer the Graph toggle while a space is shown, calling `handler` when it is clicked.
     pub fn on_graph(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_graph = Some(Rc::new(handler));
-        self
-    }
-
-    /// Offer a Plugins button while a space is shown (the space's Plugins menu), calling `handler` when it is
-    /// clicked.
-    pub fn on_plugins(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-        self.on_plugins = Some(Rc::new(handler));
         self
     }
 
@@ -311,12 +301,6 @@ impl RenderOnce for TabBar {
                             .on_click(move |_, window, cx| handler(window, cx)),
                     )
             });
-            let plugins = self.on_plugins.map(|handler| {
-                Button::new("tab-plugins", "Plugins")
-                    .variant(ButtonVariant::Ghost)
-                    .selector("tab-plugins")
-                    .on_click(move |_, window, cx| handler(window, cx))
-            });
             let add_repo = self.on_add_repo.map(|handler| {
                 Button::new("tab-add-repo", "+ Repo")
                     .variant(ButtonVariant::Ghost)
@@ -357,7 +341,6 @@ impl RenderOnce for TabBar {
                 .children(graph)
                 .children(add_agent)
                 .children(add_repo)
-                .children(plugins)
                 .child(div().w(px(1.0)).h(px(16.0)).bg(theme.border_subtle))
                 .child(discard)
                 .child(ship)
@@ -427,7 +410,6 @@ mod tests {
         assert!(bar.active_shape.is_none());
         assert!(!bar.home_active);
         assert!(bar.on_graph.is_none() && !bar.graph_open);
-        assert!(bar.on_plugins.is_none());
         let bar = bar
             .home_active(true)
             .active_shape(Some(Shape::Debug))

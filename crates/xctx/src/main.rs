@@ -25,7 +25,6 @@ mod plugin_backend;
 mod plugin_browser;
 mod plugin_host;
 mod plugin_jobs;
-mod plugin_menu_dialog;
 mod plugin_panes;
 #[cfg(test)]
 mod plugin_tests;
@@ -35,6 +34,7 @@ mod space_graph;
 mod space_layout;
 mod space_tab;
 mod spawn;
+mod tool_dock;
 mod workspace;
 
 use gpui::{

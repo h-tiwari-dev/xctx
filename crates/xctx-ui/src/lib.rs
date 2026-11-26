@@ -3,7 +3,7 @@
 //! tab bar, the split view over an `xctx-layout` pane tree, the prompt input, the status bar, the
 //! Inbox panel, the Plan Gate card, the Parent Agent drawer, the Agent Graph panel, the Shared
 //! Space panel, the loop bar, the fork dialog, the attempt strip and the review sheet for
-//! competing attempts, the Plugins menu, and the small buttons, pills and badges they share.
+//! competing attempts, the tool dock, and the small buttons, pills and badges they share.
 //! Components read their colours from the [`Theme`] global when one is set (`cx.set_global(Theme::dark())`),
 //! and fall back to [`Theme::dark`] otherwise. They hold no app state: the app passes in what to show and
 //! receives what the user did through callbacks and [`PromptEvent`]s.
@@ -20,7 +20,6 @@ pub mod motion;
 pub mod overlay;
 pub mod parent_agent;
 pub mod plan_gate;
-pub mod plugin_menu;
 pub mod prompt;
 pub mod repo_picker;
 pub mod review_sheet;
@@ -31,6 +30,7 @@ pub mod status_bar;
 pub mod tab_bar;
 pub mod theme;
 pub mod toast;
+pub mod tool_dock;
 
 pub use agent_graph::{
     AgentGraphView, HELPER_KINDS, PaneLive, agent_identity_color, agent_state_label,
@@ -62,11 +62,6 @@ pub use motion::{
 pub use overlay::{Overlay, OverlayPlacement};
 pub use parent_agent::{AgentStatus, DRAWER_HEIGHT, PARENT_AGENT_ROLE, ParentAgentDrawer};
 pub use plan_gate::{PLAN_GATE_HINT, PLAN_NEEDS_REPO, PlanGateCard, PlanGateView, PlanRepo};
-pub use plugin_menu::{
-    MountedEntry, PLUGIN_MENU_EMPTY, PLUGIN_PROBLEM_LIMIT, PLUGIN_ROW_LIMIT, PLUGIN_TRUST_HINT,
-    PluginEntry, PluginGroup, PluginMenu, PluginMenuView, PluginProblemRow, PluginSetting,
-    PluginSource,
-};
 pub use prompt::{PromptBuffer, PromptEvent, PromptInput};
 pub use repo_picker::{RepoChoice, RepoPicker};
 pub use review_sheet::{
@@ -89,4 +84,8 @@ pub use theme::{Theme, Tone, ToneColors};
 pub use toast::{
     DEFAULT_MAX_QUEUED_TOASTS, DEFAULT_MAX_VISIBLE_TOASTS, DEFAULT_TOAST_TTL, Toast, ToastAction,
     ToastEntry, ToastId, ToastQueue, ToastStack, toast_icon,
+};
+pub use tool_dock::{
+    DockItem, TOOL_DOCK_WIDTH, TOOL_ITEM_LIMIT, TOOL_LOCKED_HINT, TOOL_PROBLEM_LIMIT, ToolDock,
+    ToolDockView, ToolGroup, ToolProblem, ToolSetting,
 };

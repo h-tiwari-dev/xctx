@@ -55,7 +55,7 @@ pub const ACTION_SETTLE: Duration = Duration::from_millis(300);
 pub const CONSOLE_SETTLE: Duration = Duration::from_millis(200);
 
 /// What `page.*` tools say when the space has no browser pane.
-pub const NOT_MOUNTED: &str = "the browser plugin is not mounted in this space";
+pub const NOT_MOUNTED: &str = "the browser is not open in this space";
 
 /// One space's live browser.
 struct SpaceBrowser {

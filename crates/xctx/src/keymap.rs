@@ -56,8 +56,6 @@ actions!(
         ForkAttempts,
         /// Open the review sheet on the latest round of attempts of the space being shown.
         ReviewAttempts,
-        /// Open the Plugins menu of the space being shown.
-        OpenPlugins,
     ]
 );
 
@@ -94,7 +92,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-g", ToggleGraph, ws),
         KeyBinding::new("cmd-shift-f", ForkAttempts, ws),
         KeyBinding::new("cmd-shift-r", ReviewAttempts, ws),
-        KeyBinding::new("cmd-shift-p", OpenPlugins, ws),
         KeyBinding::new("cmd-0", ShowHome, ws),
         KeyBinding::new("cmd-enter", LaunchDraft, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
@@ -117,7 +114,6 @@ pub fn space_key_hints(fork: bool) -> Vec<KeyHint> {
         KeyHint::new("⌘G", "graph"),
         KeyHint::new("⌘⇧F", "fork"),
         KeyHint::new("⌘⇧R", "review"),
-        KeyHint::new("⌘⇧P", "plugins"),
         KeyHint::new("⌘0", "home"),
     ];
     if !fork {
@@ -149,6 +145,6 @@ mod tests {
         };
         assert!(keys(true).contains(&"⌘⇧F".to_owned()));
         assert!(!keys(false).contains(&"⌘⇧F".to_owned()));
-        assert!(keys(false).contains(&"⌘⇧P".to_owned()));
+        assert!(keys(false).contains(&"⌘G".to_owned()));
     }
 }
