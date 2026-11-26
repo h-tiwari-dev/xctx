@@ -23,6 +23,7 @@ xctx-inbox = { path = "../xctx-inbox" }
 xctx-layout = { path = "../xctx-layout" }
 xctx-nav = { path = "../xctx-nav" }
 xctx-omp = { path = "../xctx-omp" }
+xctx-omp-view = { path = "../xctx-omp-view" }
 xctx-plugin = { path = "../xctx-plugin" }
 xctx-plugin-view = { path = "../xctx-plugin-view" }
 xctx-term = { path = "../xctx-term" }

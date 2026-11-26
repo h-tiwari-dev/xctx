@@ -591,6 +591,10 @@ impl Workspace {
                 let handle = view.focus_handle(cx);
                 handle.focus(window, cx);
             }
+            Some(PaneTerminal::Omp(omp)) => {
+                let handle = omp.view.focus_handle(cx);
+                handle.focus(window, cx);
+            }
             // A plugin pane drawn by a renderer takes the keys in its main input (Esc leaves it).
             _ => match self.plugin_pane_focus(&(tab.space.id.clone(), focused), cx) {
                 Some(handle) => handle.focus(window, cx),

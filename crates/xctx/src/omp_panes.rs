@@ -2,16 +2,23 @@
 //! thread, carrying its frames into the space's graph and the Inbox, starting a crashed one again on its session,
 //! and Open in terminal, which hands the session to `omp --resume` in a terminal pane.
 //!
-//! The pane itself shows only a status line.
+//! The pane draws the session with `xctx-omp-view`'s [`OmpView`]: transcript, tool cards and a composer whose
+//! messages go to the agent's omp.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt;
 use futures::channel::mpsc;
-use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, Window, div};
+use gpui::{
+    AnyElement, AppContext, Context, Entity, IntoElement, ParentElement, Styled, Subscription,
+    Window, div,
+};
 use xctx_core::SpaceId;
 use xctx_graph::AgentNodeId;
 use xctx_layout::{PaneId, PaneKind, RolePane};
+use xctx_omp::{Frame, Incoming};
+use xctx_omp_view::{ModelChoice, OmpIntent, OmpView};
 use xctx_plugin::RunnerManifest;
 use xctx_term_view::TerminalView;
 use xctx_ui::Theme;
@@ -36,6 +43,10 @@ pub(crate) struct OmpPane {
     generation: u64,
     /// Whether Open in terminal waits for its child to exit.
     open_in_terminal: bool,
+    /// The chat pane drawing the agent's session.
+    pub(crate) view: Entity<OmpView>,
+    /// Carries what the user does in [`OmpPane::view`] to the agent's omp.
+    _intents: Subscription,
 }
 
 /// How an RPC agent opens its conversation for `start`: the space's task as its first prompt, its session
@@ -124,6 +135,11 @@ impl Workspace {
             label,
             node.and_then(|n| n.session),
         );
+        let view = cx.new(|cx| OmpView::new(Arc::new(agent.model().clone()), cx));
+        let (space_id, pane_id) = (id.clone(), pane.id);
+        let intents = cx.subscribe(&view, move |this, _, intent: &OmpIntent, cx| {
+            this.rpc_intent(&space_id, pane_id, intent, cx);
+        });
         if let Some(tab) = self.tabs.get_mut(id) {
             tab.terminals.insert(
                 pane.id,
@@ -132,6 +148,8 @@ impl Workspace {
                     runner,
                     generation: 0,
                     open_in_terminal: false,
+                    view,
+                    _intents: intents,
                 })),
             );
         }
@@ -167,6 +185,7 @@ impl Workspace {
                 let updates = omp.agent.attach(started, opening);
                 let frames = omp.agent.take_frames();
                 this.rpc_updates(&space, pane, &updates, cx);
+                this.refresh_rpc_view(&space, pane, cx);
                 frames
             });
             let Ok(Some(frames)) = frames else {
@@ -190,10 +209,20 @@ impl Workspace {
                 });
                 return;
             }
-            while let Some(incoming) = rx.next().await {
-                let gone = matches!(incoming, xctx_omp::Incoming::Exited { .. });
+            while let Some(first) = rx.next().await {
+                let mut gone = false;
+                // Everything that arrived by now is applied in one go, so the pane redraws once per wake.
                 let applied = this.update_in(cx, |this, window, cx| {
-                    this.rpc_incoming(&space, pane, generation, incoming, window, cx)
+                    let mut next = Some(first);
+                    while let Some(incoming) = next.take() {
+                        gone = matches!(incoming, Incoming::Exited { .. });
+                        this.rpc_incoming(&space, pane, generation, incoming, window, cx);
+                        if gone {
+                            break;
+                        }
+                        next = rx.try_recv().ok();
+                    }
+                    this.refresh_rpc_view(&space, pane, cx);
                 });
                 if gone || applied.is_err() {
                     return;
@@ -210,7 +239,7 @@ impl Workspace {
         id: &SpaceId,
         pane: PaneId,
         generation: u64,
-        incoming: xctx_omp::Incoming,
+        incoming: Incoming,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -220,6 +249,19 @@ impl Workspace {
         else {
             return;
         };
+        let view = omp.view.clone();
+        let mut exit = None;
+        match &incoming {
+            Incoming::Malformed(detail) => {
+                view.update(cx, |view, cx| view.malformed_frame(detail, cx));
+            }
+            Incoming::Frame(Frame::Response(r)) if r.command == "get_model_picker" && r.success => {
+                let choices = ModelChoice::from_picker(&r.data);
+                view.update(cx, |view, cx| view.set_model_choices(choices, cx));
+            }
+            Incoming::Exited { code, stderr } => exit = Some((*code, stderr.clone())),
+            Incoming::Frame(_) => {}
+        }
         let updates = omp.agent.apply(incoming);
         self.rpc_updates(id, pane, &updates, cx);
         let Some(unexpected) = updates.iter().find_map(|update| match update {
@@ -240,6 +282,9 @@ impl Workspace {
         if let Some(opening) = omp.agent.restart_opening() {
             self.boot_rpc_agent(id, pane, opening, window, cx);
             return;
+        }
+        if let Some((code, stderr)) = &exit {
+            view.update(cx, |view, cx| view.client_exited(*code, stderr, cx));
         }
         let reason = match omp.agent.status() {
             AgentStatus::Failed { reason } => reason.clone(),
@@ -278,6 +323,34 @@ impl Workspace {
             .apply_updates(updates, graph, self.inbox.as_mut(), &self.redactor);
         for problem in problems {
             self.error(problem, cx);
+        }
+        cx.notify();
+    }
+
+    /// Show the current session of RPC pane `pane` of space `id` in its view.
+    fn refresh_rpc_view(&mut self, id: &SpaceId, pane: PaneId, cx: &mut Context<Self>) {
+        let Some(omp) = self.rpc_pane_mut(id, pane) else {
+            return;
+        };
+        let session = Arc::new(omp.agent.model().clone());
+        omp.view
+            .clone()
+            .update(cx, |view, cx| view.set_session(session, cx));
+    }
+
+    /// Send what the user did in the view of RPC pane `pane` of space `id` to its omp.
+    fn rpc_intent(
+        &mut self,
+        id: &SpaceId,
+        pane: PaneId,
+        intent: &OmpIntent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(omp) = self.rpc_pane_mut(id, pane) else {
+            return;
+        };
+        if let Err(e) = omp.agent.send_command(intent.command()) {
+            self.error(format!("could not send to the agent: {e}"), cx);
         }
         cx.notify();
     }
@@ -434,25 +507,32 @@ impl Workspace {
     /// What RPC pane `omp` shows in the split: its status line, with the retry badge while omp retries.
     pub(crate) fn render_rpc_pane(&self, omp: &OmpPane, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
-        let (status, color) = match omp.agent.status() {
-            AgentStatus::Starting => ("starting omp…".to_owned(), theme.text_subtle),
-            AgentStatus::Running => ("working".to_owned(), theme.text),
-            AgentStatus::Idle => ("waiting for a message".to_owned(), theme.text_subtle),
-            AgentStatus::Done => ("done".to_owned(), theme.text_subtle),
-            AgentStatus::Blocked { reason } => (reason.clone(), theme.warning),
-            AgentStatus::Failed { reason } => (reason.clone(), theme.danger),
-            AgentStatus::Stopped => ("stopped".to_owned(), theme.text_subtle),
+        // The view shows the conversation; this line only says what it cannot: a start, a block or a failure.
+        let status = match omp.agent.status() {
+            AgentStatus::Starting => Some(("starting omp…".to_owned(), theme.text_subtle)),
+            AgentStatus::Blocked { reason } => Some((reason.clone(), theme.warning)),
+            AgentStatus::Failed { reason } => Some((reason.clone(), theme.danger)),
+            _ => None,
         };
-        let status = match omp.agent.retry_badge() {
-            Some(badge) => format!("{status} · {badge}"),
-            None => status,
+        let status = match (status, omp.agent.retry_badge()) {
+            (Some((text, color)), Some(badge)) => Some((format!("{text} · {badge}"), color)),
+            (None, Some(badge)) => Some((badge.to_owned(), theme.warning)),
+            (status, None) => status,
         };
         div()
+            .flex()
+            .flex_col()
             .size_full()
-            .p(Theme::SPACE_3)
-            .text_size(Theme::TEXT_SM)
-            .text_color(color)
-            .child(self.redactor.redact(&status).into_owned())
+            .children(status.map(|(text, color)| {
+                div()
+                    .flex_none()
+                    .px(Theme::SPACE_3)
+                    .py(Theme::SPACE_1)
+                    .text_size(Theme::TEXT_SM)
+                    .text_color(color)
+                    .child(self.redactor.redact(&text).into_owned())
+            }))
+            .child(div().flex_1().min_h_0().child(omp.view.clone()))
             .into_any_element()
     }
 }

@@ -6458,6 +6458,7 @@ dependencies = [
  "xctx-layout",
  "xctx-nav",
  "xctx-omp",
+ "xctx-omp-view",
  "xctx-plugin",
  "xctx-plugin-view",
  "xctx-term",

@@ -258,7 +258,6 @@ impl OmpAgent {
     }
 
     /// The session model, as a pane draws it.
-    #[allow(dead_code)] // No caller yet: the native session pane is still to come.
     pub fn model(&self) -> &SessionModel {
         &self.model
     }
@@ -418,6 +417,22 @@ impl OmpAgent {
         let id = self.command_id();
         self.send(&command.with_id(id)).map_err(|e| e.to_string())?;
         Ok(delivery)
+    }
+
+    /// Send `command`, which the user gave in the agent's pane, under an id of its own. A `prompt` without a
+    /// streaming behaviour starts a turn. Fails when its child does not run.
+    pub fn send_command(&mut self, command: Command) -> Result<(), String> {
+        if self.client.is_none() {
+            return Err("its omp is not running".to_owned());
+        }
+        let starts_turn =
+            command.kind() == "prompt" && command.as_value().get("streamingBehavior").is_none();
+        let id = self.command_id();
+        self.send(&command.with_id(id)).map_err(|e| e.to_string())?;
+        if starts_turn {
+            self.prompt_in_flight = true;
+        }
+        Ok(())
     }
 
     /// Answer a pending request with `answer` (an `extension_ui_response` the user chose), and return what
