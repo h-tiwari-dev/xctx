@@ -1,0 +1,18 @@
+[package]
+name = "xctx-omp"
+version.workspace = true
+edition.workspace = true
+description = "omp's RPC protocol for xctx: the JSONL codec, the child-process client and the pure session model a native agent pane draws"
+
+[dependencies]
+base64 = "0.22"
+regex = "1"
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "fake-omp"
+path = "src/bin/fake-omp.rs"
