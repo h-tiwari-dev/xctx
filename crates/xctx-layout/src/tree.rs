@@ -46,6 +46,68 @@ pub enum FocusDirection {
     Down,
 }
 
+/// Where a pane dragged over another pane lands: beside it on one side (the target is split there), or in its
+/// place (the two panes swap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropEdge {
+    /// To the left of the target, which keeps the right side.
+    Left,
+    /// To the right of the target.
+    Right,
+    /// Above the target, which keeps the bottom.
+    Top,
+    /// Below the target.
+    Bottom,
+    /// In the target's place; the target takes the dragged pane's old place.
+    Center,
+}
+
+impl DropEdge {
+    /// The share of a pane's width (and height) from each side that counts as that side's drop zone; the rest,
+    /// the middle, is [`DropEdge::Center`].
+    pub const EDGE_SHARE: f32 = 0.25;
+
+    /// The drop edge for the point (`x`, `y`) over `rect`: [`DropEdge::Center`] in the middle, else the side
+    /// the point is nearest to (relative to the rectangle's size, so a wide pane's left and right zones are as
+    /// easy to hit as its top and bottom). A point outside `rect` gives the nearest side too; an empty `rect` or
+    /// a non-finite coordinate gives [`DropEdge::Center`].
+    pub fn at(rect: Rect, x: f32, y: f32) -> Self {
+        if !(x.is_finite() && y.is_finite()) || rect.width <= 0.0 || rect.height <= 0.0 {
+            return Self::Center;
+        }
+        let u = (x - rect.x) / rect.width;
+        let v = (y - rect.y) / rect.height;
+        let inner = Self::EDGE_SHARE..=(1.0 - Self::EDGE_SHARE);
+        if inner.contains(&u) && inner.contains(&v) {
+            return Self::Center;
+        }
+        let sides = [
+            (u, Self::Left),
+            (1.0 - u, Self::Right),
+            (v, Self::Top),
+            (1.0 - v, Self::Bottom),
+        ];
+        sides
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(Self::Center, |(_, edge)| edge)
+    }
+
+    /// The part of `rect` a pane dropped at this edge would take: its left, right, top or bottom half, or all
+    /// of it for [`DropEdge::Center`]. For drawing the drop preview.
+    pub fn preview(self, rect: Rect) -> Rect {
+        let (half_w, half_h) = (rect.width / 2.0, rect.height / 2.0);
+        match self {
+            Self::Left => Rect::new(rect.x, rect.y, half_w, rect.height),
+            Self::Right => Rect::new(rect.x + half_w, rect.y, half_w, rect.height),
+            Self::Top => Rect::new(rect.x, rect.y, rect.width, half_h),
+            Self::Bottom => Rect::new(rect.x, rect.y + half_h, rect.width, half_h),
+            Self::Center => rect,
+        }
+    }
+}
+
 /// A node of the binary split tree: a pane, or a split of two subtrees.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -115,6 +177,19 @@ impl PaneNode {
         match self {
             Self::Leaf { pane } => *pane,
             Self::Split { second, .. } => second.last_pane(),
+        }
+    }
+
+    /// Exchange the leaves `a` and `b` wherever they are.
+    fn swap_leaves(&mut self, a: PaneId, b: PaneId) {
+        match self {
+            Self::Leaf { pane } if *pane == a => *pane = b,
+            Self::Leaf { pane } if *pane == b => *pane = a,
+            Self::Leaf { .. } => {}
+            Self::Split { first, second, .. } => {
+                first.swap_leaves(a, b);
+                second.swap_leaves(a, b);
+            }
         }
     }
 
@@ -598,6 +673,68 @@ impl PaneTree {
             self.focused = p;
         }
         self.zoomed = pane;
+        Ok(())
+    }
+
+    /// Move `pane` to `edge` of `target`, as dropping a dragged pane header does: for a side, `pane` leaves its
+    /// place (its sibling takes the space) and `target` is split in half with `pane` on that side; for
+    /// [`DropEdge::Center`] the two panes swap places. `pane` is focused afterwards and any zoom ends. Dropping a
+    /// pane on itself changes nothing.
+    pub fn drop_pane(
+        &mut self,
+        pane: PaneId,
+        target: PaneId,
+        edge: DropEdge,
+    ) -> Result<(), LayoutError> {
+        for id in [pane, target] {
+            if !self.contains(id) {
+                return Err(LayoutError::UnknownPane(id));
+            }
+        }
+        if pane == target {
+            return Ok(());
+        }
+        let (axis, pane_first) = match edge {
+            DropEdge::Center => {
+                self.root.swap_leaves(pane, target);
+                self.focused = pane;
+                self.zoomed = None;
+                return Ok(());
+            }
+            DropEdge::Left => (SplitAxis::Horizontal, true),
+            DropEdge::Right => (SplitAxis::Horizontal, false),
+            DropEdge::Top => (SplitAxis::Vertical, true),
+            DropEdge::Bottom => (SplitAxis::Vertical, false),
+        };
+        // Both panes are in the tree and differ, so the root is a split, and what is left without `pane` still
+        // holds `target`; the original is kept only to leave the tree unchanged if that ever did not hold.
+        let original = self.root.clone();
+        let Some((rest, _)) =
+            std::mem::replace(&mut self.root, PaneNode::Leaf { pane }).without(pane)
+        else {
+            self.root = original;
+            return Err(LayoutError::LastPane(pane));
+        };
+        self.root = rest;
+        let id = self.fresh_split_id();
+        let Some(slot) = self.root.leaf_mut(target) else {
+            self.root = original;
+            return Err(LayoutError::UnknownPane(target));
+        };
+        let (first, second) = if pane_first {
+            (pane, target)
+        } else {
+            (target, pane)
+        };
+        *slot = PaneNode::Split {
+            id,
+            axis,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf { pane: first }),
+            second: Box::new(PaneNode::Leaf { pane: second }),
+        };
+        self.focused = pane;
+        self.zoomed = None;
         Ok(())
     }
 
@@ -1228,5 +1365,84 @@ mod tests {
                 Err(e) => assert!(e.to_string().contains(message), "{e} lacks {message:?}"),
             }
         }
+    }
+
+    #[test]
+    fn drop_edge_is_the_middle_or_the_nearest_side() {
+        let rect = Rect::new(100.0, 0.0, 400.0, 200.0);
+        assert_eq!(DropEdge::at(rect, 300.0, 100.0), DropEdge::Center);
+        assert_eq!(DropEdge::at(rect, 110.0, 100.0), DropEdge::Left);
+        assert_eq!(DropEdge::at(rect, 490.0, 100.0), DropEdge::Right);
+        assert_eq!(DropEdge::at(rect, 300.0, 10.0), DropEdge::Top);
+        assert_eq!(DropEdge::at(rect, 300.0, 190.0), DropEdge::Bottom);
+        // Relative distances: 5% from the left beats 10% from the top.
+        assert_eq!(DropEdge::at(rect, 120.0, 20.0), DropEdge::Left);
+        assert_eq!(DropEdge::at(rect, f32::NAN, 20.0), DropEdge::Center);
+        assert_eq!(
+            DropEdge::at(Rect::new(0.0, 0.0, 0.0, 10.0), 0.0, 0.0),
+            DropEdge::Center
+        );
+    }
+
+    #[test]
+    fn dropping_a_pane_on_a_side_moves_it_beside_the_target() {
+        let mut tree = grid();
+        tree.set_zoom(Some(P4)).unwrap();
+        tree.drop_pane(P4, P1, DropEdge::Left).unwrap();
+        let layout = tree.layout(Rect::new(0.0, 0.0, 100.0, 100.0), 0.0);
+        // 2 took 4's place on the right; 4 sits left of 1 in the top-left quarter.
+        assert_rect(layout.pane(P2).unwrap(), 50.0, 0.0, 50.0, 100.0);
+        assert_rect(layout.pane(P4).unwrap(), 0.0, 0.0, 25.0, 50.0);
+        assert_rect(layout.pane(P1).unwrap(), 25.0, 0.0, 25.0, 50.0);
+        assert_rect(layout.pane(P3).unwrap(), 0.0, 50.0, 50.0, 50.0);
+        assert_eq!(tree.focused(), P4);
+        assert!(!tree.is_zoomed());
+
+        tree.drop_pane(P3, P2, DropEdge::Bottom).unwrap();
+        let layout = tree.layout(Rect::new(0.0, 0.0, 100.0, 100.0), 0.0);
+        assert_rect(layout.pane(P2).unwrap(), 50.0, 0.0, 50.0, 50.0);
+        assert_rect(layout.pane(P3).unwrap(), 50.0, 50.0, 50.0, 50.0);
+        assert_rect(layout.pane(P4).unwrap(), 0.0, 0.0, 25.0, 100.0);
+        // The round trip through serde still holds every invariant.
+        let saved = serde_json::to_value(&tree).unwrap();
+        assert_eq!(serde_json::from_value::<PaneTree>(saved).unwrap(), tree);
+    }
+
+    #[test]
+    fn dropping_a_pane_in_the_centre_swaps_the_two() {
+        let mut tree = grid();
+        tree.drop_pane(P1, P4, DropEdge::Center).unwrap();
+        let layout = tree.layout(Rect::new(0.0, 0.0, 100.0, 100.0), 0.0);
+        assert_rect(layout.pane(P4).unwrap(), 0.0, 0.0, 50.0, 50.0);
+        assert_rect(layout.pane(P1).unwrap(), 50.0, 50.0, 50.0, 50.0);
+        assert_eq!(tree.focused(), P1);
+    }
+
+    #[test]
+    fn dropping_a_pane_on_itself_or_an_unknown_pane_changes_nothing() {
+        let mut tree = grid();
+        let before = tree.clone();
+        tree.drop_pane(P2, P2, DropEdge::Left).unwrap();
+        assert_eq!(tree, before);
+        assert_eq!(
+            tree.drop_pane(PaneId(9), P2, DropEdge::Left),
+            Err(LayoutError::UnknownPane(PaneId(9)))
+        );
+        assert_eq!(
+            tree.drop_pane(P2, PaneId(9), DropEdge::Center),
+            Err(LayoutError::UnknownPane(PaneId(9)))
+        );
+        assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn a_two_pane_tree_survives_a_drop_onto_the_other_pane() {
+        let mut tree = PaneTree::new(P1);
+        tree.split(P1, SplitAxis::Horizontal, P2, 0.3).unwrap();
+        tree.drop_pane(P2, P1, DropEdge::Top).unwrap();
+        let layout = tree.layout(Rect::new(0.0, 0.0, 100.0, 100.0), 0.0);
+        assert_rect(layout.pane(P2).unwrap(), 0.0, 0.0, 100.0, 50.0);
+        assert_rect(layout.pane(P1).unwrap(), 0.0, 50.0, 100.0, 50.0);
+        assert_eq!(layout.dividers.len(), 1);
     }
 }

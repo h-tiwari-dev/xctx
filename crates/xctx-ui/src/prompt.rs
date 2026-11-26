@@ -394,6 +394,8 @@ pub struct PromptInput {
     selecting: bool,
     /// Whether Enter on blank text still emits [`PromptEvent::Submit`] (with an empty string).
     submit_blank: bool,
+    /// Whether the input draws no outline, fill or side padding, for an input inside its own frame.
+    borderless: bool,
 }
 
 impl EventEmitter<PromptEvent> for PromptInput {}
@@ -413,6 +415,7 @@ impl PromptInput {
             placeholder: SharedString::default(),
             selecting: false,
             submit_blank: false,
+            borderless: false,
         }
     }
 
@@ -432,6 +435,13 @@ impl PromptInput {
     /// confirms what was chosen beside it.
     pub fn submit_blank(mut self, submit_blank: bool) -> Self {
         self.submit_blank = submit_blank;
+        self
+    }
+
+    /// Draw no outline, fill or side padding: for an input that sits in a frame of its own, such as the command
+    /// palette's query row.
+    pub fn borderless(mut self, borderless: bool) -> Self {
+        self.borderless = borderless;
         self
     }
 
@@ -636,12 +646,15 @@ impl Render for PromptInput {
             .items_start()
             .w_full()
             .min_h(px(40.0))
-            .px(Theme::SPACE_3)
+            .when(!self.borderless, |input| {
+                input
+                    .px(Theme::SPACE_3)
+                    .rounded(Theme::RADIUS_MD)
+                    .border_1()
+                    .border_color(theme.outline(focused))
+                    .bg(theme.raised)
+            })
             .py(Theme::SPACE_2 + px(2.0))
-            .rounded(Theme::RADIUS_MD)
-            .border_1()
-            .border_color(theme.outline(focused))
-            .bg(theme.raised)
             .text_size(Theme::TEXT_LG)
             .cursor_text()
             .child(body)

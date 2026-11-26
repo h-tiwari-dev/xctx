@@ -111,6 +111,14 @@ pub enum IconName {
     Ticket,
     /// A pen tool: a design connector.
     PenTool,
+    /// A grip of dots: a drag handle.
+    Grip,
+    /// Two arrows pointing inwards: end a zoom.
+    Minimize,
+    /// Stacked sheets: window appearance (translucency).
+    Layers,
+    /// The command key: the command palette.
+    Command,
 }
 
 impl IconName {
@@ -157,6 +165,10 @@ impl IconName {
         Self::Send,
         Self::Ticket,
         Self::PenTool,
+        Self::Grip,
+        Self::Minimize,
+        Self::Layers,
+        Self::Command,
     ];
 
     /// The asset path used with [`UiAssets`] and [`gpui::svg`].
@@ -203,6 +215,10 @@ impl IconName {
             Self::Send => "icons/send.svg",
             Self::Ticket => "icons/ticket.svg",
             Self::PenTool => "icons/pen-tool.svg",
+            Self::Grip => "icons/grip.svg",
+            Self::Minimize => "icons/minimize.svg",
+            Self::Layers => "icons/layers.svg",
+            Self::Command => "icons/command.svg",
         }
     }
 
@@ -250,6 +266,10 @@ impl IconName {
             Self::Send => "send",
             Self::Ticket => "ticket",
             Self::PenTool => "pen-tool",
+            Self::Grip => "grip",
+            Self::Minimize => "minimize",
+            Self::Layers => "layers",
+            Self::Command => "command",
         }
     }
 
@@ -297,6 +317,10 @@ impl IconName {
             Self::Send => include_bytes!("../assets/icons/send.svg"),
             Self::Ticket => include_bytes!("../assets/icons/ticket.svg"),
             Self::PenTool => include_bytes!("../assets/icons/pen-tool.svg"),
+            Self::Grip => include_bytes!("../assets/icons/grip.svg"),
+            Self::Minimize => include_bytes!("../assets/icons/minimize.svg"),
+            Self::Layers => include_bytes!("../assets/icons/layers.svg"),
+            Self::Command => include_bytes!("../assets/icons/command.svg"),
         }
     }
 

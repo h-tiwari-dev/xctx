@@ -1,5 +1,6 @@
 //! The GPUI view that draws a terminal session and feeds it input.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7,10 +8,11 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EventEmitter,
-    FocusHandle, Focusable, Hitbox, HitboxBehavior, Hsla, KeyDownEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollEvent, ShapedLine,
-    StrikethroughStyle, Subscription, Task, TextAlign, TextRun, TouchPhase, UnderlineStyle,
-    WeakEntity, Window, canvas, div, fill, outline, point, prelude::*, px, size,
+    ExternalPaths, FocusHandle, Focusable, Hitbox, HitboxBehavior, Hsla, KeyDownEvent,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, ScrollDelta,
+    ScrollEvent, ShapedLine, StrikethroughStyle, Subscription, Task, TextAlign, TextRun,
+    TouchPhase, UnderlineStyle, WeakEntity, Window, canvas, div, fill, outline, point, prelude::*,
+    px, size,
 };
 use xctx_term::input::{
     self, MouseButton as TermMouseButton, MouseEvent as TermMouseEvent, MouseEventKind,
@@ -231,6 +233,23 @@ impl TerminalView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        if text.is_empty() {
+            return;
+        }
+        let modes = self.session.modes();
+        self.write_input(&input::encode_paste(&text, modes.bracketed_paste), cx);
+    }
+
+    /// Types dropped files into the program as shell-quoted paths (see
+    /// [`shell_quote_paths`]), going through the paste route, and focuses the view.
+    fn on_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        let text = shell_quote_paths(paths.paths());
         if text.is_empty() {
             return;
         }
@@ -876,11 +895,12 @@ impl Render for TerminalView {
         let view = cx.entity();
         let weak_view = cx.weak_entity();
 
+        let highlight = self.theme.drop_highlight;
         div()
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .size_full()
-            .bg(self.theme.background)
+            .relative()
             .on_key_down(cx.listener(Self::on_key_down))
             .child(
                 canvas(
@@ -898,5 +918,77 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                        style.bg(highlight).border_2().border_color(Rgba {
+                            a: 1.0,
+                            ..highlight
+                        })
+                    })
+                    .on_drop(cx.listener(Self::on_external_paths_drop)),
+            )
+    }
+}
+
+/// The text typed for dropped files: each path shell-quoted, joined with spaces, plus one
+/// trailing space. Paths made only of `[A-Za-z0-9_@%+=:,./-]` stay raw; others are wrapped
+/// in single quotes with embedded `'` written as `'\''`. Empty input gives an empty string.
+pub fn shell_quote_paths(paths: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for path in paths {
+        let path = path.to_string_lossy();
+        let safe = !path.is_empty()
+            && path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+        if safe {
+            out.push_str(&path);
+        } else {
+            out.push('\'');
+            out.push_str(&path.replace('\'', r"'\''"));
+            out.push('\'');
+        }
+        out.push(' ');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quote(paths: &[&str]) -> String {
+        shell_quote_paths(&paths.iter().map(PathBuf::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn safe_paths_stay_raw() {
+        assert_eq!(
+            quote(&["/usr/bin/env", "a_b@c%d+e=f:g,h.-"]),
+            "/usr/bin/env a_b@c%d+e=f:g,h.- "
+        );
+    }
+
+    #[test]
+    fn spaces_are_quoted() {
+        assert_eq!(quote(&["/tmp/My File.txt"]), "'/tmp/My File.txt' ");
+    }
+
+    #[test]
+    fn single_quotes_are_escaped() {
+        assert_eq!(quote(&["/tmp/it's"]), r"'/tmp/it'\''s' ");
+    }
+
+    #[test]
+    fn unicode_is_quoted() {
+        assert_eq!(quote(&["/tmp/café", "/a"]), "'/tmp/café' /a ");
+    }
+
+    #[test]
+    fn no_paths_give_nothing() {
+        assert_eq!(quote(&[]), "");
     }
 }

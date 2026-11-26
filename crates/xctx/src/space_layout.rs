@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use xctx_core::{Space, SpaceShape};
 use xctx_layout::{
-    FocusDirection, LayoutError, PLUGIN_COLUMN_BASE_SHARE, PaneId, PaneKind, PaneRole, PaneTree,
-    Reshape, RolePane, Shape, SplitAxis, SplitId, reshape,
+    DropEdge, FocusDirection, LayoutError, PLUGIN_COLUMN_BASE_SHARE, PaneId, PaneKind, PaneRole,
+    PaneTree, Reshape, RolePane, Shape, SplitAxis, SplitId, reshape,
 };
 
 /// The share the existing pane keeps when it is split.
@@ -291,6 +291,17 @@ impl SpaceLayout {
             self.tree.set_zoom(Some(pane))?;
             Ok(true)
         }
+    }
+
+    /// Move `pane` to `edge` of `target` (beside it, or swapped with it for [`DropEdge::Center`]), as dropping a
+    /// dragged pane header does. Roles stay with their panes; `pane` is focused afterwards.
+    pub fn drop_pane(
+        &mut self,
+        pane: PaneId,
+        target: PaneId,
+        edge: DropEdge,
+    ) -> Result<(), LayoutError> {
+        self.tree.drop_pane(pane, target, edge)
     }
 }
 

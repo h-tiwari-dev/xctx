@@ -66,6 +66,9 @@ pub struct TerminalTheme {
     pub cursor_text: Rgba,
     /// Overlay drawn over selected cells; normally translucent.
     pub selection: Rgba,
+    /// Tint drawn over the view while files are dragged onto it; the 2px outline uses the
+    /// same colour fully opaque.
+    pub drop_highlight: Rgba,
     /// Thumb of the scrollback indicator shown while scrolled back.
     pub scrollback_indicator: Rgba,
     /// ANSI colours 0-15: black, red, green, yellow, blue, magenta, cyan, white, then the
@@ -82,6 +85,7 @@ impl Default for TerminalTheme {
             cursor_text: rgb(0x18181b),
             selection: rgba(0x60a5fa55),
             scrollback_indicator: rgba(0xa1a1aa66),
+            drop_highlight: rgba(0x2ea8ff2e),
             ansi: [
                 rgb(0x27272a),
                 rgb(0xf87171),
@@ -150,6 +154,8 @@ impl TerminalTheme {
         if cell.flags.contains(CellFlags::INVERSE) {
             std::mem::swap(&mut foreground, &mut background);
         }
+        // Glyphs stay opaque even when inverse hands them a translucent default background.
+        foreground.a = 1.0;
         if cell.flags.contains(CellFlags::DIM) {
             foreground = mix(foreground, background, DIM_FACTOR);
         }

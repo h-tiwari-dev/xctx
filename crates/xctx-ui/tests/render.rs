@@ -10,8 +10,8 @@ use gpui::{
 };
 use xctx_layout::{PaneId, PaneKind, PaneTree, Rect, Shape, SplitAxis};
 use xctx_ui::{
-    PaneView, PromptEvent, PromptInput, SplitView, StatusBanner, StatusBar, TabBar, TabItem, Theme,
-    ratio_for_drag,
+    PaneView, PromptEvent, PromptInput, SpaceHeaderInfo, SplitView, StatusBanner, StatusBar, Theme,
+    TitleBar, ratio_for_drag,
 };
 
 struct PromptHost {
@@ -213,17 +213,16 @@ impl Render for BarsHost {
             .flex()
             .flex_col()
             .child(
-                TabBar::new()
-                    .tabs([
-                        TabItem::new("fix-retry", "make checkout retry safe")
-                            .badge("2 repos")
-                            .active(true)
-                            .running(true),
-                        TabItem::new("docs", "docs"),
-                    ])
-                    .active_shape(Some(Shape::Review))
-                    .on_home(|_, _| {})
-                    .on_select(|_, _, _| {})
+                TitleBar::new("make checkout retry safe")
+                    .space(SpaceHeaderInfo {
+                        shape: Shape::Review,
+                        graph_open: false,
+                        production: true,
+                        branch: "space/fix-retry".into(),
+                        env: "production,fix-retry".into(),
+                    })
+                    .on_toggle_sidebar(|_, _| {})
+                    .on_palette(|_, _| {})
                     .on_shape(|_, _, _| {})
                     .on_ship(|_, _| {})
                     .on_discard(|_, _| {}),
@@ -248,5 +247,18 @@ fn bars_draw_with_every_item(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(Theme::dark()));
     let (_host, cx) = cx.add_window_view(|_, _| BarsHost);
     cx.run_until_parked();
-    cx.simulate_click(point(px(30.0), px(15.0)), Modifiers::default());
+    for selector in [
+        "title-sidebar",
+        "title-palette",
+        "title-shape-2",
+        "title-discard",
+        "title-ship",
+        "status-dismiss",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} not drawn");
+    }
+    // A press on a control must not reach the window-move area behind it (the test window cannot move).
+    if let Some(center) = cx.debug_bounds("title-palette").map(|b| b.center()) {
+        cx.simulate_click(center, Modifiers::default());
+    }
 }

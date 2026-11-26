@@ -17,7 +17,8 @@ use xctx_layout::{FocusDirection, PaneId, PaneKind, PaneRole, RolePane, Shape, S
 use xctx_term::TerminalSession;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
 use xctx_ui::{
-    Button, ButtonSize, ButtonVariant, PaneView, SharedTab, SplitView, Theme, pane_kind_label,
+    Button, ButtonSize, ButtonVariant, IconName, PaneView, SharedTab, SplitView, Theme,
+    pane_kind_label,
 };
 
 use crate::agent_session::AgentSession;
@@ -585,7 +586,7 @@ impl Workspace {
 
     /// Apply `change` to the layout of the space being shown, then save it, focus the focused pane and redraw.
     /// Does nothing on Home.
-    fn change_layout(
+    pub(crate) fn change_layout(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1051,6 +1052,8 @@ impl Workspace {
                     Some(PaneTerminal::Running { view, .. }) => div()
                         .relative()
                         .size_full()
+                        .pl(Theme::SPACE_2)
+                        .pt(Theme::SPACE_1)
                         .child(view.clone())
                         .children(self.render_serve_hint(&tab.space.id, pane.id, cx))
                         .into_any_element(),
@@ -1107,6 +1110,8 @@ impl Workspace {
         let on_focus = entity.clone();
         let on_zoom = entity.clone();
         let on_close = entity.clone();
+        let on_drop_pane = entity.clone();
+        let on_drop_tool = entity.clone();
         let on_resize = entity;
         SplitView::new(
             SharedString::from(format!("split-{}", tab.space.id)),
@@ -1125,6 +1130,17 @@ impl Workspace {
         .on_resize(move |split, ratio, _window, cx| {
             let _ = on_resize.update(cx, |this, cx| this.set_split_ratio(split, ratio, cx));
         })
+        .on_drop_pane(move |pane, target, edge, window, cx| {
+            let _ = on_drop_pane.update(cx, |this, cx| {
+                this.drop_pane(pane, target, edge, window, cx)
+            });
+        })
+        .on_drop_tool(move |tool, target, edge, window, cx| {
+            let tool = tool.clone();
+            let _ = on_drop_tool.update(cx, |this, cx| {
+                this.drop_tool(&tool, target, edge, window, cx)
+            });
+        })
         .into_any_element()
     }
 
@@ -1142,7 +1158,6 @@ impl Workspace {
             return None;
         }
         let repo = tab.space.repos.iter().find(|r| r.name == pane.role.repo)?;
-        let theme = Theme::of(cx);
         let id = pane.id.0 as usize;
         let mut row = div()
             .flex()
@@ -1152,7 +1167,9 @@ impl Workspace {
         if let Some(url) = tab.repo_links.get(&repo.name).cloned() {
             let shown = url.trim_start_matches("https://").to_owned();
             row = row.child(
-                Button::new(("pane-remote", id), shown)
+                Button::new(("pane-remote", id), "")
+                    .icon(IconName::Globe)
+                    .tooltip(format!("Copy {shown}"))
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1161,12 +1178,6 @@ impl Workspace {
                     })),
             );
         }
-        row = row.child(
-            div()
-                .px(Theme::SPACE_1)
-                .text_color(theme.text_subtle)
-                .child(repo.branch.clone()),
-        );
         let exited = pane.role.kind == PaneKind::Agent
             && tab.terminals.get(&pane.id).is_some_and(|terminal| {
                 matches!(
@@ -1192,7 +1203,9 @@ impl Workspace {
         let (git_space, git_repo, git_pane) = (tab.space.id.clone(), repo.name.clone(), pane.id);
         Some(
             row.child(
-                Button::new(("pane-files", id), "Files")
+                Button::new(("pane-files", id), "")
+                    .icon(IconName::Folder)
+                    .tooltip(format!("Files of {}", repo.name))
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1200,7 +1213,9 @@ impl Workspace {
                     })),
             )
             .child(
-                Button::new(("pane-git", id), "Git")
+                Button::new(("pane-git", id), "")
+                    .icon(IconName::Git)
+                    .tooltip(format!("Git (lazygit) in {}", repo.name))
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
                     .on_click(cx.listener(move |this, _, window, cx| {

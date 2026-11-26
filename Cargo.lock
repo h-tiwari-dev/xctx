@@ -6439,6 +6439,7 @@ dependencies = [
  "xctx-http",
  "xctx-inbox",
  "xctx-layout",
+ "xctx-nav",
  "xctx-plugin",
  "xctx-plugin-view",
  "xctx-term",
@@ -6624,6 +6625,7 @@ dependencies = [
  "xctx-channel",
  "xctx-graph",
  "xctx-layout",
+ "xctx-nav",
 ]
 
 [[package]]

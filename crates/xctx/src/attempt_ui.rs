@@ -621,7 +621,12 @@ impl Workspace {
                     Some(None) => header.push_str(" — exited"),
                     None => {}
                 }
-                div().size_full().child(view.clone()).into_any_element()
+                div()
+                    .size_full()
+                    .pl(Theme::SPACE_2)
+                    .pt(Theme::SPACE_1)
+                    .child(view.clone())
+                    .into_any_element()
             }
             Some(PaneTerminal::Failed(message)) => note(message.clone(), theme.danger),
             None => match attempt.map(|a| a.state) {
@@ -634,10 +639,16 @@ impl Workspace {
                 _ => note("starting…".to_owned(), theme.text_subtle),
             },
         };
+        // The terminal draws no background of its own: this frame is its surface, as a pane's frame is.
         div()
             .flex()
             .flex_col()
             .size_full()
+            .rounded(Theme::RADIUS_LG)
+            .border_1()
+            .border_color(theme.border_subtle)
+            .bg(theme.surface)
+            .overflow_hidden()
             .child(
                 div()
                     .flex_none()

@@ -1,15 +1,17 @@
-//! The compact bar along the bottom of the window: the active space and its environment, the git branch, the
-//! shape, a zoom badge, a transient message, and key hints.
+//! The compact status line along the bottom of the window, made of segments: the active space, the git branch,
+//! its mise env, its port, the agents running, the shape, a zoom badge, the Inbox count, a transient message, and
+//! key hints drawn as keycaps.
 
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{App, FontWeight, Hsla, SharedString, Window, div, prelude::*, px};
+use gpui::{App, FontWeight, SharedString, Window, div, prelude::*, px};
 use xctx_layout::Shape;
 
-use crate::components::{Badge, Button, ButtonSize, ButtonVariant};
-use crate::tab_bar::shape_label;
+use crate::components::{Badge, Tooltip};
+use crate::icon::{Icon, IconName, IconSize};
 use crate::theme::{Theme, Tone};
+use crate::title_bar::shape_label;
 
 /// What a [`StatusBanner`] reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,10 +101,39 @@ pub fn format_key_hints(hints: &[KeyHint]) -> String {
         .join(" · ")
 }
 
+/// Whether a mise env names production (any `,`-separated part is `production`, ignoring case), which the bar
+/// and title bar draw in the danger tone.
+pub fn is_production_env(env: &str) -> bool {
+    env.split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case("production"))
+}
+
+/// A key chord such as `⌘K` drawn as a small keycap: [`Theme::TEXT_XS`] in `meta`, on `raised` with a `border`
+/// outline. Shared by the status line, the title bar and the Roster.
+pub fn keycap(keys: impl Into<SharedString>, theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(16.0))
+        .min_w(px(16.0))
+        .px(px(4.0))
+        .rounded(Theme::RADIUS_SM)
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
+        .text_size(Theme::TEXT_XS)
+        .text_color(theme.meta)
+        .whitespace_nowrap()
+        .child(keys.into())
+}
+
 type DismissHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// The bottom bar. Every item is optional and hidden when unset; the app passes what applies to the space
-/// being shown.
+/// being shown. It has no background of its own (it sits on the window chrome) and a `border_subtle` top line.
+/// Test selectors: `status-inbox` (the Inbox button) and `status-dismiss` (the banner's dismiss button).
 #[derive(IntoElement)]
 pub struct StatusBar {
     space: Option<SharedString>,
@@ -110,6 +141,7 @@ pub struct StatusBar {
     port: Option<u16>,
     branch: Option<SharedString>,
     shape: Option<Shape>,
+    agents: Option<(usize, usize)>,
     zoomed: bool,
     banner: Option<StatusBanner>,
     hints: Vec<KeyHint>,
@@ -133,6 +165,7 @@ impl StatusBar {
             port: None,
             branch: None,
             shape: None,
+            agents: None,
             zoomed: false,
             banner: None,
             hints: default_key_hints(),
@@ -148,7 +181,7 @@ impl StatusBar {
         self
     }
 
-    /// The `MISE_ENV` the space's panes run with, when it differs from the slug.
+    /// The `MISE_ENV` the space's panes run with; drawn as a danger badge when it names production.
     pub fn mise_env(mut self, env: impl Into<SharedString>) -> Self {
         self.mise_env = Some(env.into());
         self
@@ -169,6 +202,12 @@ impl StatusBar {
     /// The space's current shape.
     pub fn shape(mut self, shape: Shape) -> Self {
         self.shape = Some(shape);
+        self
+    }
+
+    /// How many of the space's `total` agents are `running`, shown as `running/total`.
+    pub fn agents(mut self, running: usize, total: usize) -> Self {
+        self.agents = Some((running, total));
         self
     }
 
@@ -209,72 +248,138 @@ impl StatusBar {
     }
 }
 
-/// A `label value` pair, with the value in the main text colour.
-fn item(theme: &Theme, label: &'static str, value: SharedString, value_color: Hsla) -> gpui::Div {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(Theme::SPACE_1)
-        .child(div().text_color(theme.text_subtle).child(label))
-        .child(div().text_color(value_color).child(value))
+/// One segment: a row of an optional icon and text, kept whole.
+fn segment() -> gpui::Div {
+    div().flex().flex_none().items_center().gap(Theme::SPACE_1)
+}
+
+/// The thin line between left-hand segments.
+fn divider(theme: &Theme) -> gpui::Div {
+    div().flex_none().w(px(1.0)).h(px(12.0)).bg(theme.border)
 }
 
 impl RenderOnce for StatusBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx);
+        let mut segments: Vec<gpui::AnyElement> = Vec::new();
 
-        let space = self.space.map(|slug| {
-            div()
-                .flex_none()
-                .text_color(theme.text)
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(slug)
-        });
-        let mise_env = self
-            .mise_env
-            .map(|env| item(&theme, "MISE_ENV", env, theme.text_muted));
-        let port = self
-            .port
-            .map(|port| item(&theme, "PORT", port.to_string().into(), theme.text_muted));
-        let branch = self
-            .branch
-            .map(|branch| item(&theme, "⎇", branch, theme.text_muted));
-        let shape = self
-            .shape
-            .map(|shape| Badge::new(shape_label(shape)).tone(Tone::Accent));
-        let zoomed = self
-            .zoomed
-            .then(|| Badge::new("ZOOMED").tone(Tone::Warning));
+        if let Some(slug) = self.space {
+            segments.push(
+                segment()
+                    .text_color(theme.text)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(slug)
+                    .into_any_element(),
+            );
+        }
+        if let Some(branch) = self.branch {
+            segments.push(
+                segment()
+                    .min_w_0()
+                    .flex_shrink_1()
+                    .child(
+                        Icon::new(IconName::Git)
+                            .size(IconSize::Xs)
+                            .color(theme.text_subtle),
+                    )
+                    .child(div().min_w_0().truncate().child(branch))
+                    .into_any_element(),
+            );
+        }
+        if let Some(env) = self.mise_env {
+            let element = if is_production_env(&env) {
+                Badge::new(env).tone(Tone::Danger).into_any_element()
+            } else {
+                segment()
+                    .child(div().text_color(theme.text_subtle).child("env"))
+                    .child(env)
+                    .into_any_element()
+            };
+            segments.push(element);
+        }
+        if let Some(port) = self.port {
+            segments.push(
+                segment()
+                    .text_color(theme.meta)
+                    .child(format!(":{port}"))
+                    .into_any_element(),
+            );
+        }
+        if let Some((running, total)) = self.agents {
+            let (icon, color) = if running > 0 {
+                (IconName::Running, theme.success)
+            } else {
+                (IconName::Idle, theme.text_subtle)
+            };
+            segments.push(
+                segment()
+                    .child(Icon::new(icon).size(IconSize::Xs).color(color))
+                    .child(
+                        div()
+                            .text_color(theme.meta)
+                            .child(format!("{running}/{total}")),
+                    )
+                    .child(div().text_color(theme.text_subtle).child("agents"))
+                    .into_any_element(),
+            );
+        }
+        if let Some(shape) = self.shape {
+            segments.push(segment().child(shape_label(shape)).into_any_element());
+        }
+        if self.zoomed {
+            segments.push(
+                segment()
+                    .child(
+                        Icon::new(IconName::Maximize)
+                            .size(IconSize::Xs)
+                            .color(theme.warning),
+                    )
+                    .child(Badge::new("ZOOMED").tone(Tone::Warning))
+                    .into_any_element(),
+            );
+        }
 
-        let inbox = self.inbox.map(|pending| {
-            let label = format!("Inbox {pending}");
-            let mut button = Button::new("status-inbox", label)
-                .variant(if pending > 0 {
-                    ButtonVariant::Secondary
-                } else {
-                    ButtonVariant::Ghost
-                })
-                .size(ButtonSize::Compact)
-                .selected(pending > 0)
-                .selector("status-inbox");
-            if let Some(handler) = self.on_inbox.clone() {
-                button = button.on_click(move |_, window, cx| handler(window, cx));
+        let mut left = div()
+            .flex()
+            .min_w_0()
+            .flex_shrink_1()
+            .items_center()
+            .gap(Theme::SPACE_2);
+        for (i, element) in segments.into_iter().enumerate() {
+            if i > 0 {
+                left = left.child(divider(&theme));
             }
-            div().flex_none().child(button)
-        });
+            left = left.child(element);
+        }
 
         let banner = self.banner.map(|banner| {
-            let (tone, color) = match banner.kind {
-                BannerKind::Info => (Tone::Accent, theme.text),
-                BannerKind::Error => (Tone::Danger, theme.danger),
+            let (tone, icon) = match banner.kind {
+                BannerKind::Info => (Tone::Accent, IconName::Check),
+                BannerKind::Error => (Tone::Danger, IconName::Error),
             };
             let colors = theme.tone(tone);
             let dismiss = self.on_dismiss_banner.map(|handler| {
-                Button::new("status-dismiss", "×")
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Compact)
-                    .on_click(move |_, window, cx| handler(window, cx))
+                let hover = theme.hover;
+                div()
+                    .id("status-dismiss")
+                    .debug_selector(|| "status-dismiss".to_owned())
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(14.0))
+                    .rounded(Theme::RADIUS_FULL)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(
+                        Icon::new(IconName::Close)
+                            .size_px(px(10.0))
+                            .color(colors.fg),
+                    )
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        handler(window, cx);
+                    })
             });
             div()
                 .flex()
@@ -284,22 +389,78 @@ impl RenderOnce for StatusBar {
                 .gap(Theme::SPACE_1)
                 .h(px(18.0))
                 .pl(Theme::SPACE_2)
-                .pr(Theme::SPACE_0_5)
-                .rounded(Theme::RADIUS_SM)
+                .pr(if dismiss.is_some() {
+                    Theme::SPACE_0_5
+                } else {
+                    Theme::SPACE_2
+                })
+                .rounded(Theme::RADIUS_FULL)
+                .border_1()
+                .border_color(colors.border)
                 .bg(colors.bg)
-                .text_color(color)
+                .text_color(match banner.kind {
+                    BannerKind::Info => theme.text,
+                    BannerKind::Error => theme.danger,
+                })
+                .child(Icon::new(icon).size_px(px(11.0)).color(colors.fg))
                 .child(div().flex_1().min_w_0().truncate().child(banner.message))
-                .children(dismiss.map(|button| div().flex_none().child(button)))
+                .children(dismiss)
         });
         let has_banner = banner.is_some();
 
-        // With a banner showing, the hints shrink (and truncate) before the banner does.
+        let inbox = self.inbox.map(|pending| {
+            let hover = theme.hover;
+            let (icon_color, text_color) = if pending > 0 {
+                (theme.warning, theme.warning)
+            } else {
+                (theme.text_subtle, theme.text_subtle)
+            };
+            let mut button = div()
+                .id("status-inbox")
+                .debug_selector(|| "status-inbox".to_owned())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(Theme::SPACE_1)
+                .h(px(18.0))
+                .px(Theme::SPACE_1 + px(2.0))
+                .rounded(Theme::RADIUS_SM)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .tooltip(|_, cx| Tooltip::view("Inbox", cx))
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .size(IconSize::Xs)
+                        .color(icon_color),
+                )
+                .when(pending > 0, |button| {
+                    button.child(
+                        div()
+                            .text_color(text_color)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(pending.to_string()),
+                    )
+                });
+            if let Some(handler) = self.on_inbox.clone() {
+                button = button.on_click(move |_, window, cx| handler(window, cx));
+            }
+            button
+        });
+
+        // With a banner showing, the hints shrink (and clip) before the banner does.
         let hints = (!self.hints.is_empty()).then(|| {
             div()
-                .when(has_banner, |hints| hints.min_w_0().truncate())
+                .flex()
+                .items_center()
+                .gap(Theme::SPACE_3)
+                .overflow_hidden()
+                .when(has_banner, |hints| hints.min_w_0().flex_shrink_1())
                 .when(!has_banner, |hints| hints.flex_none())
-                .text_color(theme.text_subtle)
-                .child(format_key_hints(&self.hints))
+                .children(self.hints.into_iter().map(|hint| {
+                    segment()
+                        .child(keycap(hint.keys, &theme))
+                        .child(div().text_color(theme.text_subtle).child(hint.label))
+                }))
         });
 
         div()
@@ -308,21 +469,14 @@ impl RenderOnce for StatusBar {
             .items_center()
             .w_full()
             .h(Theme::STATUS_BAR_HEIGHT)
-            .px(Theme::SPACE_2)
+            .px(Theme::SPACE_3)
             .gap(Theme::SPACE_3)
-            .bg(theme.chrome)
             .border_t_1()
             .border_color(theme.border_subtle)
             .text_size(Theme::TEXT_XS)
             .text_color(theme.text_muted)
             .whitespace_nowrap()
-            .children(space)
-            .children(mise_env)
-            .children(port)
-            .children(branch)
-            .children(shape)
-            .children(zoomed)
-            .children(inbox)
+            .child(left)
             .child(
                 div()
                     .flex()
@@ -332,6 +486,7 @@ impl RenderOnce for StatusBar {
                     .justify_end()
                     .children(banner),
             )
+            .children(inbox)
             .children(hints)
     }
 }
@@ -365,8 +520,19 @@ mod tests {
         let bar = StatusBar::new();
         assert_eq!(bar.hints, default_key_hints());
         assert!(bar.space.is_none() && bar.port.is_none() && bar.banner.is_none());
-        let bar = bar.space("fix-retry").port(4101).zoomed(true);
+        assert!(bar.agents.is_none());
+        let bar = bar.space("fix-retry").port(4101).zoomed(true).agents(2, 3);
         assert_eq!(bar.port, Some(4101));
+        assert_eq!(bar.agents, Some((2, 3)));
         assert!(bar.zoomed);
+    }
+
+    #[test]
+    fn production_envs_are_recognised() {
+        assert!(is_production_env("production"));
+        assert!(is_production_env("checkout, Production"));
+        assert!(!is_production_env("checkout"));
+        assert!(!is_production_env("preproduction"));
+        assert!(!is_production_env(""));
     }
 }

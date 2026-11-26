@@ -30,16 +30,18 @@ mod plugin_panes;
 mod plugin_tests;
 mod repo_links;
 mod serve_hints;
+mod shell;
 mod space_graph;
 mod space_layout;
 mod space_tab;
 mod spawn;
 mod tool_dock;
+mod ui_prefs;
 mod workspace;
 
 use gpui::{
-    App, AppContext, Bounds, Menu, MenuItem, SystemMenuType, TitlebarOptions, WindowBounds,
-    WindowOptions, px, size,
+    App, AppContext, Bounds, Menu, MenuItem, SystemMenuType, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
 };
 use xctx_ui::{Theme, UiAssets};
 
@@ -79,17 +81,29 @@ fn main() {
             })
             .detach();
 
+            let prefs = ui_prefs::UiPrefs::load(xctx_core::store::data_dir().ok().as_deref());
             let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+            let (light_x, light_y) = Theme::TRAFFIC_LIGHT_POSITION;
             let opened = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
                         title: Some(xctx_core::APP_NAME.into()),
-                        ..Default::default()
+                        // The window draws its own title bar row (Roster toggle, space header) under the traffic
+                        // lights, and moves itself from that row's empty parts.
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(light_x, light_y)),
                     }),
+                    app_owns_titlebar_drag: true,
+                    window_background: if prefs.translucent {
+                        WindowBackgroundAppearance::Blurred
+                    } else {
+                        WindowBackgroundAppearance::Opaque
+                    },
+                    window_min_size: Some(size(px(760.0), px(480.0))),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| Workspace::new(window, cx)),
+                |window, cx| cx.new(|cx| Workspace::new(prefs, window, cx)),
             );
             if let Err(e) = opened {
                 eprintln!("xctx: could not open the main window: {e}");

@@ -1,21 +1,21 @@
-//! The main window's root view: Home or a space tab, under the tab bar and over the status bar, and the state
-//! they share (the store, the repo index, the open spaces, the status banner).
+//! The main window's root view: the title bar row over the Roster and Home or a space, over the status bar; the
+//! command palette over all of it; and the state they share (the store, the repo index, the open spaces, the
+//! status banner).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
     Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, ParentElement, Render,
-    SharedString, Styled, Subscription, Task, Window, WindowAppearance, div, prelude::*,
+    SharedString, Styled, Subscription, Task, Window, div, prelude::*,
 };
 use xctx_core::{Redactor, RepoIndex, Space, SpaceId, Store};
 use xctx_inbox::{Inbox, ItemId};
 use xctx_layout::{FocusDirection, SplitAxis};
 use xctx_plugin::RunnerRegistry;
 use xctx_term_view::{TerminalFont, TerminalTheme};
-use xctx_ui::{
-    BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, TabBar, TabItem, Theme,
-};
+use xctx_ui::command_palette::{CommandPalette, PaletteEvent};
+use xctx_ui::{BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, Theme};
 
 use crate::agent_session::SessionStorage;
 use crate::attempt_ui::shown_worktree;
@@ -26,18 +26,20 @@ use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
-    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph, ToggleZoom,
-    WORKSPACE_CONTEXT, home_key_hints, space_key_hints,
+    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph, TogglePalette,
+    ToggleRoster, ToggleTranslucency, ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
 use crate::plugin_host::{PluginHost, load_runners, user_plugin_dir, user_runner_dir};
+use crate::shell::theme_for;
 use crate::space_graph::SpaceGraphs;
 use crate::space_layout::layout_shape;
 use crate::space_tab::SpaceTab;
 use crate::spawn::ProgramSearch;
+use crate::ui_prefs::UiPrefs;
 
-/// What the window shows below the tab bar.
+/// What the window shows to the right of the Roster.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     /// Home: the prompt, the draft, the living spaces and the indexed folders.
@@ -146,6 +148,12 @@ pub(crate) struct Workspace {
     pub(crate) serve_hints: crate::serve_hints::ServeHints,
     /// The tool dock's popovers and what each open space's dock lists.
     pub(crate) tool_dock: crate::tool_dock::DockState,
+    /// The window's look: translucent or not, the Roster collapsed or not.
+    pub(crate) prefs: UiPrefs,
+    /// The ⌘K command palette, drawn over everything while open.
+    pub(crate) palette: Entity<CommandPalette>,
+    /// Whether the palette is open (kept here so browser pages can hide under it without reading the entity).
+    pub(crate) palette_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -155,30 +163,28 @@ impl Focusable for Workspace {
     }
 }
 
-/// Build the terminal palette from the active window [`Theme`].
+/// Build the terminal palette from the active window [`Theme`]. Every terminal sits in a frame painted with
+/// `surface` (a pane, the Parent Agent card, the attempt view), so its own default background is fully
+/// transparent: one surface layer, in opaque and translucent windows alike. Text and the cursor stay opaque.
 pub(crate) fn terminal_theme(theme: &Theme) -> TerminalTheme {
+    let opaque = |color: Hsla| color.alpha(1.0).to_rgb();
     TerminalTheme {
-        foreground: theme.text.to_rgb(),
-        background: theme.surface.to_rgb(),
-        cursor: theme.text.to_rgb(),
-        cursor_text: theme.surface.to_rgb(),
+        foreground: opaque(theme.text),
+        background: theme.surface.alpha(0.0).to_rgb(),
+        cursor: opaque(theme.text),
+        cursor_text: opaque(theme.surface),
         selection: theme.accent.alpha(0.33).to_rgb(),
         scrollback_indicator: theme.text_muted.alpha(0.40).to_rgb(),
         ansi: theme.ansi.map(Hsla::to_rgb),
-    }
-}
-
-fn theme_for_appearance(appearance: WindowAppearance) -> Theme {
-    match appearance {
-        WindowAppearance::Light | WindowAppearance::VibrantLight => Theme::light(),
-        WindowAppearance::Dark | WindowAppearance::VibrantDark => Theme::dark(),
+        drop_highlight: theme.accent.alpha(0.18).to_rgb(),
     }
 }
 
 impl Workspace {
-    /// The workspace over the store in the default data directory, with its active spaces as tabs.
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let theme = theme_for_appearance(window.appearance());
+    /// The workspace over the store in the default data directory, with its active spaces in the Roster, drawn
+    /// with the look `prefs` chose.
+    pub(crate) fn new(prefs: UiPrefs, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let theme = theme_for(window.appearance(), prefs.translucent);
         cx.set_global(theme);
         let (mut store, store_error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
@@ -197,11 +203,20 @@ impl Workspace {
             PromptInput::new(cx)
                 .placeholder("Add repos: type to search yours, or a folder such as ~/code/web")
         });
+        let palette = cx.new(|cx| CommandPalette::new(window, cx));
         let subscriptions = vec![
             cx.observe(&plan_repo_input, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |this, window, cx| {
-                this.apply_appearance(window.appearance(), cx);
+                this.apply_theme(window.appearance(), cx);
             }),
+            cx.subscribe_in(
+                &palette,
+                window,
+                |this, _, event: &PaletteEvent, window, cx| match event {
+                    PaletteEvent::Run(id) => this.run_palette_item(id, window, cx),
+                    PaletteEvent::Dismissed => this.palette_closed(window, cx),
+                },
+            ),
             cx.subscribe_in(
                 &root_input,
                 window,
@@ -290,6 +305,9 @@ impl Workspace {
             browsers: Default::default(),
             serve_hints: Default::default(),
             tool_dock: Default::default(),
+            prefs,
+            palette,
+            palette_open: false,
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -320,28 +338,6 @@ impl Workspace {
         workspace.rescan(cx);
         workspace.focus_home(window, cx);
         workspace
-    }
-
-    /// Update the global [`Theme`] and every live terminal when the system appearance changes.
-    fn apply_appearance(&mut self, appearance: WindowAppearance, cx: &mut Context<Self>) {
-        let theme = theme_for_appearance(appearance);
-        cx.set_global(theme);
-        self.terminal_theme = terminal_theme(&theme);
-        for tab in self.tabs.values() {
-            for pane in tab.terminals.values().chain(tab.attempt_terminals.values()) {
-                if let crate::space_tab::PaneTerminal::Running { view, .. } = pane {
-                    view.update(cx, |terminal, cx| {
-                        terminal.set_theme(self.terminal_theme, cx);
-                    });
-                }
-            }
-        }
-        if let Some(view) = &self.parent.view {
-            view.update(cx, |terminal, cx| {
-                terminal.set_theme(self.terminal_theme, cx);
-            });
-        }
-        cx.notify();
     }
 
     /// Re-read the active spaces from the store.
@@ -523,10 +519,11 @@ impl Workspace {
         }
     }
 
+    /// ⌘1–⌘9: show the space in that Roster slot.
     fn show_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        match self.spaces.get(index).map(|s| s.id.clone()) {
+        match self.roster_space(index, cx) {
             Some(id) => self.show_space(&id, window, cx),
-            None => self.info(format!("there is no space tab {}", index + 1), cx),
+            None => self.info(format!("there is no space at ⌘{}", index + 1), cx),
         }
     }
 
@@ -564,87 +561,6 @@ impl Workspace {
         })
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> TabBar {
-        let active = match &self.view {
-            View::Space(id) => Some(id),
-            View::Home => None,
-        };
-        let tabs: Vec<TabItem> = self
-            .spaces
-            .iter()
-            .map(|space| {
-                let repos = space.repos.len();
-                let running = self
-                    .tabs
-                    .get(&space.id)
-                    .is_some_and(|tab| tab.agent_running(cx));
-                TabItem::new(space.id.as_str().to_owned(), space.title.clone())
-                    .badge(if repos == 1 {
-                        "1 repo".to_owned()
-                    } else {
-                        format!("{repos} repos")
-                    })
-                    .active(active == Some(&space.id))
-                    .running(running)
-            })
-            .collect();
-        let shape = self.active_tab().map(|tab| layout_shape(tab.space.shape));
-        let graph_open = self.active_tab().is_some_and(|tab| tab.graph_open);
-        let entity = cx.entity().downgrade();
-        let (home, select, reshape, ship, discard, graph, add_repo, add_agent) = (
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity,
-        );
-        TabBar::new()
-            .home_active(active.is_none())
-            .tabs(tabs)
-            .active_shape(shape)
-            .graph_open(graph_open)
-            .on_graph(move |window, cx| {
-                let _ = graph.update(cx, |this, cx| {
-                    if this.dialog.is_none() {
-                        this.toggle_graph(window, cx);
-                    }
-                });
-            })
-            .on_add_repo(move |window, cx| {
-                let _ = add_repo.update(cx, |this, cx| {
-                    if this.dialog.is_none() {
-                        this.open_add_repo_dialog(window, cx);
-                    }
-                });
-            })
-            .on_add_agent(move |window, cx| {
-                let _ = add_agent.update(cx, |this, cx| {
-                    if this.dialog.is_none() {
-                        this.open_add_agent_dialog(window, cx);
-                    }
-                });
-            })
-            .on_home(move |window, cx| {
-                let _ = home.update(cx, |this, cx| this.show_home(window, cx));
-            })
-            .on_select(move |id, window, cx| {
-                let id = SpaceId::new(id.to_string());
-                let _ = select.update(cx, |this, cx| this.show_space(&id, window, cx));
-            })
-            .on_shape(move |shape, window, cx| {
-                let _ = reshape.update(cx, |this, cx| this.reshape(shape, window, cx));
-            })
-            .on_ship(move |window, cx| {
-                let _ = ship.update(cx, |this, cx| this.open_ship(window, cx));
-            })
-            .on_discard(move |window, cx| {
-                let _ = discard.update(cx, |this, cx| this.open_discard(window, cx));
-            })
-    }
-
     fn render_status_bar(&self, cx: &mut Context<Self>) -> StatusBar {
         let entity = cx.entity().downgrade();
         let show_inbox = cx.entity().downgrade();
@@ -669,6 +585,15 @@ impl Workspace {
                         || (space.port, space.branch()),
                         |worktree| (worktree.port, worktree.branch.clone()),
                     );
+                let agent_panes = tab.layout.agent_panes();
+                let running = agent_panes
+                    .iter()
+                    .filter(|pane| {
+                        tab.terminals
+                            .get(pane)
+                            .is_some_and(|terminal| terminal.is_alive(cx))
+                    })
+                    .count();
                 bar = bar
                     .space(space.id.as_str().to_owned())
                     .mise_env(space.effective_mise_env())
@@ -676,10 +601,11 @@ impl Workspace {
                     .branch(branch)
                     .shape(layout_shape(space.shape))
                     .zoomed(tab.layout.tree().is_zoomed())
-                    .hints(space_key_hints(self.strip_can_fork(tab)));
+                    .agents(running, agent_panes.len())
+                    .hints(palette_hint());
             }
             None => {
-                bar = bar.hints(home_key_hints());
+                bar = bar.hints(palette_hint());
                 if let Some(busy) = &self.busy {
                     bar = bar.space(format!("{busy}…"));
                 }
@@ -783,22 +709,39 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &DismissDialog, window, cx| this.dismiss_dialog(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &TogglePalette, window, cx| this.toggle_palette(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleRoster, _, cx| this.toggle_roster(cx)))
+            .on_action(cx.listener(|this, _: &ToggleTranslucency, window, cx| {
+                this.toggle_translucency(window, cx)
+            }))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(theme.chrome)
             .text_color(theme.text)
             .text_size(Theme::TEXT_MD)
-            .child(self.render_tab_bar(cx))
+            .child(self.render_title_bar(cx))
             .child(
                 div()
-                    .relative()
+                    .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(body)
-                    .children(dialog),
+                    .child(self.render_roster(cx))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(body)
+                            .children(dialog),
+                    ),
             )
             .child(self.render_status_bar(cx))
+            .child(self.palette.clone())
             // Last, so it runs after every pane placed its browser this frame: hide the browsers none placed.
             .child(self.browsers.frame_end())
     }

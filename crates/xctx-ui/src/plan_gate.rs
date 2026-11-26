@@ -7,8 +7,8 @@ use gpui::{AnyElement, App, FontWeight, SharedString, Window, div, prelude::*, p
 use xctx_layout::Shape;
 
 use crate::components::{Badge, Button, ButtonSize, ButtonVariant, Pill};
-use crate::tab_bar::{SHAPES, shape_label};
 use crate::theme::{Theme, Tone};
+use crate::title_bar::{SHAPES, shape_label};
 
 /// A repo of the proposed space.
 #[derive(Debug, Clone, PartialEq, Eq)]

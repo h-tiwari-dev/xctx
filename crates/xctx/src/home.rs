@@ -4,14 +4,14 @@
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, Context, Div, FontWeight, IntoElement, ParentElement, Styled, Window, div,
-    prelude::*,
+    AnyElement, Context, Div, ExternalPaths, Focusable, FontWeight, IntoElement, ParentElement,
+    Styled, Window, div, prelude::*, px,
 };
-use xctx_core::{Space, SpaceDraft};
+use xctx_core::{Space, SpaceDraft, SpaceId};
 use xctx_graph::AgentRole;
 use xctx_ui::{
-    Badge, Button, ButtonSize, ButtonVariant, PaneLive, ParentAgentDrawer, Theme, Tone, card_badge,
-    helper_kind_label, shape_label,
+    Badge, Button, ButtonSize, ButtonVariant, DRAWER_HEIGHT, Icon, IconName, IconSize, PaneLive,
+    ParentAgentDrawer, Theme, Tone, card_badge, helper_kind_label, shape_label,
 };
 
 use crate::graph_panel::pane_lives;
@@ -116,37 +116,106 @@ impl Workspace {
         true
     }
 
-    /// Home's content.
-    pub(crate) fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Index every directory among `paths` dropped from Finder; anything else is skipped with a note. The
+    /// directory checks run off the main thread.
+    fn drop_roots(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let (dirs, skipped) = executor
+                .spawn(async move {
+                    let (dirs, others): (Vec<PathBuf>, Vec<PathBuf>) =
+                        paths.into_iter().partition(|path| path.is_dir());
+                    (dirs, others.len())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for dir in dirs {
+                    this.add_root(dir.display().to_string(), cx);
+                }
+                match skipped {
+                    0 => {}
+                    1 => this.info("skipped 1 dropped item: only folders are indexed", cx),
+                    n => this.info(
+                        format!("skipped {n} dropped items: only folders are indexed"),
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Home's content: a centred column with the hero, the Parent Agent composer, the indexed folders (also a
+    /// drop target for folders from Finder), the Inbox and the living spaces.
+    pub(crate) fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
+        let terminal_height = (window.viewport_size().height * 0.38).max(DRAWER_HEIGHT);
+        let dragging = cx.has_active_drag();
+        let composer = div()
+            .id("home-composer")
+            .flex()
+            .flex_col()
+            .gap(Theme::SPACE_3)
+            .p(Theme::SPACE_1)
+            .rounded(Theme::RADIUS_LG)
+            .border_2()
+            .border_color(gpui::transparent_black())
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style
+                    .border_color(theme.accent.alpha(0.8))
+                    .bg(theme.accent.alpha(0.06))
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.drop_roots(paths.paths().to_vec(), cx)
+            }))
+            .child(self.render_parent_agent(terminal_height, window, cx))
+            .child(self.render_roots(cx))
+            .when(dragging, |area| {
+                area.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(Theme::SPACE_2)
+                        .py(Theme::SPACE_2)
+                        .rounded(Theme::RADIUS_MD)
+                        .border_1()
+                        .border_color(theme.accent.alpha(0.5))
+                        .text_size(Theme::TEXT_SM)
+                        .text_color(theme.accent)
+                        .child(Icon::new(IconName::Folder).color(theme.accent))
+                        .child("Drop folders to index them"),
+                )
+            });
         let mut column = div()
             .flex()
             .flex_col()
             .gap(Theme::SPACE_6)
             .w_full()
-            .max_w(gpui::px(880.0))
+            .max_w(px(920.0))
             .px(Theme::SPACE_6)
-            .py(Theme::SPACE_6)
+            .pt(px(48.0))
+            .pb(Theme::SPACE_6)
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(Theme::SPACE_2)
+                    .gap(Theme::SPACE_1)
                     .child(
                         div()
                             .text_size(Theme::TEXT_XL)
                             .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
                             .child("What are you working on?"),
                     )
                     .child(
                         div()
                             .text_size(Theme::TEXT_SM)
-                            .text_color(theme.text_subtle)
-                            .child("Tell the Parent Agent. It drafts a space from your indexed repos and shows it here; ⌘↵ launches it. It can also check on and message the agents of your living spaces."),
-                    )
-                    .child(self.render_roots(cx))
-                    .child(self.render_parent_agent(cx)),
-            );
+                            .text_color(theme.text_muted)
+                            .child("Tell the Parent Agent: it drafts a space from your indexed repos, and ⌘↵ launches it."),
+                    ),
+            )
+            .child(composer);
         if let Some(plan) = self.render_plan_review(cx) {
             column = column.child(plan);
         }
@@ -156,9 +225,22 @@ impl Workspace {
         if let Some(busy) = &self.busy {
             column = column.child(notice(format!("{busy}…"), theme.text_muted, &theme));
         }
-        column = column
-            .child(self.render_spaces(cx))
-            .child(self.render_inbox(cx));
+        if self.inbox_pending() > 0 {
+            column = column
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(Theme::SPACE_2)
+                        .child(section_title("Needs you", &theme))
+                        .child(self.render_inbox(cx)),
+                )
+                .child(self.render_spaces(cx));
+        } else {
+            column = column
+                .child(self.render_spaces(cx))
+                .child(self.render_inbox(cx));
+        }
         div()
             .id("home")
             .size_full()
@@ -172,33 +254,62 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_parent_agent(&self, cx: &mut Context<Self>) -> ParentAgentDrawer {
+    fn render_parent_agent(
+        &self,
+        height: gpui::Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> ParentAgentDrawer {
         let restart = cx.entity().downgrade();
-        let mut drawer =
-            ParentAgentDrawer::new(self.parent.status.clone()).on_restart(move |window, cx| {
+        let mut drawer = ParentAgentDrawer::new(self.parent.status.clone())
+            .height(height)
+            .on_restart(move |window, cx| {
                 let _ = restart.update(cx, |this, cx| this.start_parent_agent(window, cx));
             });
         if let Some(view) = &self.parent.view {
-            drawer = drawer.body(view.clone());
+            let focused = view.focus_handle(cx).contains_focused(window, cx);
+            drawer = drawer.focused(focused).body(view.clone());
         }
         drawer
     }
 
     fn render_spaces(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::of(cx);
-        let mut list = div()
+        let section = div()
             .flex()
             .flex_col()
             .gap(Theme::SPACE_2)
             .child(section_title("Living spaces", &theme));
         if self.spaces.is_empty() {
-            list = list.child(
+            return section.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(Theme::SPACE_2)
+                    .p(Theme::SPACE_4)
+                    .rounded(Theme::RADIUS_LG)
+                    .border_1()
+                    .border_color(theme.border_subtle)
+                    .text_size(Theme::TEXT_SM)
                     .text_color(theme.text_muted)
-                    .child("No spaces yet. Tell the Parent Agent what you are working on."),
+                    .child(Icon::new(IconName::Idle).color(theme.text_subtle))
+                    .child("No spaces yet — tell the Parent Agent what you're working on."),
             );
         }
-        for (index, space) in self.spaces.iter().enumerate() {
+        let mut grid = div().flex().flex_wrap().gap(Theme::SPACE_3);
+        // In Roster order, so a card's ⌘N is the key that shows it.
+        let order: Vec<(SpaceId, Option<usize>)> = self
+            .roster_entries(cx)
+            .into_iter()
+            .map(|entry| (entry.id, entry.item.shortcut))
+            .collect();
+        let spaces = order.iter().filter_map(|(id, shortcut)| {
+            self.spaces
+                .iter()
+                .find(|space| &space.id == id)
+                .map(|space| (space, *shortcut))
+        });
+        for (index, (space, shortcut)) in spaces.enumerate() {
             let id = space.id.clone();
             let running = self
                 .tabs
@@ -207,17 +318,29 @@ impl Workspace {
             let header = div()
                 .id(("space-card", index))
                 .cursor_pointer()
-                .rounded(Theme::RADIUS_MD)
-                .hover(|style| style.bg(theme.raised))
                 .on_click(cx.listener(move |this, _, window, cx| this.show_space(&id, window, cx)))
-                .child(space_summary(space, running, index, &theme));
-            list = list.child(
-                card(&theme)
+                .child(space_summary(space, running, shortcut, &theme));
+            grid = grid.child(
+                div()
+                    .id(("space-card-body", index))
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .flex_basis(px(380.0))
+                    .min_w_0()
+                    .gap(Theme::SPACE_3)
+                    .p(Theme::SPACE_4)
+                    .rounded(Theme::RADIUS_LG)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .shadow_sm()
+                    .hover(move |style| style.bg(theme.hover))
                     .child(header)
                     .child(self.render_space_agents(space, index, cx)),
             );
         }
-        list
+        section.child(grid)
     }
 
     /// The agents of `space` under its card, each with what its pane does and Open (or Start when it has no
@@ -225,7 +348,7 @@ impl Workspace {
     /// start when it opens.
     fn render_space_agents(&self, space: &Space, index: usize, cx: &mut Context<Self>) -> Div {
         let theme = Theme::of(cx);
-        let rows = div().flex().flex_col().gap(Theme::SPACE_1);
+        let rows = div().flex().flex_col().gap(Theme::SPACE_0_5);
         let (Some(tab), Some(state)) = (self.tabs.get(&space.id), self.graphs.get(&space.id))
         else {
             return rows.child(
@@ -252,7 +375,7 @@ impl Workspace {
                 if has_pane { "Open" } else { "Start" },
             )
             .variant(if has_pane {
-                ButtonVariant::Secondary
+                ButtonVariant::Ghost
             } else {
                 ButtonVariant::Primary
             })
@@ -270,17 +393,27 @@ impl Workspace {
                 }
             }));
             rows = rows.child(
-                row(&theme)
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Theme::SPACE_2)
+                    .h(px(28.0))
+                    .px(Theme::SPACE_2)
+                    .rounded(Theme::RADIUS_MD)
+                    .bg(theme.raised)
+                    .text_size(Theme::TEXT_SM)
                     .child(
                         div()
                             .flex_none()
-                            .size(gpui::px(7.0))
+                            .size(px(7.0))
                             .rounded_full()
                             .bg(theme.tone(tone).fg),
                     )
                     .child(
                         div()
+                            .flex_none()
                             .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
                             .child(node.label.clone()),
                     )
                     .child(
@@ -288,7 +421,6 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(Theme::TEXT_SM)
                             .text_color(theme.text_subtle)
                             .child(role),
                     )
@@ -299,8 +431,8 @@ impl Workspace {
         rows
     }
 
-    /// The folders xctx indexes for repos, as a compact strip above the Parent Agent (it drafts from them): each
-    /// folder with ✕, how many repos were found, Rescan, and where another folder is typed.
+    /// The folders xctx indexes for repos, as a compact chip row under the Parent Agent (it drafts from them):
+    /// each folder with ×, how many repos were found, Rescan, and where another folder is typed.
     fn render_roots(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::of(cx);
         let status = if self.scanning {
@@ -311,58 +443,75 @@ impl Workspace {
                 count => format!("{count} repos indexed"),
             }
         };
-        let mut folders = div()
+        let mut chips = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(Theme::SPACE_1)
             .child(
                 div()
-                    .text_size(Theme::TEXT_SM)
-                    .text_color(theme.text_muted)
+                    .mr(Theme::SPACE_1)
+                    .text_size(Theme::TEXT_XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_subtle)
                     .child("Repos from"),
             );
         if self.roots.is_empty() {
-            folders = folders.child(
+            chips = chips.child(
                 div()
                     .text_size(Theme::TEXT_SM)
                     .text_color(theme.warning)
-                    .child("no folder yet: add the one that holds your repos, such as ~/code"),
+                    .child(
+                        "no folder yet: add or drop the one that holds your repos, such as ~/code",
+                    ),
             );
         }
         for (index, root) in self.roots.iter().enumerate() {
             let root = root.clone();
-            folders = folders.child(
+            chips = chips.child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(Theme::SPACE_0_5)
+                    .gap(Theme::SPACE_1)
+                    .h(px(24.0))
                     .pl(Theme::SPACE_2)
                     .rounded(Theme::RADIUS_FULL)
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.raised)
                     .text_size(Theme::TEXT_SM)
+                    .text_color(theme.text)
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Xs)
+                            .color(theme.text_muted),
+                    )
                     .child(root.display().to_string())
                     .child(
-                        Button::new(("remove-root", index), "✕")
+                        Button::new(("remove-root", index), "")
+                            .icon(IconName::Close)
+                            .tooltip("Stop indexing this folder")
                             .variant(ButtonVariant::Ghost)
                             .size(ButtonSize::Compact)
+                            .rounded_full()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.remove_root(root.clone(), cx)
                             })),
                     ),
             );
         }
-        folders = folders
+        chips = chips
             .child(
                 div()
-                    .text_size(Theme::TEXT_SM)
-                    .text_color(theme.text_subtle)
+                    .ml(Theme::SPACE_1)
+                    .text_size(Theme::TEXT_XS)
+                    .text_color(theme.meta)
                     .child(status),
             )
             .child(
-                Button::new("rescan", "Rescan")
+                Button::new("rescan", "")
+                    .icon(IconName::Refresh)
+                    .tooltip("Rescan")
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
                     .disabled(self.scanning)
@@ -371,8 +520,9 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .gap(Theme::SPACE_1)
-            .child(folders)
+            .gap(Theme::SPACE_2)
+            .px(Theme::SPACE_1)
+            .child(chips)
             .child(
                 div()
                     .flex()
@@ -380,8 +530,10 @@ impl Workspace {
                     .gap(Theme::SPACE_2)
                     .child(div().flex_1().child(self.root_input.clone()))
                     .child(
-                        Button::new("add-root", "Add folder")
+                        Button::new("add-root", "Add")
+                            .icon(IconName::Plus)
                             .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Compact)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let input = this.root_input.read(cx).value().to_owned();
                                 this.add_root(input, cx);
@@ -391,15 +543,15 @@ impl Workspace {
     }
 }
 
-/// A living space's card body: title, slug, shape, port, branch and repos.
-fn space_summary(space: &Space, running: bool, index: usize, theme: &Theme) -> Div {
+/// A living space's card header: state dot, title, shape, its ⌘N key, then slug, branch, port and repos.
+fn space_summary(space: &Space, running: bool, shortcut: Option<usize>, theme: &Theme) -> Div {
     let repos = space
         .repos
         .iter()
         .map(|r| r.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let shortcut = (index < 9).then(|| format!("⌘{}", index + 1));
+    let shortcut = shortcut.map(|slot| keycap(format!("⌘{slot}"), theme));
     div()
         .flex()
         .flex_col()
@@ -411,28 +563,35 @@ fn space_summary(space: &Space, running: bool, index: usize, theme: &Theme) -> D
                 .gap(Theme::SPACE_2)
                 .child(
                     div()
+                        .flex_none()
+                        .size(px(8.0))
+                        .rounded_full()
+                        .bg(if running {
+                            theme.success
+                        } else {
+                            theme.text_subtle
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_size(Theme::TEXT_LG)
+                        .text_color(theme.text)
                         .child(space.title.clone()),
                 )
                 .child(Badge::new(shape_label(layout_shape(space.shape))).tone(Tone::Accent))
-                .when(running, |row| {
-                    row.child(Badge::new("running").tone(Tone::Success))
-                })
                 .child(div().flex_1())
-                .children(shortcut.map(|keys| {
-                    div()
-                        .text_size(Theme::TEXT_SM)
-                        .text_color(theme.text_subtle)
-                        .child(keys)
-                })),
+                .children(shortcut),
         )
         .child(
             div()
+                .truncate()
                 .text_size(Theme::TEXT_SM)
                 .text_color(theme.text_muted)
                 .child(format!(
-                    "{}  ·  {}  ·  PORT {}  ·  {}",
+                    "{} · {} · :{} · {}",
                     space.id,
                     space.branch(),
                     space.port,
@@ -441,27 +600,18 @@ fn space_summary(space: &Space, running: bool, index: usize, theme: &Theme) -> D
         )
 }
 
-fn card(theme: &Theme) -> Div {
+/// A key chord drawn as a small keycap.
+fn keycap(keys: String, theme: &Theme) -> Div {
     div()
-        .flex()
-        .flex_col()
-        .gap(Theme::SPACE_2)
-        .p(Theme::SPACE_4)
-        .rounded(Theme::RADIUS_LG)
+        .flex_none()
+        .px(Theme::SPACE_1)
+        .rounded(Theme::RADIUS_SM)
         .border_1()
         .border_color(theme.border)
-        .bg(theme.surface)
-}
-
-fn row(theme: &Theme) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap(Theme::SPACE_2)
-        .px(Theme::SPACE_3)
-        .py(Theme::SPACE_2)
-        .rounded(Theme::RADIUS_MD)
         .bg(theme.raised)
+        .text_size(Theme::TEXT_XS)
+        .text_color(theme.meta)
+        .child(keys)
 }
 
 fn notice(message: String, color: gpui::Hsla, theme: &Theme) -> Div {
@@ -479,8 +629,8 @@ fn notice(message: String, color: gpui::Hsla, theme: &Theme) -> Div {
 
 fn section_title(title: &'static str, theme: &Theme) -> Div {
     div()
-        .text_size(Theme::TEXT_LG)
+        .text_size(Theme::TEXT_XS)
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.text)
+        .text_color(theme.text_subtle)
         .child(title)
 }

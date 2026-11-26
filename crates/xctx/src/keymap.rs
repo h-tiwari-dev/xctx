@@ -56,15 +56,21 @@ actions!(
         ForkAttempts,
         /// Open the review sheet on the latest round of attempts of the space being shown.
         ReviewAttempts,
+        /// Open the command palette, or close it.
+        TogglePalette,
+        /// Collapse the Roster to a rail of icons, or expand it.
+        ToggleRoster,
+        /// Make the window translucent (the blurred desktop shows through), or opaque.
+        ToggleTranslucency,
     ]
 );
 
-/// Show the space in tab `0` (zero-based); bound to Cmd+1 to Cmd+9.
+/// Show the space in Roster slot `0` (zero-based, in Roster order); bound to Cmd+1 to Cmd+9.
 #[derive(Clone, Debug, PartialEq, gpui::Action)]
 #[action(namespace = xctx, no_json)]
 pub struct ActivateTab(pub usize);
 
-/// The keys that show tabs 1 to 9.
+/// The keys that show Roster slots 1 to 9.
 const TAB_KEYS: [&str; 9] = [
     "cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9",
 ];
@@ -94,57 +100,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-r", ReviewAttempts, ws),
         KeyBinding::new("cmd-0", ShowHome, ws),
         KeyBinding::new("cmd-enter", LaunchDraft, ws),
+        KeyBinding::new("cmd-k", TogglePalette, ws),
+        KeyBinding::new("cmd-b", ToggleRoster, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
     ];
     for (index, key) in TAB_KEYS.into_iter().enumerate() {
         bindings.push(KeyBinding::new(key, ActivateTab(index), ws));
     }
     cx.bind_keys(bindings);
+    xctx_ui::command_palette::bind_palette_keys(cx);
 }
 
-/// The hints shown in a space. `fork` is whether ⌘⇧F can fork the writer it would pick (its runner can fork
-/// sessions); without it the fork hint is left out.
-pub fn space_key_hints(fork: bool) -> Vec<KeyHint> {
-    let mut hints = vec![
-        KeyHint::new("⌘D/⌘⇧D", "split"),
-        KeyHint::new("⌘W", "close"),
-        KeyHint::new("⌘⌥←→↑↓", "focus"),
-        KeyHint::new("⌘⌃←→↑↓", "resize"),
-        KeyHint::new("⌘⇧Z", "zoom"),
-        KeyHint::new("⌘G", "graph"),
-        KeyHint::new("⌘⇧F", "fork"),
-        KeyHint::new("⌘⇧R", "review"),
-        KeyHint::new("⌘0", "home"),
-    ];
-    if !fork {
-        hints.retain(|hint| hint.keys.as_ref() != "⌘⇧F");
-    }
-    hints
-}
-
-/// The hints shown on Home.
-pub fn home_key_hints() -> Vec<KeyHint> {
-    vec![
-        KeyHint::new("⌘⏎", "launch"),
-        KeyHint::new("⌘1-9", "spaces"),
-        KeyHint::new("⌘Q", "quit"),
-    ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_fork_hint_shows_only_when_forking_is_possible() {
-        let keys = |fork| -> Vec<String> {
-            space_key_hints(fork)
-                .iter()
-                .map(|h| h.keys.to_string())
-                .collect()
-        };
-        assert!(keys(true).contains(&"⌘⇧F".to_owned()));
-        assert!(!keys(false).contains(&"⌘⇧F".to_owned()));
-        assert!(keys(false).contains(&"⌘G".to_owned()));
-    }
+/// The one hint the status bar shows: every other key is found, with its chord, in the command palette.
+pub fn palette_hint() -> Vec<KeyHint> {
+    vec![KeyHint::new("⌘K", "Commands")]
 }

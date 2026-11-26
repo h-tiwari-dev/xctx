@@ -15,6 +15,6 @@ pub use error::LayoutError;
 pub use geometry::{DividerRect, LayoutResult, PaneRect, Rect};
 pub use shape::{PLUGIN_COLUMN_BASE_SHARE, PaneKind, PaneRole, Reshape, RolePane, Shape, reshape};
 pub use tree::{
-    FocusDirection, MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, PaneNode, PaneTree, SplitAxis,
-    SplitId,
+    DropEdge, FocusDirection, MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, PaneNode, PaneTree,
+    SplitAxis, SplitId,
 };

@@ -516,12 +516,13 @@ impl Workspace {
         }
     }
 
-    /// Whether a browser page may be drawn over its pane: not while a dialog, or a popover of the shown space's dock,
-    /// is open over it.
+    /// Whether a browser page may be drawn over its pane: not while a dialog, the command palette, or a popover of
+    /// the shown space's dock, is open over it.
     pub(crate) fn pages_may_show(&self) -> bool {
         let shown = self.active_space_id();
         let over_shown = |space: Option<&SpaceId>| space.is_some() && space == shown.as_ref();
         self.dialog.is_none()
+            && !self.palette_open
             && !over_shown(self.tool_dock.popover.as_ref().map(|(space, _)| space))
             && !over_shown(self.tool_dock.problems_open.as_ref())
     }
@@ -543,32 +544,36 @@ impl Workspace {
 
     /// Open tool `name` in the space shown, with its default setting; the popover instead when it has no usable
     /// default.
-    fn dock_open(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.active_space_id() else {
-            return;
-        };
-        let Some((title, plan)) = self.tool_plan(&id, name) else {
-            return;
-        };
-        match plan {
-            Some(plan) if plan.needs_input => self.dock_popover(Some(name), window, cx),
-            Some(plan) => {
-                self.dock_mount(&id, name, &title, plan.repo, plan.settings, window, cx);
-            }
-            None => {
-                self.dock_mount(
-                    &id,
-                    name,
-                    &title,
-                    None,
-                    MountSettings::default(),
-                    window,
-                    cx,
-                );
-            }
-        }
+    pub(crate) fn dock_open(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.dock_open_returning(name, window, cx);
     }
 
+    /// Open tool `name` in the space shown with its default setting, as a click on it in the dock does, and
+    /// return its new pane; `None` when it opened nothing here (it needs a setting first and its popover opened,
+    /// it waits for approval in the Inbox, or it failed, which is shown).
+    pub(crate) fn dock_open_returning(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<xctx_layout::PaneId> {
+        let id = self.active_space_id()?;
+        let (title, plan) = self.tool_plan(&id, name)?;
+        let (repo, settings) = match plan {
+            Some(plan) if plan.needs_input => {
+                self.dock_popover(Some(name), window, cx);
+                return None;
+            }
+            Some(plan) => (plan.repo, plan.settings),
+            None => (None, MountSettings::default()),
+        };
+        self.dock_mount(&id, name, &title, repo, settings, window, cx)
+            .ok()
+            .flatten()
+    }
+
+    /// Mount tool `name` in space `id`, saying what happened: `Ok(Some(pane))` when its pane opened,
+    /// `Ok(None)` when it waits for approval in the Inbox, `Err(())` when it failed (the error is shown).
     #[allow(clippy::too_many_arguments)]
     fn dock_mount(
         &mut self,
@@ -579,11 +584,11 @@ impl Workspace {
         settings: MountSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Result<Option<xctx_layout::PaneId>, ()> {
         match self.mount_plugin(id, name, repo, settings, false, window, cx) {
-            Ok(MountOutcome::Mounted(_)) => {
+            Ok(MountOutcome::Mounted(pane)) => {
                 self.info(format!("Opened {title}"), cx);
-                true
+                Ok(Some(pane))
             }
             Ok(MountOutcome::Gated(_)) => {
                 self.info(
@@ -592,17 +597,17 @@ impl Workspace {
                     ),
                     cx,
                 );
-                true
+                Ok(None)
             }
             Err(e) => {
                 self.show_op_error(e, cx);
-                false
+                Err(())
             }
         }
     }
 
     /// Close every pane of tool `name` in the space shown, as `⌘W` on them does.
-    fn dock_close(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dock_close(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.active_space_id() else {
             return;
         };
@@ -673,7 +678,10 @@ impl Workspace {
         };
         // Close first: the new pane takes the keys.
         self.tool_dock.popover = None;
-        if !self.dock_mount(&id, &name, &title, plan.repo, settings, window, cx) {
+        if self
+            .dock_mount(&id, &name, &title, plan.repo, settings, window, cx)
+            .is_err()
+        {
             // Keep what was typed, so it can be fixed.
             self.tool_dock.popover = Some((id, name));
         }

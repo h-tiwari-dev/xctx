@@ -7,6 +7,7 @@ use std::rc::Rc;
 use gpui::{AnyElement, App, FontWeight, Pixels, SharedString, Window, div, prelude::*, px};
 
 use crate::components::{Badge, Button, ButtonSize};
+use crate::icon::{Icon, IconName};
 use crate::theme::{Theme, Tone};
 
 /// Where the Parent Agent's session is.
@@ -54,16 +55,18 @@ impl AgentStatus {
 /// the Plan Gate is enforced.
 pub const PARENT_AGENT_ROLE: &str = "Drafts a space for your task; nothing launches until you press Launch. Asked not to write code (advisory).";
 
-/// The default height of the panel's terminal.
-pub const DRAWER_HEIGHT: Pixels = px(360.0);
+/// The default (minimum) height of the panel's terminal; Home passes a taller one that grows with the window.
+pub const DRAWER_HEIGHT: Pixels = px(260.0);
 
 type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// The Parent Agent drawer.
+/// The Parent Agent drawer: Home's composer card, a slim header (icon, name, status, Restart when stopped) over
+/// the agent's terminal.
 #[derive(IntoElement)]
 pub struct ParentAgentDrawer {
     status: AgentStatus,
     height: Pixels,
+    focused: bool,
     body: Option<AnyElement>,
     on_restart: Option<Handler>,
 }
@@ -74,6 +77,7 @@ impl ParentAgentDrawer {
         Self {
             status,
             height: DRAWER_HEIGHT,
+            focused: false,
             body: None,
             on_restart: None,
         }
@@ -82,6 +86,12 @@ impl ParentAgentDrawer {
     /// The terminal's height.
     pub fn height(mut self, height: Pixels) -> Self {
         self.height = height;
+        self
+    }
+
+    /// Whether the agent's terminal has keyboard focus: the card's border turns `accent`.
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
         self
     }
 
@@ -106,7 +116,8 @@ impl RenderOnce for ParentAgentDrawer {
             .filter(|_| self.status.can_restart())
             .map(|handler| {
                 Button::new("parent-restart", "Restart")
-                    .size(ButtonSize::Regular)
+                    .icon(IconName::Refresh)
+                    .size(ButtonSize::Compact)
                     .selector("parent-restart")
                     .on_click(move |_, window, cx| handler(window, cx))
             });
@@ -132,42 +143,48 @@ impl RenderOnce for ParentAgentDrawer {
             .border_t_1()
             .border_color(theme.border_subtle)
             .child(content);
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(Theme::SPACE_2)
+            .h(px(36.0))
+            .px(Theme::SPACE_3)
+            .bg(theme.raised)
+            .child(Icon::new(IconName::Orchestrator).color(theme.accent))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(Theme::TEXT_MD)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child("Parent Agent"),
+            )
+            .child(Badge::new(self.status.label()).tone(self.status.tone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(Theme::TEXT_XS)
+                    .text_color(theme.text_subtle)
+                    .child(PARENT_AGENT_ROLE),
+            )
+            .children(restart);
         div()
             .flex()
             .flex_col()
             .w_full()
-            .rounded(Theme::RADIUS_MD)
+            .rounded(Theme::RADIUS_LG)
             .border_1()
-            .border_color(theme.accent.alpha(0.4))
+            .border_color(if self.focused {
+                theme.accent
+            } else {
+                theme.border
+            })
             .bg(theme.surface)
+            .shadow_md()
             .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(Theme::SPACE_2)
-                    .px(Theme::SPACE_3)
-                    .py(Theme::SPACE_2)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(Theme::TEXT_LG)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child("Parent Agent"),
-                    )
-                    .child(Badge::new(self.status.label()).tone(self.status.tone()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(Theme::TEXT_XS)
-                            .text_color(theme.text_subtle)
-                            .child(PARENT_AGENT_ROLE),
-                    )
-                    .children(restart),
-            )
+            .child(header)
             .child(body)
     }
 }

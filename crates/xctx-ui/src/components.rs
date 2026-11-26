@@ -8,6 +8,7 @@ use gpui::{
     px, transparent_black,
 };
 
+use crate::icon::{Icon, IconName, IconSize};
 use crate::theme::{Theme, Tone};
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -66,7 +67,7 @@ impl ButtonVariant {
             },
             Self::Ghost => ButtonColors {
                 bg: transparent_black(),
-                bg_hover: theme.raised,
+                bg_hover: theme.hover,
                 fg: theme.text_muted,
                 border: transparent_black(),
             },
@@ -129,6 +130,8 @@ impl ButtonSize {
 pub struct Button {
     id: ElementId,
     label: SharedString,
+    icon: Option<IconName>,
+    tooltip: Option<SharedString>,
     variant: ButtonVariant,
     size: ButtonSize,
     selected: bool,
@@ -144,6 +147,8 @@ impl Button {
         Self {
             id: id.into(),
             label: label.into(),
+            icon: None,
+            tooltip: None,
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             selected: false,
@@ -199,6 +204,19 @@ impl Button {
         self.on_click = Some(Rc::new(handler));
         self
     }
+
+    /// Draw `icon` before the label; with an empty label the button is a square icon button.
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// Show `text` in a tooltip while the mouse rests on the button, such as what an icon button does and its
+    /// key chord.
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
 }
 
 impl RenderOnce for Button {
@@ -215,15 +233,22 @@ impl RenderOnce for Button {
             _ if self.selected => FontWeight::SEMIBOLD,
             _ => FontWeight::MEDIUM,
         };
+        let icon_size = match self.size {
+            ButtonSize::Compact => IconSize::Xs,
+            ButtonSize::Regular => IconSize::Sm,
+            ButtonSize::Large => IconSize::Md,
+        };
+        let icon_only = self.icon.is_some() && self.label.is_empty();
         let mut button = div()
             .id(self.id)
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
+            .gap(Theme::SPACE_1 + px(2.0))
             .h(self.size.height())
             .min_w(self.size.height())
-            .px(self.size.padding_x())
+            .when(!icon_only, |button| button.px(self.size.padding_x()))
             .rounded(radius)
             .border_1()
             .border_color(colors.border)
@@ -232,7 +257,14 @@ impl RenderOnce for Button {
             .text_size(self.size.text_size())
             .font_weight(weight)
             .whitespace_nowrap()
-            .child(self.label);
+            .children(
+                self.icon
+                    .map(|icon| Icon::new(icon).size(icon_size).color(colors.fg)),
+            )
+            .when(!self.label.is_empty(), |button| button.child(self.label));
+        if let Some(text) = self.tooltip {
+            button = button.tooltip(move |_, cx| Tooltip::view(text.clone(), cx));
+        }
         if let Some(selector) = self.selector {
             button = button.debug_selector(|| selector);
         }
@@ -251,6 +283,35 @@ impl RenderOnce for Button {
             }
         }
         button
+    }
+}
+
+/// The small label shown over a control while the mouse rests on it ([`Button::tooltip`]).
+pub struct Tooltip {
+    text: SharedString,
+}
+
+impl Tooltip {
+    /// A tooltip view showing `text`, for GPUI's `.tooltip(..)` on any interactive element.
+    pub fn view(text: impl Into<SharedString>, cx: &mut App) -> gpui::AnyView {
+        cx.new(|_| Self { text: text.into() }).into()
+    }
+}
+
+impl gpui::Render for Tooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(Theme::SPACE_2)
+            .py(Theme::SPACE_1)
+            .rounded(Theme::RADIUS_MD)
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.overlay)
+            .shadow_md()
+            .text_size(Theme::TEXT_XS)
+            .text_color(theme.text)
+            .child(self.text.clone())
     }
 }
 

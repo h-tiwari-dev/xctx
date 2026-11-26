@@ -11,4 +11,4 @@ mod view;
 
 pub use keys::key_event_for_keystroke;
 pub use theme::{CellColors, TerminalFont, TerminalTheme};
-pub use view::{TerminalView, TerminalViewEvent};
+pub use view::{TerminalView, TerminalViewEvent, shell_quote_paths};

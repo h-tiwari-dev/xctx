@@ -1,9 +1,10 @@
 //! The tool dock: a slim column of icon buttons on the right edge of a space, one per tool the space can use
 //! (Terminal, Logs, Browser, Files, the API client, Database, Jira, Figma, and the user's and repos' own), in
-//! groups. A click opens a closed tool's pane or closes an open one; a tool that takes a setting (a command, a
-//! database, a URL) can be opened with another value from a small popover; tool folders whose manifest could not
-//! be read show as a warning item at the bottom.
+//! groups. A click opens a closed tool's pane or closes an open one; dragging a tool onto a pane opens it there; a
+//! tool that takes a setting (a command, a database, a URL) can be opened with another value from a small popover;
+//! tool folders whose manifest could not be read show as a warning item at the bottom.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
@@ -12,6 +13,7 @@ use gpui::{
 };
 
 use crate::components::{Button, ButtonSize, ButtonVariant};
+use crate::drag::{DragPreview, DraggedTool};
 use crate::icon::{Icon, IconName, IconSize};
 use crate::theme::{Theme, Tone};
 
@@ -114,12 +116,16 @@ type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 /// The tool dock, drawn from a [`ToolDockView`].
 ///
 /// A click on a closed tool calls [`ToolDock::on_open`] (or, when it [`DockItem::needs_input`], opens its popover);
-/// a click on an open tool calls [`ToolDock::on_close`]. A right-click or the chevron shown on hover, on a tool with
-/// a setting, calls [`ToolDock::on_popover`] with its name; the host then sets [`ToolDockView::popover`], puts
-/// [`ToolSetting::default`] in its input and passes that input to [`ToolDock::setting_input`]. The popover's Open
-/// calls [`ToolDock::on_submit`] (Enter and Escape in the input are the host's to handle), and a click outside it
-/// calls [`ToolDock::on_popover`] with `None`. The problems item toggles its list with [`ToolDock::on_problems`].
-/// Nothing reacts while [`ToolDockView::busy`].
+/// a click on an open tool calls [`ToolDock::on_close`]. A press on the tool whose popover is open only closes the
+/// popover. Every tool but a [`DockItem::locked`] one can also be dragged, as a [`DraggedTool`], onto a pane of the
+/// [`crate::SplitView`] (see [`crate::SplitView::on_drop_tool`]); a drag (a press that moves) is not a click. A
+/// right-click or the chevron shown on hover, on a tool with a setting, calls [`ToolDock::on_popover`] with its
+/// name; the host then sets [`ToolDockView::popover`], puts [`ToolSetting::default`] in its input and passes that
+/// input to [`ToolDock::setting_input`]. The popover's Open calls [`ToolDock::on_submit`] (Enter and Escape in the
+/// input are the host's to handle), and a click outside it calls [`ToolDock::on_popover`] with `None`. The problems
+/// item toggles its list with [`ToolDock::on_problems`]. Nothing reacts while [`ToolDockView::busy`].
+///
+/// The dock paints no background: it sits on the window's chrome, behind a thin line on its left.
 ///
 /// Selectors for tests: `tool-dock`, `tool-<name>` (an item's button), `tool-open-<name>` (its open dot),
 /// `tool-lock-<name>`, `tool-more-<name>` (the hover chevron), `tool-popover-<name>`, `tool-setting-<name>` (the
@@ -264,6 +270,8 @@ impl ToolDock {
         item: &DockItem,
         setting_input: &mut Option<AnyElement>,
         theme: &Theme,
+        window: &mut Window,
+        cx: &mut App,
     ) -> AnyElement {
         let busy = self.view.busy;
         let name = item.name.clone();
@@ -296,8 +304,11 @@ impl ToolDock {
         if busy {
             button = button.opacity(0.45);
         } else {
-            let raised = theme.raised;
-            button = button.cursor_pointer().hover(move |s| s.bg(raised));
+            let hover = theme.hover;
+            // An open tool keeps its active look under the pointer.
+            button = button
+                .cursor_pointer()
+                .when(!item.open, |b| b.hover(move |s| s.bg(hover)));
             let click: Option<Handler> = if item.open {
                 self.on_close.clone().map(|handler| {
                     let name = name.clone();
@@ -318,12 +329,36 @@ impl ToolDock {
                         as Handler
                 })
             };
-            // On press, in the same event as an open popover's click-away (which runs first and closes it): a press
-            // on the tool whose popover is open only closes the popover.
+            // The tool acts on the click, so that a press that turns into a drag does nothing. A press on the tool
+            // whose popover is open only closes the popover: its click-away runs on that press and the dock is
+            // redrawn without it before the release, so whether the press counts is decided when it happens.
             let popover_here = self.view.popover.as_ref() == Some(&item.name);
-            if let Some(click) = click.filter(|_| !popover_here) {
-                button =
-                    button.on_mouse_down(MouseButton::Left, move |_, window, cx| click(window, cx));
+            if let Some(click) = click {
+                let armed = window.use_keyed_state(
+                    SharedString::from(format!("tool-armed-{name}")),
+                    cx,
+                    |_, _| Cell::new(false),
+                );
+                let pressed = armed.clone();
+                button = button
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        pressed.read(cx).set(!popover_here);
+                    })
+                    .on_click(move |_, window, cx| {
+                        if armed.read(cx).replace(false) {
+                            click(window, cx);
+                        }
+                    });
+            }
+            if !item.locked {
+                let dragged = DraggedTool {
+                    name: item.name.clone(),
+                    title: item.title.clone(),
+                    icon: item.icon,
+                };
+                button = button.on_drag(dragged, |tool, _, _, cx| {
+                    cx.new(|_| DragPreview::new(tool.icon, tool.title.clone()))
+                });
             }
             if item.setting.is_some()
                 && let Some(handler) = self.on_popover.clone()
@@ -355,7 +390,7 @@ impl ToolDock {
                 .right(px(1.0))
                 .p(px(1.0))
                 .rounded(Theme::RADIUS_SM)
-                .bg(theme.chrome)
+                .bg(theme.raised)
                 .child(
                     Icon::new(IconName::Lock)
                         .size_px(px(9.0))
@@ -514,12 +549,12 @@ impl ToolDock {
         if busy {
             button = button.opacity(0.45);
         } else if let Some(handler) = self.on_problems.clone() {
-            let raised = theme.raised;
+            let hover = theme.hover;
             // On mouse down, in the same event as the open list's click-away (which runs first and closes it): a
             // press on the item while the list is open only closes it.
             button = button
                 .cursor_pointer()
-                .hover(move |s| s.bg(raised))
+                .hover(move |s| s.bg(hover))
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     if !open {
                         handler(true, window, cx);
@@ -594,7 +629,7 @@ impl ToolDock {
 }
 
 impl RenderOnce for ToolDock {
-    fn render(mut self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx);
         let mut setting_input = self.setting_input.take();
         let items: Vec<&DockItem> = self.view.items.iter().take(TOOL_ITEM_LIMIT).collect();
@@ -605,7 +640,7 @@ impl RenderOnce for ToolDock {
             let members: Vec<AnyElement> = items
                 .iter()
                 .filter(|item| item.group == group)
-                .map(|item| self.render_item(item, &mut setting_input, &theme))
+                .map(|item| self.render_item(item, &mut setting_input, &theme, window, cx))
                 .collect();
             if members.is_empty() {
                 continue;
@@ -638,7 +673,6 @@ impl RenderOnce for ToolDock {
             .py(Theme::SPACE_2)
             .border_l_1()
             .border_color(theme.border_subtle)
-            .bg(theme.chrome)
             .child(column)
             .children(problems)
     }

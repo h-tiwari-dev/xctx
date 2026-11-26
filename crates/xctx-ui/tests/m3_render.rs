@@ -1,5 +1,5 @@
 //! The Milestone 3 components in GPUI's headless test window: the Agent Graph panel, the Shared Space panel, the
-//! loop bar and the tab bar's Graph toggle, clicked through their buttons.
+//! loop bar and the title bar's Graph toggle, clicked through their buttons.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -13,7 +13,9 @@ use xctx_graph::{
     AgentGraph, AgentNodeId, AgentRole, AgentState, AutonomyLevel, HelperKind, LoopRun,
 };
 use xctx_layout::Shape;
-use xctx_ui::{AgentGraphView, LoopBar, SharedSpacePanel, SharedTab, TabBar, TabItem, Theme};
+use xctx_ui::{
+    AgentGraphView, LoopBar, SharedSpacePanel, SharedTab, SpaceHeaderInfo, Theme, TitleBar,
+};
 
 /// What the hosts' handlers saw, in order.
 type Log = Rc<RefCell<Vec<String>>>;
@@ -542,46 +544,33 @@ fn a_passed_loop_only_resets(cx: &mut TestAppContext) {
 
 // ---------------------------------------------------------------------------------------------------------------
 
-struct TabHost {
-    with_graph: bool,
+struct TitleHost {
     log: Log,
 }
 
-impl Render for TabHost {
+impl Render for TitleHost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let graph = self.log.clone();
-        let mut bar = TabBar::new()
-            .tabs([TabItem::new("rate-limit", "add rate limiting").active(true)])
-            .active_shape(Some(Shape::Dev))
-            .graph_open(true);
-        if self.with_graph {
-            bar = bar.on_graph(move |_, _| log(&graph, "graph"));
-        }
-        div().size_full().child(bar)
+        let bar = TitleBar::new("add rate limiting")
+            .space(SpaceHeaderInfo {
+                shape: Shape::Dev,
+                graph_open: true,
+                production: false,
+                branch: "space/rate-limit".into(),
+                env: "rate-limit".into(),
+            })
+            .on_graph(move |_, _| log(&graph, "graph"));
+        div().w(gpui::px(1400.0)).h_full().child(bar)
     }
 }
 
-fn tab_host(cx: &mut TestAppContext, with_graph: bool) -> (Log, &mut VisualTestContext) {
+#[gpui::test]
+fn the_title_bar_graph_button_toggles_the_graph(cx: &mut TestAppContext) {
     let events: Log = Rc::default();
     let host_log = events.clone();
-    let (_host, cx) = cx.add_window_view(move |_, _| TabHost {
-        with_graph,
-        log: host_log,
-    });
+    let (_host, cx) = cx.add_window_view(move |_, _| TitleHost { log: host_log });
     cx.run_until_parked();
-    (events, cx)
-}
-
-#[gpui::test]
-fn the_tab_bar_graph_pill_toggles_the_graph(cx: &mut TestAppContext) {
-    let (events, cx) = tab_host(cx, true);
-    assert!(click(cx, "tab-graph"));
-    assert!(click(cx, "tab-graph"));
+    assert!(click(cx, "title-graph"));
+    assert!(click(cx, "title-graph"));
     assert_eq!(*events.borrow(), ["graph", "graph"]);
-}
-
-#[gpui::test]
-fn the_tab_bar_has_no_graph_pill_without_a_handler(cx: &mut TestAppContext) {
-    let (_events, cx) = tab_host(cx, false);
-    assert!(cx.debug_bounds("tab-graph").is_none());
 }

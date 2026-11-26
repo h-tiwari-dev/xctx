@@ -37,6 +37,8 @@ pub struct Theme {
     pub on_accent: Hsla,
     /// Selected row background and text selection.
     pub selection: Hsla,
+    /// A translucent wash under a hovered row or ghost button; reads the same on any surface, opaque or not.
+    pub hover: Hsla,
     /// Read-outs: port, budget, cost, counts and key chords.
     pub meta: Hsla,
     /// Running, passed and agreed states.
@@ -130,14 +132,19 @@ impl Theme {
     /// Font size of headings.
     pub const TEXT_XL: Pixels = px(20.0);
 
-    /// Height of the tab bar.
-    pub const TAB_BAR_HEIGHT: Pixels = px(38.0);
+    /// Height of the window's title bar row: the traffic lights, the Roster toggle and the space header.
+    pub const TITLE_BAR_HEIGHT: Pixels = px(40.0);
+    /// Room left of the title bar's content for the window's traffic lights.
+    pub const TRAFFIC_LIGHT_INSET: Pixels = px(78.0);
+    /// Where the traffic lights sit, from the window's top-left corner, so they are centred in the title bar.
+    pub const TRAFFIC_LIGHT_POSITION: (Pixels, Pixels) = (px(14.0), px(13.0));
     /// Height of the status bar.
     pub const STATUS_BAR_HEIGHT: Pixels = px(24.0);
     /// Height of a pane's header strip.
-    pub const PANE_HEADER_HEIGHT: Pixels = px(24.0);
-    /// Thickness of the gap between split panes, which is also the divider's drawn width.
-    pub const DIVIDER_THICKNESS: Pixels = px(4.0);
+    pub const PANE_HEADER_HEIGHT: Pixels = px(28.0);
+    /// Thickness of the gap between split panes, where a divider is grabbed; a hovered or dragged divider draws a
+    /// 2px line in its middle.
+    pub const DIVIDER_THICKNESS: Pixels = px(6.0);
     /// How far a divider's grab area extends past its drawn width on each side.
     pub const DIVIDER_GRAB_SLOP: Pixels = px(3.0);
 
@@ -160,6 +167,7 @@ impl Theme {
             accent_hover: hex(0x47b2ff),
             on_accent: hex(0x0f1216),
             selection: accent.alpha(0.16),
+            hover: hex(0xe8ecf4).alpha(0.07),
             meta: hex(0xd4c090),
             success: hex(0x3ddc84),
             warning: hex(0xffb347),
@@ -212,6 +220,7 @@ impl Theme {
             accent_hover: hex(0x005f9c),
             on_accent: hex(0xffffff),
             selection: accent.alpha(0.14),
+            hover: hex(0x1a1e26).alpha(0.06),
             meta: hex(0x7a6118),
             success: hex(0x157a46),
             warning: hex(0x9a5a00),
@@ -281,6 +290,29 @@ impl Theme {
     /// The outline of a pane or input: [`Theme::accent`] when focused, else [`Theme::border`].
     pub fn outline(&self, focused: bool) -> Hsla {
         if focused { self.accent } else { self.border }
+    }
+
+    /// This theme for a translucent, blurred window: the window chrome and the panes let the blurred desktop
+    /// through (chrome more than panes, so the Roster reads as a sidebar), while raised controls, overlays and
+    /// text stay opaque so everything stays legible. The terminal takes its background from `surface`, so it
+    /// turns translucent with the panes.
+    pub fn translucent(self) -> Self {
+        Self {
+            chrome: self.chrome.alpha(Self::TRANSLUCENT_CHROME_ALPHA),
+            surface: self.surface.alpha(Self::TRANSLUCENT_SURFACE_ALPHA),
+            border_subtle: self.border_subtle.alpha(0.7),
+            ..self
+        }
+    }
+
+    /// Opacity of `chrome` in a [`Theme::translucent`] theme.
+    pub const TRANSLUCENT_CHROME_ALPHA: f32 = 0.62;
+    /// Opacity of `surface` in a [`Theme::translucent`] theme.
+    pub const TRANSLUCENT_SURFACE_ALPHA: f32 = 0.74;
+
+    /// Whether this theme draws its chrome translucent (see [`Theme::translucent`]).
+    pub fn is_translucent(&self) -> bool {
+        self.chrome.a < 1.0
     }
 }
 
