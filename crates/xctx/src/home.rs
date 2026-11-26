@@ -1,7 +1,7 @@
-//! Home: the Parent Agent you tell what you are working on, the space it drafts (launched with ⌘↵), the
-//! Inbox, the living spaces, and the indexed folders.
+//! Home: the centred hero and task composer backed by the Parent Agent, with toggleable indexed-folders and
+//! Parent Agent terminal drawers, the plan review card (launched with ⌘↵), the Inbox, and the active spaces.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, Context, Div, ExternalPaths, Focusable, FontWeight, IntoElement, ParentElement,
@@ -10,13 +10,15 @@ use gpui::{
 use xctx_core::{Space, SpaceDraft, SpaceId};
 use xctx_graph::AgentRole;
 use xctx_ui::{
-    Badge, Button, ButtonSize, ButtonVariant, DRAWER_HEIGHT, Icon, IconName, IconSize, PaneLive,
-    ParentAgentDrawer, Theme, Tone, card_badge, helper_kind_label, shape_label,
+    AgentStatus, Badge, Button, ButtonSize, ButtonVariant, ComposerCard, ComposerChip,
+    DRAWER_HEIGHT, HomeBackdrop, HomeHero, Icon, IconName, IconSize, PaneLive, ParentAgentDrawer,
+    Theme, Tone, card_badge, helper_kind_label, shape_label,
 };
 
 use crate::flow::pane_lives;
 use crate::lifecycle::{folder_to_index, home_dir, launch_space};
 use crate::space_layout::layout_shape;
+use crate::spawn::typed_task;
 use crate::workspace::Workspace;
 
 impl Workspace {
@@ -145,11 +147,128 @@ impl Workspace {
         .detach();
     }
 
-    /// Home's content: a centred column with the hero, the Parent Agent composer, the indexed folders (also a
-    /// drop target for folders from Finder), the Inbox and the living spaces.
+    /// Send a task from Home's composer to the running Parent Agent, opening its terminal drawer so the
+    /// response is visible.
+    pub(crate) fn submit_task(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let result = match (&self.parent.status, &self.parent.view) {
+            (AgentStatus::Running, Some(view)) => {
+                let typed = typed_task(&text);
+                let line = typed.strip_suffix('\r').unwrap_or(&typed);
+                let session = view.read(cx).session();
+                session
+                    .write(line.as_bytes())
+                    .and_then(|()| session.write(b"\r"))
+            }
+            _ => {
+                self.home_agent_open = true;
+                self.error("the Parent Agent is not running", cx);
+                return;
+            }
+        };
+        if let Err(e) = result {
+            self.home_agent_open = true;
+            self.error(format!("could not send to the Parent Agent: {e}"), cx);
+            return;
+        }
+        self.task_input.update(cx, |input, cx| input.clear(cx));
+        self.home_agent_open = true;
+        self.task_input.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Home's content: a decorative backdrop behind a scrolling centred column holding the hero, the task
+    /// composer card (also a drop target for folders from Finder), optional indexed-folders and Parent Agent
+    /// terminal drawers, the plan review card, the Inbox and the active spaces.
     pub(crate) fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
         let terminal_height = (window.viewport_size().height * 0.38).max(DRAWER_HEIGHT);
+        let compact = self.home_agent_open || self.plan_review.is_some();
+        let top_pad = if compact {
+            Theme::SPACE_6
+        } else {
+            (window.viewport_size().height * 0.12).max(px(24.0))
+        };
+        let can_submit = !self.task_input.read(cx).value().trim().is_empty()
+            && matches!(self.parent.status, AgentStatus::Running);
+        let left_readout = match self.spaces.len() {
+            0 => String::new(),
+            1 => "1 space".to_owned(),
+            n => format!("{n} spaces"),
+        };
+        let right_readout = if self.scanning {
+            "indexing…".to_owned()
+        } else {
+            match self.index.repos().len() {
+                1 => "1 repo".to_owned(),
+                n => format!("{n} repos"),
+            }
+        };
+        let (agent_tone, agent_busy) = match self.parent.status {
+            AgentStatus::Running => (Tone::Accent, false),
+            AgentStatus::Starting => (Tone::Warning, true),
+            AgentStatus::Exited(_) | AgentStatus::Unavailable(_) => (Tone::Danger, false),
+        };
+        let agent_chip = ComposerChip::new("home-agent-chip", "Parent Agent")
+            .pill(true)
+            .icon(IconName::Orchestrator)
+            .tone(agent_tone)
+            .busy(agent_busy)
+            .active(self.home_agent_open)
+            .tooltip("Show or hide the Parent Agent's terminal")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.home_agent_open = !this.home_agent_open;
+                this.focus_home(window, cx);
+                cx.notify();
+            }));
+        let folders_label = match self.roots.as_slice() {
+            [] => "Add a repo folder".to_owned(),
+            [only] => shorten_home(only),
+            many => format!("{} folders", many.len()),
+        };
+        let mut folders_chip = ComposerChip::new("home-folders-chip", folders_label)
+            .icon(IconName::Folder)
+            .active(self.home_roots_open)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.home_roots_open = !this.home_roots_open;
+                cx.notify();
+            }));
+        if self.roots.is_empty() {
+            folders_chip = folders_chip.tone(Tone::Warning);
+        }
+        let pending = self.inbox_pending();
+        let mut card = ComposerCard::new(self.task_input.clone())
+            .focused(
+                self.task_input
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+            )
+            .can_submit(can_submit)
+            .left_readout(left_readout)
+            .right_readout(right_readout)
+            .chip(agent_chip)
+            .chip(folders_chip)
+            .on_submit(cx.listener(|this, _, window, cx| {
+                let text = this.task_input.read(cx).value().to_owned();
+                this.submit_task(text, window, cx);
+            }));
+        if pending > 0 {
+            card = card.chip(
+                ComposerChip::new("home-inbox-chip", format!("{pending} waiting"))
+                    .icon(IconName::Inbox)
+                    .tone(Tone::Warning)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_inbox(None, window, cx);
+                    })),
+            );
+        }
         let dragging = cx.has_active_drag();
         let composer = div()
             .id("home-composer")
@@ -168,8 +287,7 @@ impl Workspace {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.drop_roots(paths.paths().to_vec(), cx)
             }))
-            .child(self.render_parent_agent(terminal_height, window, cx))
-            .child(self.render_roots(cx))
+            .child(card)
             .when(dragging, |area| {
                 area.child(
                     div()
@@ -187,6 +305,11 @@ impl Workspace {
                         .child("Drop folders to index them"),
                 )
             });
+        let show_agent = self.home_agent_open
+            || !matches!(
+                self.parent.status,
+                AgentStatus::Running | AgentStatus::Starting
+            );
         let mut column = div()
             .flex()
             .flex_col()
@@ -194,28 +317,38 @@ impl Workspace {
             .w_full()
             .max_w(px(920.0))
             .px(Theme::SPACE_6)
-            .pt(px(48.0))
+            .pt(top_pad)
             .pb(Theme::SPACE_6)
-            .child(
+            .child(HomeHero::new("a task-first workspace for teams of agents").compact(compact))
+            .child(composer);
+        if !self.home_roots_open
+            && !show_agent
+            && self.plan_review.is_none()
+            && self.spaces.is_empty()
+        {
+            column = column.child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(Theme::SPACE_1)
-                    .child(
-                        div()
-                            .text_size(Theme::TEXT_XL)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child("What are you working on?"),
-                    )
-                    .child(
-                        div()
-                            .text_size(Theme::TEXT_SM)
-                            .text_color(theme.text_muted)
-                            .child("Tell the Parent Agent: it drafts a space from your indexed repos, and ⌘↵ launches it."),
-                    ),
-            )
-            .child(composer);
+                    .justify_center()
+                    .text_size(Theme::TEXT_XS)
+                    .text_color(theme.text_subtle)
+                    .child("↵ sends to the Parent Agent · ⇧↵ new line · ⌘K commands"),
+            );
+        }
+        if self.home_roots_open {
+            column = column.child(
+                div()
+                    .p(Theme::SPACE_3)
+                    .rounded(Theme::RADIUS_LG)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .child(self.render_roots(cx)),
+            );
+        }
+        if show_agent {
+            column = column.child(self.render_parent_agent(terminal_height, window, cx));
+        }
         if let Some(plan) = self.render_plan_review(cx) {
             column = column.child(plan);
         }
@@ -225,7 +358,7 @@ impl Workspace {
         if let Some(busy) = &self.busy {
             column = column.child(notice(format!("{busy}…"), theme.text_muted, &theme));
         }
-        if self.inbox_pending() > 0 {
+        if pending > 0 {
             column = column
                 .child(
                     div()
@@ -243,14 +376,21 @@ impl Workspace {
         }
         div()
             .id("home")
+            .relative()
             .size_full()
-            .overflow_y_scroll()
-            .flex()
-            .justify_center()
-            // Top-aligned, the column is as tall as its content, so the overflow scrolls here instead of being
-            // cut off at the window's height.
-            .items_start()
-            .child(column.flex_none())
+            .child(HomeBackdrop::new())
+            .child(
+                div()
+                    .id("home-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .flex()
+                    .justify_center()
+                    // Top-aligned, the column is as tall as its content, so the overflow scrolls here instead of being
+                    // cut off at the window's height.
+                    .items_start()
+                    .child(column.flex_none()),
+            )
             .into_any_element()
     }
 
@@ -279,21 +419,16 @@ impl Workspace {
             .flex()
             .flex_col()
             .gap(Theme::SPACE_2)
-            .child(section_title("Living spaces", &theme));
+            .child(section_title("Spaces", &theme));
         if self.spaces.is_empty() {
             return section.child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap(Theme::SPACE_2)
-                    .p(Theme::SPACE_4)
-                    .rounded(Theme::RADIUS_LG)
-                    .border_1()
-                    .border_color(theme.border_subtle)
+                    .justify_center()
+                    .py(Theme::SPACE_4)
                     .text_size(Theme::TEXT_SM)
                     .text_color(theme.text_muted)
-                    .child(Icon::new(IconName::Idle).color(theme.text_subtle))
-                    .child("No spaces yet — tell the Parent Agent what you're working on."),
+                    .child("No spaces yet. Describe a task above and the Parent Agent drafts one."),
             );
         }
         let mut grid = div().flex().flex_wrap().gap(Theme::SPACE_3);
@@ -330,12 +465,12 @@ impl Workspace {
                     .min_w_0()
                     .gap(Theme::SPACE_3)
                     .p(Theme::SPACE_4)
-                    .rounded(Theme::RADIUS_LG)
+                    .rounded(px(14.0))
                     .border_1()
-                    .border_color(theme.border)
+                    .border_color(theme.border_subtle)
                     .bg(theme.surface)
                     .shadow_sm()
-                    .hover(move |style| style.bg(theme.hover))
+                    .hover(move |style| style.bg(theme.hover).border_color(theme.border_strong))
                     .child(header)
                     .child(self.render_space_agents(space, index, cx)),
             );
@@ -633,4 +768,18 @@ fn section_title(title: &'static str, theme: &Theme) -> Div {
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.text_subtle)
         .child(title)
+}
+
+/// Display `path` with the user's home directory shortened to `~`.
+fn shorten_home(path: &Path) -> String {
+    if let Some(home) = home_dir()
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        return if rel.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            format!("~/{}", rel.display())
+        };
+    }
+    path.display().to_string()
 }
