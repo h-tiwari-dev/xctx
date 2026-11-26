@@ -2,6 +2,11 @@
 //!
 //! The panel draws [`InboxEntry`]s the app builds from its Inbox (already redacted) and reports what the user
 //! chose through [`InboxPanel::on_action`]. Clicking a row expands its detail through [`InboxPanel::on_toggle`].
+//!
+//! A danger entry ([`InboxEntry::danger`]: production, a write tool call, mounting a write-capable tool,
+//! trusting a repo plugin) cannot be approved from its row: the row offers Review, which expands it, and Approve
+//! is a second, deliberate click inside the expanded detail (`inbox-approve-<id>`; the row's button is
+//! `inbox-open-<id>`).
 
 use std::rc::Rc;
 
@@ -127,6 +132,9 @@ pub struct InboxEntry {
     pub production: bool,
     /// Whether the app is acting on it now (a widening being approved): its action buttons are disabled.
     pub busy: bool,
+    /// Whether approving it is high-risk (see the module docs): drawn in the danger tone, and approved only from
+    /// its expanded detail.
+    pub danger: bool,
 }
 
 impl InboxEntry {
@@ -144,6 +152,7 @@ impl InboxEntry {
             space: None,
             production: false,
             busy: false,
+            danger: false,
         }
     }
 
@@ -169,6 +178,12 @@ impl InboxEntry {
     /// Mark it as being acted on, which disables its action buttons.
     pub fn busy(mut self, busy: bool) -> Self {
         self.busy = busy;
+        self
+    }
+
+    /// Mark approving it as high-risk: it is drawn in the danger tone and approved only from its detail.
+    pub fn danger(mut self, danger: bool) -> Self {
+        self.danger = danger;
         self
     }
 }
@@ -235,23 +250,48 @@ impl InboxPanel {
         self
     }
 
+    fn action_button(&self, entry: &InboxEntry, action: InboxAction) -> Button {
+        let mut button = Button::new(
+            SharedString::from(format!("inbox-{}-{}", action.name(), entry.id)),
+            action.label(),
+        )
+        .variant(action.variant())
+        .size(ButtonSize::Regular)
+        .disabled(entry.busy)
+        .selector(format!("inbox-{}-{}", action.name(), entry.id));
+        if let Some(handler) = self.on_action.clone() {
+            let id = entry.id.clone();
+            button = button.on_click(move |_, window, cx| handler(&id, action, window, cx));
+        }
+        button
+    }
+
     fn render_entry(&self, entry: &InboxEntry, theme: &Theme) -> gpui::Stateful<gpui::Div> {
         let expanded = self.expanded.as_ref() == Some(&entry.id);
-        let actions = entry.kind.actions().iter().map(|&action| {
-            let mut button = Button::new(
-                SharedString::from(format!("inbox-{}-{}", action.name(), entry.id)),
-                action.label(),
+        // A danger entry's Approve moves into its expanded detail; the row gets Review, which expands it.
+        let guarded = entry.danger && entry.kind.actions().contains(&InboxAction::Approve);
+        let mut actions: Vec<Button> = entry
+            .kind
+            .actions()
+            .iter()
+            .filter(|&&action| !(guarded && action == InboxAction::Approve))
+            .map(|&action| self.action_button(entry, action))
+            .collect();
+        if guarded && !expanded {
+            let mut review = Button::new(
+                SharedString::from(format!("inbox-open-{}", entry.id)),
+                "Review",
             )
-            .variant(action.variant())
+            .variant(ButtonVariant::Primary)
             .size(ButtonSize::Regular)
             .disabled(entry.busy)
-            .selector(format!("inbox-{}-{}", action.name(), entry.id));
-            if let Some(handler) = self.on_action.clone() {
+            .selector(format!("inbox-open-{}", entry.id));
+            if let Some(handler) = self.on_toggle.clone() {
                 let id = entry.id.clone();
-                button = button.on_click(move |_, window, cx| handler(&id, action, window, cx));
+                review = review.on_click(move |_, window, cx| handler(&id, window, cx));
             }
-            button
-        });
+            actions.push(review);
+        }
         let space = entry.space.clone().map(|space| {
             div()
                 .flex_none()
@@ -262,24 +302,51 @@ impl InboxPanel {
         let production = entry
             .production
             .then(|| Badge::new("PRODUCTION").tone(Tone::Danger));
-        let detail = entry.detail.clone().filter(|_| expanded).map(|detail| {
+        let confirm = (guarded && expanded).then(|| {
             div()
                 .flex()
-                .flex_col()
-                .gap(Theme::SPACE_0_5)
-                .pl(px(52.0))
-                .pr(Theme::SPACE_2)
-                .pb(Theme::SPACE_2)
-                .text_size(Theme::TEXT_SM)
-                .text_color(theme.text_muted)
-                .children(
-                    detail
-                        .lines()
-                        .map(|line| div().min_h(px(14.0)).child(line.to_owned()))
-                        .collect::<Vec<_>>(),
+                .items_center()
+                .gap(Theme::SPACE_2)
+                .mt(Theme::SPACE_1)
+                .p(Theme::SPACE_2)
+                .rounded(Theme::RADIUS_MD)
+                .border_1()
+                .border_color(theme.danger.alpha(0.4))
+                .bg(theme.danger.alpha(0.08))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(Theme::TEXT_SM)
+                        .text_color(theme.danger)
+                        .child("This reaches production or writes outside the space. Approve only if you meant it."),
+                )
+                .child(
+                    self.action_button(entry, InboxAction::Approve)
+                        .variant(ButtonVariant::Danger),
                 )
         });
-        let has_detail = entry.detail.is_some();
+        let detail = expanded
+            .then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Theme::SPACE_0_5)
+                    .pl(px(52.0))
+                    .pr(Theme::SPACE_2)
+                    .pb(Theme::SPACE_2)
+                    .text_size(Theme::TEXT_SM)
+                    .text_color(theme.text_muted)
+                    .children(entry.detail.iter().flat_map(|detail| {
+                        detail
+                            .lines()
+                            .map(|line| div().min_h(px(14.0)).child(line.to_owned()))
+                            .collect::<Vec<_>>()
+                    }))
+                    .children(confirm)
+            })
+            .filter(|_| entry.detail.is_some() || guarded);
+        let has_detail = entry.detail.is_some() || guarded;
         let mut header = div()
             .id(SharedString::from(format!("inbox-row-{}", entry.id)))
             .debug_selector(|| format!("inbox-row-{}", entry.id))
@@ -292,7 +359,11 @@ impl InboxPanel {
                 div()
                     .flex_none()
                     .w(px(44.0))
-                    .child(Badge::new(entry.kind.label()).tone(entry.kind.tone())),
+                    .child(Badge::new(entry.kind.label()).tone(if entry.danger {
+                        Tone::Danger
+                    } else {
+                        entry.kind.tone()
+                    })),
             )
             .children(production)
             .child(
@@ -325,6 +396,9 @@ impl InboxPanel {
             .flex()
             .flex_col()
             .rounded(Theme::RADIUS_SM)
+            .when(entry.danger, |row| {
+                row.border_l_2().border_color(theme.danger.alpha(0.7))
+            })
             .when(expanded, |row| row.bg(theme.surface))
             .child(header)
             .children(detail)

@@ -312,7 +312,7 @@ impl Workspace {
                 });
             })
             .on_inbox(move |window, cx| {
-                let _ = inbox.update(cx, |this, cx| this.show_home(window, cx));
+                let _ = inbox.update(cx, |this, cx| this.show_inbox(None, window, cx));
             })
             .on_new_space(move |window, cx| {
                 let _ = new_space.update(cx, |this, cx| this.show_home(window, cx));
@@ -657,7 +657,8 @@ impl Workspace {
 
     fn run_palette_action(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         match name {
-            "home" | "new-space" | "inbox" => self.show_home(window, cx),
+            "home" | "new-space" => self.show_home(window, cx),
+            "inbox" => self.show_inbox(None, window, cx),
             "toggle-roster" => self.toggle_roster(cx),
             "toggle-translucency" => self.toggle_translucency(window, cx),
             "rescan" => self.rescan(cx),

@@ -148,6 +148,35 @@ fn clicking_a_row_with_detail_toggles_it_and_buttons_do_not(cx: &mut TestAppCont
     assert_eq!(*events.borrow(), ["e1 toggle", "n1 Dismiss"]);
 }
 
+#[gpui::test]
+fn a_danger_gate_is_approved_only_from_its_expanded_detail(cx: &mut TestAppContext) {
+    let events: Log = Rc::default();
+    let expanded: Rc<RefCell<Option<SharedString>>> = Rc::default();
+    let (host_log, host_expanded) = (events.clone(), expanded.clone());
+    let (_host, cx) = cx.add_window_view(move |_, _| InboxHost {
+        entries: vec![
+            InboxEntry::new("w2", InboxKind::SpaceWiden, "Widen to production")
+                .production(true)
+                .danger(true),
+        ],
+        expanded: host_expanded,
+        log: host_log,
+    });
+    cx.run_until_parked();
+
+    // Collapsed: Deny and Review, no Approve.
+    assert!(cx.debug_bounds("inbox-approve-w2").is_none());
+    assert!(cx.debug_bounds("inbox-reject-w2").is_some());
+    assert!(click(cx, "inbox-open-w2"));
+    assert_eq!(expanded.borrow().as_deref(), Some("w2"));
+    cx.run_until_parked();
+
+    // Expanded: Approve is there, as its own click.
+    assert!(cx.debug_bounds("inbox-open-w2").is_none());
+    assert!(click(cx, "inbox-approve-w2"));
+    assert_eq!(*events.borrow(), ["w2 toggle", "w2 Approve"]);
+}
+
 struct EmptyInboxHost;
 
 impl Render for EmptyInboxHost {

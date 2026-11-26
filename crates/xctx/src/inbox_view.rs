@@ -107,14 +107,16 @@ pub fn entry_kind(kind: ItemKind) -> InboxKind {
     }
 }
 
-/// The panel entries for the pending items, newest first, with secrets masked. The widenings in `approving`
-/// (being approved now) are drawn busy, so they cannot be approved or denied again until it finishes.
+/// The panel entries for the pending items, with secrets masked: high-risk gates first (production, write tool
+/// calls, write-capable mounts, repo plugin trust; see [`xctx_nav::is_danger_inbox_item`]), then newest first.
+/// The widenings in `approving` (being approved now) are drawn busy, so they cannot be approved or denied again
+/// until it finishes.
 pub fn inbox_entries(
     inbox: &Inbox,
     redactor: &Redactor,
     approving: &HashSet<ItemId>,
 ) -> Vec<InboxEntry> {
-    inbox
+    let mut entries: Vec<InboxEntry> = inbox
         .list(&Filter::default())
         .into_iter()
         .map(|item| {
@@ -127,13 +129,17 @@ pub fn inbox_entries(
             )
             .detail(preview.detail)
             .production(production)
+            .danger(xctx_nav::is_danger_inbox_item(item))
             .busy(approving.contains(&item.id));
             if let Some(space) = preview.space {
                 entry = entry.space(space.as_str().to_owned());
             }
             entry
         })
-        .collect()
+        .collect();
+    // Stable, so each group keeps the Inbox's newest-first order.
+    entries.sort_by_key(|entry| !entry.danger);
+    entries
 }
 
 /// Who an item came from, as the Plan Gate card says it.
@@ -338,6 +344,13 @@ impl Workspace {
         match action {
             InboxAction::Review => {
                 self.plan_review = Some(id);
+                // The Plan Gate is reviewed under the Parent Agent on Home.
+                if self.inbox_open {
+                    self.inbox_open = false;
+                }
+                if self.view != crate::workspace::View::Home {
+                    self.show_home(window, cx);
+                }
                 cx.notify();
             }
             InboxAction::Approve => {
@@ -1014,13 +1027,18 @@ mod tests {
         let redactor = Redactor::new([("T".to_owned(), "tok-55555".to_owned())]);
         let entries = inbox_entries(&inbox, &redactor, &HashSet::new());
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].kind, InboxKind::MissingEnvVar);
-        assert!(entries[1].production && entries[1].space.as_deref() == Some("s"));
+        // The production widening is a danger gate, so it sorts first; the rest keep newest-first order.
+        assert_eq!(entries[0].kind, InboxKind::SpaceWiden);
+        assert!(
+            entries[0].danger && entries[0].production && entries[0].space.as_deref() == Some("s")
+        );
+        assert_eq!(entries[1].kind, InboxKind::MissingEnvVar);
+        assert!(!entries[1].danger);
         assert!(entries.iter().all(|e| !e.busy));
         let approving = HashSet::from([widen]);
         let entries = inbox_entries(&inbox, &redactor, &approving);
         let busy: Vec<bool> = entries.iter().map(|e| e.busy).collect();
-        assert_eq!(busy, [false, true, false]);
+        assert_eq!(busy, [true, false, false]);
         assert_eq!(entries[2].id.as_ref(), notice.as_str());
         assert_eq!(entries[2].title.as_ref(), "used [REDACTED:T]");
         Ok(())

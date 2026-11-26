@@ -62,6 +62,10 @@ actions!(
         ToggleRoster,
         /// Make the window translucent (the blurred desktop shows through), or opaque.
         ToggleTranslucency,
+        /// Open the Inbox over whatever is shown, or close it.
+        ToggleInbox,
+        /// Show the Parent Agent as a dock over the shown space, or hide it; on Home, focus it.
+        ToggleDock,
     ]
 );
 
@@ -102,6 +106,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-enter", LaunchDraft, ws),
         KeyBinding::new("cmd-k", TogglePalette, ws),
         KeyBinding::new("cmd-b", ToggleRoster, ws),
+        KeyBinding::new("cmd-shift-i", ToggleInbox, ws),
+        KeyBinding::new("cmd-j", ToggleDock, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
     ];
     for (index, key) in TAB_KEYS.into_iter().enumerate() {

@@ -15,7 +15,7 @@ use xctx_layout::{FocusDirection, SplitAxis};
 use xctx_plugin::RunnerRegistry;
 use xctx_term_view::{TerminalFont, TerminalTheme};
 use xctx_ui::command_palette::{CommandPalette, PaletteEvent};
-use xctx_ui::{BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, Theme};
+use xctx_ui::{BannerKind, PromptEvent, PromptInput, StatusBanner, StatusBar, Theme, ToastStack};
 
 use crate::agent_session::SessionStorage;
 use crate::attempt_ui::shown_worktree;
@@ -26,8 +26,8 @@ use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
-    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleFlow, TogglePalette,
-    ToggleRoster, ToggleTranslucency, ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
+    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleDock, ToggleFlow, ToggleInbox,
+    TogglePalette, ToggleRoster, ToggleTranslucency, ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
@@ -154,6 +154,17 @@ pub(crate) struct Workspace {
     pub(crate) palette: Entity<CommandPalette>,
     /// Whether the palette is open (kept here so browser pages can hide under it without reading the entity).
     pub(crate) palette_open: bool,
+    /// Whether the Inbox overlay (⌘⇧I) is open over the view.
+    pub(crate) inbox_open: bool,
+    /// Where the keys go while the Inbox overlay is open (Esc closes it).
+    pub(crate) overlay_focus: FocusHandle,
+    /// Whether the Parent Agent dock (⌘J) is open over a space.
+    pub(crate) dock_open: bool,
+    /// The toasts in the window's bottom-right corner (new gates, mostly); its own entity, so a toast repaints
+    /// only the stack.
+    pub(crate) toasts: Entity<ToastStack>,
+    /// The pending gates already announced, so each gets one toast; `None` until the Inbox was first looked at.
+    pub(crate) seen_gates: Option<HashSet<ItemId>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -308,6 +319,11 @@ impl Workspace {
             prefs,
             palette,
             palette_open: false,
+            inbox_open: false,
+            overlay_focus: cx.focus_handle(),
+            dock_open: false,
+            toasts: cx.new(|_| ToastStack::new()),
+            seen_gates: None,
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -327,6 +343,7 @@ impl Workspace {
         workspace.start_control(window, cx);
         workspace.start_parent_agent(window, cx);
         workspace.start_serve_hints(cx);
+        workspace.start_gate_toasts(window, cx);
         if let Some(e) = workspace.inbox_error.clone() {
             workspace.error(e, cx);
         }
@@ -567,7 +584,7 @@ impl Workspace {
         let mut bar = StatusBar::new()
             .inbox(self.inbox_pending())
             .on_inbox(move |window, cx| {
-                let _ = show_inbox.update(cx, |this, cx| this.show_home(window, cx));
+                let _ = show_inbox.update(cx, |this, cx| this.show_inbox(None, window, cx));
             })
             .banner(self.banner.clone())
             .on_dismiss_banner(move |_, cx| {
@@ -628,6 +645,8 @@ impl Render for Workspace {
             None => self.render_home(window, cx),
         };
         let dialog = self.render_dialog(cx);
+        let parent_dock = self.render_dock(window, cx);
+        let inbox_overlay = self.render_inbox_overlay(cx);
         div()
             .key_context(WORKSPACE_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -715,6 +734,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleTranslucency, window, cx| {
                 this.toggle_translucency(window, cx)
             }))
+            .on_action(
+                cx.listener(|this, _: &ToggleInbox, window, cx| this.show_inbox(None, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleDock, window, cx| this.toggle_dock(window, cx)))
             .relative()
             .flex()
             .flex_col()
@@ -736,10 +759,19 @@ impl Render for Workspace {
                             .min_w_0()
                             .h_full()
                             .child(body)
+                            .children(parent_dock)
                             .children(dialog),
                     ),
             )
             .child(self.render_status_bar(cx))
+            .child(
+                div()
+                    .absolute()
+                    .right(Theme::SPACE_4)
+                    .bottom(Theme::STATUS_BAR_HEIGHT + Theme::SPACE_3)
+                    .child(self.toasts.clone()),
+            )
+            .children(inbox_overlay)
             .child(self.palette.clone())
             // Last, so it runs after every pane placed its browser this frame: hide the browsers none placed.
             .child(self.browsers.frame_end())

@@ -19,6 +19,7 @@ mod keymap;
 mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
+mod overlays;
 mod parent_agent;
 mod persist;
 mod plugin_backend;
