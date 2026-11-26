@@ -629,6 +629,7 @@ impl Workspace {
                     .into_any_element()
             }
             Some(PaneTerminal::Failed(message)) => note(message.clone(), theme.danger),
+            Some(PaneTerminal::Omp(omp)) => self.render_rpc_pane(omp, cx),
             None => match attempt.map(|a| a.state) {
                 Some(AttemptState::Adopted) => note(
                     format!(

@@ -111,6 +111,8 @@ pub(crate) struct Workspace {
     pub(crate) widen_approvals: HashSet<ItemId>,
     /// Each space's competing attempts, loaded when first needed.
     pub(crate) attempts: SpaceAttempts,
+    /// The data directory (the store's), which holds the RPC agents' session folders; `None` when there is none.
+    pub(crate) data_dir: Option<PathBuf>,
     /// Spaces whose fork, adopt or discard of attempts is running: one at a time per space, and no Ship or
     /// Discard of the space meanwhile.
     pub(crate) attempt_jobs: HashSet<SpaceId>,
@@ -317,6 +319,7 @@ impl Workspace {
             graphs: SpaceGraphs::new(data_dir.clone()),
             widen_approvals: HashSet::new(),
             attempts: SpaceAttempts::new(data_dir.clone()),
+            data_dir: data_dir.clone(),
             attempt_jobs: HashSet::new(),
             unsaved_adoptions: HashMap::new(),
             sessions: SessionStorage::from_env(),

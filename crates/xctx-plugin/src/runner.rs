@@ -11,8 +11,14 @@
 //! fork_session = ["--fork", "{source}", "--session-id", "{session}"]   # optional: copy a session
 //! extra_args = []                                # optional: given first, every time, as written
 //! skills = ["--config", "{skills_dir}/omp-config.yml"]   # optional: load xctx's agent skills
+//! interface = "terminal"                         # optional: or "rpc" (omp's `--mode rpc-ui`); terminal by default
+//! rpc_args = []                                  # optional, rpc only: given in place of the terminal arguments
 //! [env]                                          # optional: set in the agent's environment
 //! ```
+//!
+//! A runner with `interface = "rpc"` runs as a child process xctx talks to over omp's JSON-lines protocol instead
+//! of a terminal; its terminal arguments (`extra_args`, `resume`, the task) are still what "Open in terminal" uses.
+//! `rpc_args` can never carry what would widen an agent or answer for the user ([`RPC_FORBIDDEN_FLAGS`]).
 //!
 //! In `skills`, `{skills_dir}` is the folder of skills xctx gives every agent session (`<name>/SKILL.md` each),
 //! which also holds `omp-config.yml`, an `omp --config` overlay listing that folder in `skills.customDirectories`.
@@ -57,6 +63,31 @@ pub const SOURCE_PLACEHOLDER: &str = "source";
 
 /// The placeholder for the folder of xctx's agent skills, in `skills`.
 pub const SKILLS_DIR_PLACEHOLDER: &str = "skills_dir";
+
+/// Flags `rpc_args` may not hold, alone or as `--flag=value`: approvals stay the user's (`--auto-approve`,
+/// `--approval-mode`, `--no-ui`), an agent never reaches outside its worktree (`--add-dir`, `--cwd`), and the mode
+/// and session folder are xctx's to set (`--mode`, `--session-dir`, `--no-session`).
+pub const RPC_FORBIDDEN_FLAGS: &[&str] = &[
+    "--auto-approve",
+    "--approval-mode",
+    "--no-ui",
+    "--add-dir",
+    "--cwd",
+    "--mode",
+    "--session-dir",
+    "--no-session",
+];
+
+/// How xctx runs a runner's program.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Interface {
+    /// In a terminal pane, as its own terminal UI.
+    #[default]
+    Terminal,
+    /// As a child process speaking omp's RPC protocol (`--mode rpc-ui`), which xctx reads agent state from.
+    Rpc,
+}
 
 /// What a runner can be asked to do, named in [`RunnerError::Unsupported`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,6 +225,11 @@ pub struct RunnerManifest {
     pub skills: Option<ArgsTemplate>,
     /// Environment variables set for the program, by name.
     pub env: BTreeMap<String, String>,
+    /// How xctx runs it: in a terminal (the default) or over RPC.
+    pub interface: Interface,
+    /// For an RPC runner, the arguments given after the skills arguments when it runs as an RPC child, in place
+    /// of the terminal ones; never one of [`RPC_FORBIDDEN_FLAGS`].
+    pub rpc_args: Vec<String>,
 }
 
 impl RunnerManifest {
@@ -233,6 +269,11 @@ impl RunnerManifest {
     /// Whether it can be given a task as its first message.
     pub fn takes_task(&self) -> bool {
         self.task != TaskStyle::None
+    }
+
+    /// Whether xctx runs it as an RPC child rather than in a terminal.
+    pub fn is_rpc(&self) -> bool {
+        self.interface == Interface::Rpc
     }
 
     fn unsupported(&self, capability: Capability) -> RunnerError {
@@ -555,6 +596,9 @@ struct RawRunner {
     skills: Option<Vec<String>>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    interface: Interface,
+    rpc_args: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -664,6 +708,22 @@ impl RawRunner {
                 ));
             }
         }
+        if self.rpc_args.is_some() && self.interface != Interface::Rpc {
+            return Err(err(
+                "rpc_args",
+                "only a runner with `interface = \"rpc\"` takes rpc_args".to_owned(),
+            ));
+        }
+        let rpc_args = self.rpc_args.unwrap_or_default();
+        for (i, arg) in rpc_args.iter().enumerate() {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if RPC_FORBIDDEN_FLAGS.contains(&flag) {
+                return Err(err(
+                    &format!("rpc_args[{i}]"),
+                    format!("{flag} is never given to an agent xctx runs"),
+                ));
+            }
+        }
         Ok(RunnerManifest {
             name: self.name,
             description: self.description.trim().to_owned(),
@@ -675,6 +735,8 @@ impl RawRunner {
             extra_args: self.extra_args,
             skills,
             env: self.env,
+            interface: self.interface,
+            rpc_args,
         })
     }
 }
@@ -942,6 +1004,50 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    #[test]
+    fn omp_runs_over_rpc_and_the_others_in_a_terminal() -> TestResult {
+        assert_eq!(builtin("omp")?.interface, Interface::Rpc);
+        assert!(builtin("omp")?.is_rpc() && builtin("omp")?.rpc_args.is_empty());
+        for name in ["pi", "claude"] {
+            assert_eq!(builtin(name)?.interface, Interface::Terminal, "{name}");
+        }
+        assert_eq!(
+            RunnerManifest::parse(MINIMAL, "t")?.interface,
+            Interface::Terminal
+        );
+        let rpc = RunnerManifest::parse(
+            &format!("{MINIMAL}interface = \"rpc\"\nrpc_args = [\"--tools\", \"read,bash\"]\n"),
+            "t",
+        )?;
+        assert!(rpc.is_rpc());
+        assert_eq!(rpc.rpc_args, ["--tools", "read,bash"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_args_never_approve_widen_or_move_the_session() {
+        let with = |args: &str| format!("{MINIMAL}interface = \"rpc\"\nrpc_args = {args}\n");
+        for (args, field) in [
+            ("[\"--auto-approve\"]", "rpc_args[0]"),
+            (
+                "[\"--tools\", \"read\", \"--approval-mode\", \"yolo\"]",
+                "rpc_args[2]",
+            ),
+            ("[\"--approval-mode=yolo\"]", "rpc_args[0]"),
+            ("[\"--no-ui\"]", "rpc_args[0]"),
+            ("[\"--add-dir\", \"/elsewhere\"]", "rpc_args[0]"),
+            ("[\"--session-dir=/tmp/s\"]", "rpc_args[0]"),
+            ("[\"--mode\", \"json\"]", "rpc_args[0]"),
+        ] {
+            assert_eq!(invalid_field(&with(args)), field, "{args}");
+        }
+        assert_eq!(
+            invalid_field(&format!("{MINIMAL}rpc_args = [\"--tools\", \"read\"]\n")),
+            "rpc_args",
+            "a terminal runner takes no rpc_args"
+        );
     }
 
     #[test]

@@ -322,7 +322,7 @@ impl Workspace {
     ) -> Option<Entity<TerminalView>> {
         match self.tabs.get(id)?.attempt_terminals.get(&number)? {
             PaneTerminal::Running { view, .. } => Some(view.clone()),
-            PaneTerminal::Failed(_) => None,
+            PaneTerminal::Failed(_) | PaneTerminal::Omp(_) => None,
         }
     }
 
@@ -529,7 +529,8 @@ impl Workspace {
         cx.notify();
         match terminal {
             PaneTerminal::Running { view, .. } => Some(Arc::clone(view.read(cx).session())),
-            PaneTerminal::Failed(_) => None,
+            // Dropping it closes its input; omp exits, or is killed after a grace period.
+            PaneTerminal::Failed(_) | PaneTerminal::Omp(_) => None,
         }
     }
 

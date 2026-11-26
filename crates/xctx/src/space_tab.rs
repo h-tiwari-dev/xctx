@@ -22,6 +22,8 @@ use xctx_ui::{
 
 use crate::agent_session::AgentSession;
 use crate::lifecycle::reshape_space;
+use crate::omp_agent::AgentStatus;
+use crate::omp_panes::OmpPane;
 use crate::persist::{restore_layout, save_layout};
 use crate::space_graph::{scratch_dir_for, writer_panes};
 use crate::space_layout::{RESIZE_STEP, SpaceLayout, space_shape};
@@ -57,6 +59,8 @@ pub(crate) enum PaneTerminal {
     },
     /// The program could not be started.
     Failed(String),
+    /// An agent run over RPC rather than in a terminal (see [`crate::omp_agent`]).
+    Omp(Box<OmpPane>),
 }
 
 impl PaneTerminal {
@@ -67,6 +71,24 @@ impl PaneTerminal {
                 exited.is_none() && view.read(cx).session().is_alive()
             }
             PaneTerminal::Failed(_) => false,
+            PaneTerminal::Omp(pane) => pane.agent.is_live(),
+        }
+    }
+
+    /// Whether its agent is at work: a terminal agent whose program runs (all a terminal can tell), an RPC agent
+    /// whose turn runs or waits on the user.
+    pub(crate) fn is_working(&self, cx: &App) -> bool {
+        match self {
+            PaneTerminal::Omp(pane) => pane.agent.status().is_working(),
+            other => other.is_alive(cx),
+        }
+    }
+
+    /// The RPC agent it runs, if it runs one.
+    pub(crate) fn omp(&self) -> Option<&OmpPane> {
+        match self {
+            PaneTerminal::Omp(pane) => Some(pane),
+            _ => None,
         }
     }
 }
@@ -123,11 +145,21 @@ pub(crate) fn repo_links_of(space: &Space) -> HashMap<String, String> {
 }
 
 impl SpaceTab {
-    /// Whether any agent pane's agent is still running; the shell opened after an agent exited does not count.
+    /// The retry badge of graph agent `agent` when it runs over RPC and omp retries after a retryable error.
+    pub(crate) fn rpc_retry_badge(&self, agent: &AgentNodeId) -> Option<&str> {
+        self.terminals
+            .values()
+            .filter_map(PaneTerminal::omp)
+            .find(|omp| omp.agent.agent() == Some(agent))
+            .and_then(|omp| omp.agent.retry_badge())
+    }
+
+    /// Whether any agent pane's agent is still running (see [`PaneTerminal::is_working`]); the shell opened after an
+    /// agent exited does not count.
     pub(crate) fn agent_running(&self, cx: &App) -> bool {
         self.layout.agent_panes().iter().any(|pane| {
             self.terminals.get(pane).is_some_and(|terminal| {
-                terminal.is_alive(cx)
+                terminal.is_working(cx)
                     && !matches!(
                         terminal,
                         PaneTerminal::Running {
@@ -166,6 +198,11 @@ pub(crate) fn pane_title(role: &PaneRole, terminal: Option<&PaneTerminal>) -> St
             }
         }
         Some(PaneTerminal::Failed(_)) => format!("{fallback} — failed to start"),
+        Some(PaneTerminal::Omp(pane)) => match pane.agent.status() {
+            AgentStatus::Failed { .. } => format!("{fallback} — failed"),
+            AgentStatus::Stopped => format!("{fallback} — stopped"),
+            _ => fallback,
+        },
         None => fallback,
     }
 }
@@ -312,6 +349,9 @@ impl Workspace {
             self.start_plugin_pane(id, pane, window, cx);
             return;
         }
+        if self.start_rpc_pane(id, pane, start, window, cx) {
+            return;
+        }
         let agent = self.pane_agent_of(id, pane);
         let session = match self.pane_session_of(id, pane, start) {
             Ok(session) => session,
@@ -387,7 +427,7 @@ impl Workspace {
 
     /// `view`, running in `pane` of space `id`, as a pane terminal whose events reach
     /// [`Workspace::on_terminal_event`]. `after_agent` marks the shell opened after the pane's agent exited.
-    fn running_terminal(
+    pub(crate) fn running_terminal(
         &mut self,
         id: &SpaceId,
         pane: PaneId,
@@ -635,7 +675,7 @@ impl Workspace {
     /// Whether a layout change in `id` may move keyboard focus to its focused pane: only while the space is
     /// shown and no dialog is open over it, so a control request never takes the keyboard from a dialog the
     /// user is typing in. Closing the dialog focuses the focused pane.
-    fn may_focus_pane_of(&self, id: &SpaceId) -> bool {
+    pub(crate) fn may_focus_pane_of(&self, id: &SpaceId) -> bool {
         self.is_shown(id) && self.dialog.is_none()
     }
 
@@ -1009,6 +1049,8 @@ impl Workspace {
                             Some(Arc::clone(view.read(cx).session()))
                         }
                         PaneTerminal::Failed(_) => None,
+                        // Dropping it closes its input; omp exits, or is killed after a grace period.
+                        PaneTerminal::Omp(_) => None,
                     })
                     .collect()
             })
@@ -1072,6 +1114,7 @@ impl Workspace {
                         .text_color(theme.danger)
                         .child(message.clone())
                         .into_any_element(),
+                    Some(PaneTerminal::Omp(omp)) => self.render_rpc_pane(omp, cx),
                     // Plugin panes drawn by a first-party renderer have no terminal.
                     None if pane.role.kind == PaneKind::Plugin => self
                         .render_plugin_pane(&tab.space.id, pane.id, cx)
@@ -1204,6 +1247,23 @@ impl Workspace {
                     .size(ButtonSize::Compact)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.restart_agent_in(&space, &restart, window, cx)
+                    })),
+            );
+        }
+        if tab
+            .terminals
+            .get(&pane.id)
+            .and_then(PaneTerminal::omp)
+            .is_some_and(|omp| omp.agent.is_live())
+        {
+            let (space, rpc_pane) = (tab.space.id.clone(), pane.id);
+            row = row.child(
+                Button::new(("pane-open-terminal", id), "Open in terminal")
+                    .tooltip("Stop this agent here and resume its omp session in a terminal")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_rpc_agent_in_terminal(&space, rpc_pane, window, cx)
                     })),
             );
         }

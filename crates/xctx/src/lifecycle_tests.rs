@@ -540,3 +540,5 @@ fn chosen_folders_give_their_repos_once_and_name_the_empty_ones() -> TestResult 
     );
     Ok(())
 }
+
+mod omp;

@@ -5,6 +5,11 @@ name = "omp"
 description = "omp coding agent: a task and resume, without named sessions or forks (no attempts)"
 program = "omp"
 
+# xctx runs omp as an RPC child (`omp --mode rpc-ui`), so its agent state reaches the Roster, Flow and Inbox. Each
+# agent gets its own `--session-dir` under xctx's data directory, so its session resumes there; "Open in terminal"
+# runs omp's own terminal UI on the same session (`--resume <id> --session-dir <dir>`).
+interface = "rpc"
+
 # The first message follows `--`: `omp -- <task>`.
 task = { style = "after-double-dash" }
 

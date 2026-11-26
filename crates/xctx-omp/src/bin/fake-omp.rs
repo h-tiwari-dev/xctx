@@ -5,6 +5,11 @@
 //! on its input, swaps the recorded command id for the real one in the frames that follow, and emits them.
 //! `FAKE_OMP_CHUNK=N` re-sends every frame longer than N bytes as `rpc_chunk` pieces once the client has
 //! negotiated protocol v2. When the script ends it waits for its input to close, then exits.
+//!
+//! For hand-written fixtures, `{sessionDir}` in a frame or directive is the `--session-dir` the fake was given,
+//! and two directives stand in for what omp does on its own: `! touch PATH` writes an empty file (omp persisting
+//! its session file) and `! exit N` exits with code N at once (omp crashing, or closing its output). With
+//! `FAKE_OMP_LOG=FILE` every line the fake reads is appended to FILE, so a test can see what it was sent.
 
 use std::io::{BufRead, Write};
 
@@ -12,39 +17,50 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
-struct Step {
-    expect: Option<Value>,
-    emit: Vec<String>,
+enum Out {
+    Frame(String),
+    Touch(String),
+    Exit(i32),
 }
 
-fn load(path: &str) -> Vec<Step> {
+struct Step {
+    expect: Option<Value>,
+    emit: Vec<Out>,
+}
+
+fn load(path: &str, session_dir: &str) -> Vec<Step> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("fake-omp: cannot read {path}: {e}");
         std::process::exit(2);
     });
+    let text = text.replace("{sessionDir}", session_dir);
     let mut steps = vec![Step {
         expect: None,
         emit: Vec::new(),
     }];
     for line in text.lines() {
-        if let Some(frame) = line.strip_prefix("< ") {
-            steps
-                .last_mut()
-                .expect("a step")
-                .emit
-                .push(frame.to_owned());
+        let out = if let Some(frame) = line.strip_prefix("< ") {
+            Out::Frame(frame.to_owned())
+        } else if let Some(path) = line.strip_prefix("! touch ") {
+            Out::Touch(path.to_owned())
+        } else if let Some(code) = line.strip_prefix("! exit ") {
+            Out::Exit(code.trim().parse().unwrap_or(1))
         } else if let Some(command) = line.strip_prefix("> ") {
             steps.push(Step {
                 expect: serde_json::from_str(command).ok(),
                 emit: Vec::new(),
             });
-        }
+            continue;
+        } else {
+            continue;
+        };
+        steps.last_mut().expect("a step").emit.push(out);
     }
     // The recorder wrote its first command before omp's `ready` arrived; omp always says `ready` first.
     let ready = steps.iter_mut().find_map(|s| {
         s.emit
             .iter()
-            .position(|f| f.starts_with("{\"type\":\"ready\""))
+            .position(|f| matches!(f, Out::Frame(f) if f.starts_with("{\"type\":\"ready\"")))
             .map(|i| s.emit.remove(i))
     });
     if let Some(ready) = ready {
@@ -53,12 +69,34 @@ fn load(path: &str) -> Vec<Step> {
     steps
 }
 
+/// Reads input lines, appending each to the log file when there is one.
+struct Input<R> {
+    input: R,
+    log: Option<std::fs::File>,
+}
+
+impl<R: BufRead> Input<R> {
+    fn read_line(&mut self, line: &mut String) -> usize {
+        let n = self.input.read_line(line).unwrap_or(0);
+        if n > 0
+            && let Some(log) = &mut self.log
+        {
+            let _ = log.write_all(line.as_bytes());
+            let _ = log.flush();
+        }
+        n
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut fixture = None;
+    let mut session_dir = String::new();
     while let Some(a) = args.next() {
         if a == "--fixture" {
             fixture = args.next();
+        } else if a == "--session-dir" {
+            session_dir = args.next().unwrap_or_default();
         }
     }
     let Some(fixture) = fixture else {
@@ -68,10 +106,20 @@ fn main() {
     let chunk: Option<usize> = std::env::var("FAKE_OMP_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok());
-    let steps = load(&fixture);
+    let log = std::env::var_os("FAKE_OMP_LOG").and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+    let steps = load(&fixture, &session_dir);
 
     let stdin = std::io::stdin();
-    let mut input = stdin.lock();
+    let mut input = Input {
+        input: stdin.lock(),
+        log,
+    };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut negotiated = false;
@@ -83,7 +131,7 @@ fn main() {
             let want = expect.get("type").and_then(Value::as_str).unwrap_or("");
             loop {
                 let mut line = String::new();
-                if input.read_line(&mut line).unwrap_or(0) == 0 {
+                if input.read_line(&mut line) == 0 {
                     return;
                 }
                 let Ok(got) = serde_json::from_str::<Value>(&line) else {
@@ -104,7 +152,22 @@ fn main() {
             .and_then(|e| e.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        for frame in &step.emit {
+        for item in &step.emit {
+            let frame = match item {
+                Out::Frame(frame) => frame,
+                Out::Touch(path) => {
+                    let path = std::path::Path::new(path);
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(path, "");
+                    continue;
+                }
+                Out::Exit(code) => {
+                    let _ = out.flush();
+                    std::process::exit(*code);
+                }
+            };
             let mut frame = frame.clone();
             if let (Some(old), Some(new)) = (&recorded_id, &real_id) {
                 frame = frame.replace(&format!("\"id\":\"{old}\""), &format!("\"id\":\"{new}\""));
@@ -124,7 +187,7 @@ fn main() {
         }
     }
     let mut sink = String::new();
-    while input.read_line(&mut sink).unwrap_or(0) > 0 {
+    while input.read_line(&mut sink) > 0 {
         sink.clear();
     }
 }
