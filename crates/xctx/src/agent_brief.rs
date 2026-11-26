@@ -45,14 +45,14 @@ pub fn lane_brief(space: &Space, node: &AgentNode) -> String {
                 .to_owned(),
             HelperKind::Probe => format!(
                 "You are read-only: never edit files. Exercise the running app on its PORT: send requests with \
-                 the api-client plugin and read the logs plugin (`xctx-ctl plugin.list space={slug}` shows what \
-                 is mounted; `xctx-ctl plugin.mount space={slug} plugin=<name>` mounts one)."
+                 the api-client tool and read the logs tool (`xctx-ctl plugin.list space={slug}` shows the \
+                 tools and which are open; `xctx-ctl plugin.call` opens a closed tool's pane before calling it)."
             ),
             HelperKind::Browser => format!(
                 "You are read-only: never edit files. Test the app as a user sees it, in xctx's own browser and \
-                 never in any other browser. Mount it if needed (`xctx-ctl plugin.mount space={slug} \
-                 plugin=browser`), then drive it with `xctx-ctl plugin.call space={slug} plugin=browser \
-                 tool=<tool> args:='{{...}}'`: page.open {{\"path\":\"/\"}}, page.click {{\"selector\":\"...\"}}, \
+                 never in any other browser. Drive it with `xctx-ctl plugin.call space={slug} plugin=browser \
+                 tool=<tool> args:='{{...}}'` (it opens beside the agents on the first call): page.open \
+                 {{\"path\":\"/\"}}, page.click {{\"selector\":\"...\"}}, \
                  page.type {{\"selector\":\"...\",\"text\":\"...\",\"submit\":true}}, page.text, page.screenshot \
                  and page.console {{\"errors_only\":true}}. Walk the flows the task touches and report broken \
                  pages, console errors and anything that looks wrong."

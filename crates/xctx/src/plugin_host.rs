@@ -2743,7 +2743,7 @@ impl PluginHost {
             .cloned()
             .ok_or_else(|| {
                 RpcError::conflict(format!(
-                    "{plugin} is not mounted in {space}; mount it first (xctx-ctl plugin.mount space={space} plugin={plugin})"
+                    "{plugin} is not open in {space}: open the space (xctx-ctl space.open space={space}) and call again, or open the tool with xctx-ctl plugin.mount space={space} plugin={plugin}"
                 ))
             })
     }

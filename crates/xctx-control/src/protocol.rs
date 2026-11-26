@@ -395,12 +395,13 @@ pub enum Method {
     PluginList,
     /// `plugin.tools`: a plugin's tools with their parameters and effects, so an agent knows how to call them.
     PluginTools,
-    /// `plugin.mount`: mount a plugin into a space; its pane joins the layout. A connector with write tools or an
-    /// untrusted repo plugin posts a gate to the Inbox instead.
+    /// `plugin.mount`: open a tool's pane in a space, beside the agents; an agent asking for a tool that is open
+    /// gets its pane. A connector with write tools or an untrusted repo plugin posts a gate to the Inbox instead.
     PluginMount,
-    /// `plugin.unmount`: unmount a plugin from a space, closing its pane and its tools.
+    /// `plugin.unmount`: close a tool's panes (or one pane) in a space, as ⌘W does; the tool stays available.
     PluginUnmount,
-    /// `plugin.call`: call a mounted plugin's tool. Read tools run; write tools post a gate to the Inbox.
+    /// `plugin.call`: call a tool. Its pane opens first when it is closed and the space is open. Read tools run;
+    /// write tools post a gate to the Inbox.
     PluginCall,
     /// `plugin.emit`: report an event from a plugin's own tool, which the space routes to its loop. Needs
     /// [`Capability::Layout`]: a manifest action can pass or fail the loop's stage, moving the loop as
@@ -614,11 +615,13 @@ impl Method {
                 "a plugin's tools with their parameters and whether each reads or writes"
             }
             Method::PluginMount => {
-                "mount a plugin into a space; connectors with writes and untrusted repo plugins ask in the Inbox"
+                "open a tool's pane beside the agents (an open one is returned); connectors with writes and untrusted repo plugins ask in the Inbox"
             }
-            Method::PluginUnmount => "unmount a plugin (or its pane) from a space",
+            Method::PluginUnmount => {
+                "close a tool's panes (or one pane) in a space; the tool stays available"
+            }
             Method::PluginCall => {
-                "call a mounted plugin's tool; read tools run, write tools post a gate to the Inbox"
+                "call a tool (its pane opens if closed); read tools run, write tools post a gate to the Inbox"
             }
             Method::PluginEmit => {
                 "report a plugin event (from the plugin's own tool) to the space's loop"

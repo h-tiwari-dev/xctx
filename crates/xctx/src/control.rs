@@ -648,6 +648,9 @@ impl Workspace {
             | Call::AttemptList(_)
             | Call::AttemptDiff(_)
             | Call::AgentRead(_)) => {
+                if let Call::PluginCall(p) = &call {
+                    self.open_tool_for_call(&p.space, &p.plugin, window, cx);
+                }
                 if !self.mise_ready {
                     self.pending_masked_reads
                         .push(PendingMaskedRead { call, responder });
@@ -1384,6 +1387,38 @@ impl Workspace {
             ))
         })?;
         Ok(tool_specs(&found.manifest))
+    }
+
+    /// Before `plugin.call`, open the tool's pane when the space is open and the tool has none, so an agent can use
+    /// any tool whether or not its pane was open, and the user sees it. A tool that needs the user's approval
+    /// first is left alone; the call then says it is not open.
+    fn open_tool_for_call(
+        &mut self,
+        space: &str,
+        plugin: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(id) = resolve_space(&self.spaces, |id| self.in_flight_spaces.contains(id), space)
+        else {
+            return;
+        };
+        let Some(space) = self.tabs.get(&id).map(|tab| tab.space.clone()) else {
+            return;
+        };
+        if self.mounted_plugins(&id).iter().any(|m| m.plugin == plugin) {
+            return;
+        }
+        if !matches!(
+            self.plugins.mount_check(&space, plugin, true),
+            Ok((crate::plugin_host::MountCheck::Ready, _))
+        ) {
+            return;
+        }
+        let settings = self.agent_mount_settings(&id, plugin, None);
+        if let Err(e) = self.mount_plugin(&id, plugin, None, settings, true, window, cx) {
+            self.show_op_error(e, cx);
+        }
     }
 
     /// `plugin.call`: run a read tool and answer with its masked output, or post a write to the Inbox and answer

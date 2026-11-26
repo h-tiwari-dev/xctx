@@ -23,25 +23,14 @@ no `$XCTX_SPACE`: pass the space's slug from `xctx-ctl space.list` instead.
 1. Make sure the app is up on `$PORT`. If no dev server is running, start it in a terminal with the repo's
    own script on that port (for example `bun run dev --port "$PORT"` or `npm run dev -- --port "$PORT"`), and
    wait until it prints that it is ready.
-2. See whether the space has a browser already:
-
-   ```sh
-   xctx-ctl plugin.list space="$XCTX_SPACE"
-   ```
-
-   Mount one only when `browser` is not mounted there; a second browser pane cannot show a page.
-
-   ```sh
-   xctx-ctl plugin.mount space="$XCTX_SPACE" plugin=browser
-   ```
-
-3. Open the page you mean, a path or a full `http://localhost:$PORT/...` URL:
+2. Open the page you mean, a path or a full `http://localhost:$PORT/...` URL. When the space's browser is
+   closed, this call opens it beside you first; when it is open, it uses that one:
 
    ```sh
    xctx-ctl plugin.call space="$XCTX_SPACE" plugin=browser tool=page.open args:='{"path":"/"}'
    ```
 
-4. Tell the user it is open beside you and what they are looking at.
+3. Tell the user it is open beside you and what they are looking at.
 
 ## Checking the page yourself
 
@@ -56,5 +45,5 @@ pane; when it shows another site, the tools refuse to read it. Open your page ag
 
 ## An API instead of a page
 
-For a backend with no page to show, mount the API client beside you instead:
-`xctx-ctl plugin.mount space="$XCTX_SPACE" plugin=api-client`.
+For a backend with no page to show, open the API client beside you instead:
+`xctx-ctl plugin.mount space="$XCTX_SPACE" plugin=api-client` (an open one is reused), then call its tools.

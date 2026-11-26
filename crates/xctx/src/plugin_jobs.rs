@@ -132,6 +132,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Result<MountOutcome, RpcError> {
         let space = self.open_tab_mut(id)?.space.clone();
+        // An agent asking for a tool that is open already gets its pane, not a second one.
+        if from_agent
+            && let Some(open) = self
+                .mounted_plugins(id)
+                .into_iter()
+                .find(|m| m.plugin == plugin)
+        {
+            return Ok(MountOutcome::Mounted(open.pane));
+        }
         if let Some(repo) = &repo
             && !space.repos.iter().any(|r| &r.name == repo)
         {
@@ -990,10 +999,7 @@ impl Workspace {
                         }
                     }
                     _ => self.info(
-                        format!(
-                            "Trusted {}; mount it from the Plugins menu (⌘⇧P)",
-                            gate.plugin
-                        ),
+                        format!("Trusted {}; open it from the tool dock", gate.plugin),
                         cx,
                     ),
                 }

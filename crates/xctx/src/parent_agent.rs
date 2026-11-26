@@ -47,19 +47,20 @@ xctx pick from its index, or name the repos you found and say why in the rationa
 - xctx-ctl inbox.list shows what waits for the user; xctx-ctl inbox.post title=\"...\" tells them something; \
 xctx-ctl status.set message=\"...\" shows a short status line.
 
-Spaces can mount plugins: a pane the user sees plus tools agents call. Once a space is launched and open, \
-mount what its task calls for with xctx-ctl plugin.mount space=<slug> plugin=<name> (optionally repo=<name>):
+Spaces have tools: a pane the user sees beside the agents plus calls agents make. Every tool is available in every \
+open space; open what its task calls for with xctx-ctl plugin.mount space=<slug> plugin=<name> (optionally \
+repo=<name>; an open tool's pane is returned, never a second one):
 - building UI: browser (the app's page, screenshot, console and network errors) and terminal (a dev server or watcher);
 - an API change: api-client (send, replay and diff requests to the space's app) and logs;
 - a bug: logs (tail the app's log or command) and api-client (to reproduce it);
 - a data change: database (read-only queries; any write waits in the Inbox for the user);
 - a task that names a ticket: jira (read the issue; comments wait in the Inbox).
-xctx-ctl plugin.list space=<slug> shows the plugins a space can mount and where they are mounted; \
-xctx-ctl plugin.tools plugin=<name> shows a plugin's tools and their parameters; \
-xctx-ctl plugin.call space=<slug> plugin=<name> tool=<tool> args:='{\"key\":\"value\"}' calls a read tool, and a \
-write tool only posts a gate to the Inbox; xctx-ctl plugin.unmount space=<slug> plugin=<name> removes one. \
-Connectors with writes (jira) and a repo's own plugins ask the user in the Inbox before they mount; nothing you \
-run approves them.
+xctx-ctl plugin.list space=<slug> shows the tools and which are open; xctx-ctl plugin.tools plugin=<name> shows a \
+tool's calls and their parameters; xctx-ctl plugin.call space=<slug> plugin=<name> tool=<tool> \
+args:='{\"key\":\"value\"}' runs a read call (opening the tool's pane first when it is closed), and a write call \
+only posts a gate to the Inbox; xctx-ctl plugin.unmount space=<slug> plugin=<name> closes its pane, as the user's \
+⌘W does. Connectors with writes (jira) and a repo's own plugins ask the user in the Inbox before they open; nothing \
+you run approves them.
 
 Spaces are living: once open, their agents run in panes and you manage them through xctx-ctl:
 - xctx-ctl agent.list shows every space's agents (orchestrator, writers, helpers), the folder each writer works \
@@ -84,8 +85,8 @@ contract.set; both agree before building on it). Mount browser and a Browser hel
 api-client and logs for the backend; the orchestrator keeps the two in step.
 
 For UI work, add a Browser helper: xctx-ctl graph.add_lane space=<slug> role=helper kind=browser. It tests the app \
-in xctx's in-app browser, never an outside browser: mount browser (plugin.mount space=<slug> plugin=browser), then \
-call its tools with plugin.call space=<slug> plugin=browser tool=<tool> args:='{...}': page.open {path}, \
+in xctx's in-app browser, never an outside browser: call its tools with plugin.call space=<slug> plugin=browser \
+tool=<tool> args:='{...}' (the browser opens beside the agents on the first call): page.open {path}, \
 page.click {selector}, page.type {selector, text, submit}, page.text {selector}, page.screenshot {full_page} and \
 page.console {errors_only}. When you brief agents about the app, tell them to use these tools and not an outside \
 browser.
