@@ -14,7 +14,7 @@ use xctx_ui::{
     ParentAgentDrawer, Theme, Tone, card_badge, helper_kind_label, shape_label,
 };
 
-use crate::graph_panel::pane_lives;
+use crate::flow::pane_lives;
 use crate::lifecycle::{folder_to_index, home_dir, launch_space};
 use crate::space_layout::layout_shape;
 use crate::workspace::Workspace;

@@ -6,7 +6,8 @@
 //! is not a control moves the window when dragged and zooms it when double-clicked: one
 //! [`window_drag_area`] fills the row behind its content, and each control blocks the mouse from reaching it.
 //!
-//! Test selectors: `title-sidebar`, `title-palette`, `title-shape-<i>` (in [`SHAPES`] order), `title-graph`,
+//! Test selectors: `title-sidebar`, `title-palette`, `title-shape-<i>` (in [`SHAPES`] order), `title-mode-panes`,
+//! `title-mode-flow`,
 //! `title-add-agent`, `title-add-repo`, `title-discard`, `title-ship`.
 
 use std::rc::Rc;
@@ -38,8 +39,9 @@ pub fn shape_label(shape: Shape) -> &'static str {
 pub struct SpaceHeaderInfo {
     /// The space's current shape, selected in the shape control.
     pub shape: Shape,
-    /// Whether the agent graph is open; selects the Graph button.
-    pub graph_open: bool,
+    /// Whether the space shows its Flow view instead of its panes; selects Flow in the mode switch and hides
+    /// the shape control (shapes arrange panes).
+    pub flow_open: bool,
     /// Whether the space runs with a `production` env; draws the env chip as a danger badge.
     pub production: bool,
     /// The git branch of the focused pane's worktree; empty to hide its chip.
@@ -69,7 +71,7 @@ pub struct TitleBar {
     space: Option<SpaceHeaderInfo>,
     on_toggle_sidebar: Option<Handler>,
     on_palette: Option<Handler>,
-    on_graph: Option<Handler>,
+    on_toggle_flow: Option<Handler>,
     on_add_agent: Option<Handler>,
     on_add_repo: Option<Handler>,
     on_shape: Option<ShapeHandler>,
@@ -87,7 +89,7 @@ impl TitleBar {
             space: None,
             on_toggle_sidebar: None,
             on_palette: None,
-            on_graph: None,
+            on_toggle_flow: None,
             on_add_agent: None,
             on_add_repo: None,
             on_shape: None,
@@ -122,9 +124,9 @@ impl TitleBar {
         self
     }
 
-    /// Call `handler` when the Graph button is clicked, to toggle the agent graph.
-    pub fn on_graph(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-        self.on_graph = Some(Rc::new(handler));
+    /// Call `handler` when the mode switch's other side (Panes or Flow) is clicked, to flip between them.
+    pub fn on_toggle_flow(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_toggle_flow = Some(Rc::new(handler));
         self
     }
 
@@ -317,6 +319,68 @@ impl TitleBar {
             .children(segments)
     }
 
+    /// The Panes | Flow switch: the selected side is drawn raised; a click on the other side flips the view.
+    fn render_mode(&self, flow_open: bool, theme: &Theme) -> gpui::Div {
+        let sides = [
+            ("title-mode-panes", IconName::SplitH, "Panes", !flow_open),
+            ("title-mode-flow", IconName::Orchestrator, "Flow", flow_open),
+        ];
+        let segments = sides.into_iter().map(|(selector, icon, label, selected)| {
+            let (hover, text) = (theme.hover, theme.text);
+            let mut segment = div()
+                .id(selector)
+                .debug_selector(move || selector.to_owned())
+                .flex()
+                .items_center()
+                .gap(Theme::SPACE_1)
+                .h_full()
+                .px(Theme::SPACE_2)
+                .rounded(Theme::RADIUS_SM)
+                .text_size(Theme::TEXT_SM)
+                .child(Icon::new(icon).size(IconSize::Xs).color(if selected {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                }))
+                .child(label)
+                .tooltip(|_, cx| Tooltip::view("Switch between panes and Flow ⌘G", cx));
+            segment = if selected {
+                segment
+                    .bg(theme.raised)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_sm()
+                    .text_color(theme.text)
+                    .font_weight(FontWeight::SEMIBOLD)
+            } else {
+                let segment = segment
+                    .cursor_pointer()
+                    .text_color(theme.text_muted)
+                    .hover(move |style| style.bg(hover).text_color(text));
+                match self.on_toggle_flow.clone() {
+                    Some(handler) => segment.on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        handler(window, cx);
+                    }),
+                    None => segment,
+                }
+            };
+            segment
+        });
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .h(CONTROL_HEIGHT)
+            .p(px(2.0))
+            .rounded(Theme::RADIUS_MD)
+            .border_1()
+            .border_color(theme.border_subtle)
+            .bg(theme.hover)
+            .children(segments)
+    }
+
     fn render_discard(&self, theme: &Theme) -> gpui::Stateful<gpui::Div> {
         let danger = theme.danger;
         let mut button = div()
@@ -416,21 +480,15 @@ impl TitleBar {
         if let Some(handler) = self.on_ship.clone() {
             ship = ship.on_click(move |_, window, cx| handler(window, cx));
         }
-        let graph = tool_button(
-            "title-graph",
-            IconName::Inspector,
-            "",
-            "Agent graph ⌘G",
-            self.on_graph.clone(),
-        )
-        .selected(info.graph_open);
         div()
             .flex()
             .flex_none()
             .items_center()
             .gap(Theme::SPACE_1)
-            .child(control(self.render_shapes(info.shape, theme)).mr(Theme::SPACE_2))
-            .child(control(graph))
+            .child(control(self.render_mode(info.flow_open, theme)).mr(Theme::SPACE_2))
+            .when(!info.flow_open, |row| {
+                row.child(control(self.render_shapes(info.shape, theme)).mr(Theme::SPACE_2))
+            })
             .child(control(tool_button(
                 "title-add-agent",
                 IconName::Plus,
@@ -529,7 +587,7 @@ mod tests {
         assert!(!bar.sidebar_collapsed);
         let info = SpaceHeaderInfo {
             shape: Shape::Debug,
-            graph_open: true,
+            flow_open: true,
             production: false,
             branch: "space/fix".into(),
             env: "fix".into(),

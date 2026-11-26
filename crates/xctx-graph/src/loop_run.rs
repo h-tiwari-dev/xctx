@@ -87,6 +87,9 @@ pub struct StageTransition {
     pub iteration: u32,
     /// False when `from`'s checks failed and the loop went back to `Write`.
     pub checks_passed: bool,
+    /// When `to` started, in seconds since the Unix epoch; 0 in histories saved before stage changes were timed.
+    #[serde(default)]
+    pub at: u64,
 }
 
 /// What [`LoopRun::advance`] or [`LoopRun::approve_next_stage`] did.
@@ -301,6 +304,7 @@ impl LoopRun {
             to: next,
             iteration: self.iteration,
             checks_passed: next != LoopStage::Write,
+            at: unix_now(),
         });
         self.stage = next;
         if self.budget_exhausted() {
@@ -315,6 +319,13 @@ impl LoopRun {
     fn budget_exhausted(&self) -> bool {
         self.autonomy.is_exhausted(self.iteration, self.turns_used)
     }
+}
+
+/// Seconds since the Unix epoch; 0 when the clock is before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 impl AutonomyLevel {

@@ -17,8 +17,7 @@ use xctx_layout::{FocusDirection, PaneId, PaneKind, PaneRole, RolePane, Shape, S
 use xctx_term::TerminalSession;
 use xctx_term_view::{TerminalView, TerminalViewEvent};
 use xctx_ui::{
-    Button, ButtonSize, ButtonVariant, IconName, PaneView, SharedTab, SplitView, Theme,
-    pane_kind_label,
+    Button, ButtonSize, ButtonVariant, IconName, PaneView, SplitView, Theme, pane_kind_label,
 };
 
 use crate::agent_session::AgentSession;
@@ -77,10 +76,12 @@ pub(crate) struct SpaceTab {
     pub(crate) space: Space,
     pub(crate) layout: SpaceLayout,
     pub(crate) terminals: HashMap<PaneId, PaneTerminal>,
-    /// Whether the agent graph panel is open beside the panes.
-    pub(crate) graph_open: bool,
-    /// The tab of the Shared Space panel shown in the graph panel.
-    pub(crate) shared_tab: SharedTab,
+    /// Whether the space shows its Flow view (loop, agent graph, timeline) instead of its panes.
+    pub(crate) flow_open: bool,
+    /// What the Flow view is narrowed to: one agent or one pair, or `None` for everything.
+    pub(crate) flow_focus: Option<xctx_nav::flow::FlowFocus>,
+    /// The scroll and measurements of the Flow view's timeline, kept across frames.
+    pub(crate) timeline: gpui::ListState,
     /// The agent terminal of each live attempt, by attempt number. They are not in the layout; the attempt strip
     /// switches to them (see [`Workspace::attempt_terminal`]).
     pub(crate) attempt_terminals: HashMap<u32, PaneTerminal>,
@@ -93,15 +94,16 @@ pub(crate) struct SpaceTab {
 }
 
 impl SpaceTab {
-    /// A tab for `space` laid out as `layout`, with no terminals started yet and the graph panel closed.
+    /// A tab for `space` laid out as `layout`, with no terminals started yet, showing its panes.
     fn new(space: Space, layout: SpaceLayout) -> SpaceTab {
         let repo_links = repo_links_of(&space);
         SpaceTab {
             space,
             layout,
             terminals: HashMap::new(),
-            graph_open: false,
-            shared_tab: SharedTab::default(),
+            flow_open: false,
+            flow_focus: None,
+            timeline: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(600.0)),
             attempt_terminals: HashMap::new(),
             shown_attempt: None,
             repo_links,
@@ -1020,20 +1022,26 @@ impl Workspace {
         sessions
     }
 
-    /// The pane area of the space being shown (its split view, under the attempt strip when it has attempts),
-    /// with the agent graph panel beside it when open, and the tool dock (drawn from `dock`) on the right edge.
+    /// The pane area of the space being shown: its split view (under the attempt strip when it has attempts)
+    /// with the tool dock (drawn from `dock`) on the right edge, or its Flow view when that is shown.
     pub(crate) fn render_space(
         &self,
         tab: &SpaceTab,
         dock: Option<xctx_ui::ToolDockView>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The Flow view replaces the panes (and their tool dock); the panes keep running behind it.
+        if tab.flow_open {
+            return div()
+                .size_full()
+                .child(self.render_flow(tab, cx))
+                .into_any_element();
+        }
         let split = self.render_space_body(tab, cx);
         div()
             .flex()
             .size_full()
             .child(div().flex_1().min_w_0().h_full().child(split))
-            .children(tab.graph_open.then(|| self.render_graph_panel(tab, cx)))
             .children(dock.map(|view| self.render_tool_dock(view, cx)))
             .into_any_element()
     }

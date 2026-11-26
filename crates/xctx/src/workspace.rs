@@ -26,7 +26,7 @@ use crate::inbox_view::{EnvPrompt, PlanLaunches};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
-    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleGraph, TogglePalette,
+    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleFlow, TogglePalette,
     ToggleRoster, ToggleTranslucency, ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
 };
 use crate::lifecycle::scan_index;
@@ -678,10 +678,9 @@ impl Render for Workspace {
             .on_action(Self::pane_shortcut::<ToggleZoom>(cx, |this, window, cx| {
                 this.toggle_zoom(window, cx)
             }))
-            .on_action(Self::pane_shortcut::<ToggleGraph>(
-                cx,
-                |this, window, cx| this.toggle_graph(window, cx),
-            ))
+            .on_action(Self::pane_shortcut::<ToggleFlow>(cx, |this, window, cx| {
+                this.toggle_flow(window, cx)
+            }))
             .on_action(Self::pane_shortcut::<ForkAttempts>(
                 cx,
                 |this, window, cx| this.fork_from_keys(window, cx),

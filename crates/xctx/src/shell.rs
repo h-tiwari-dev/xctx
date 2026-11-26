@@ -13,7 +13,7 @@ use xctx_ui::roster::{
 use xctx_ui::title_bar::{SpaceHeaderInfo, TitleBar};
 use xctx_ui::{DraggedTool, PaneLive, SHAPES, Theme, shape_label};
 
-use crate::graph_panel::pane_lives;
+use crate::flow::pane_lives;
 use crate::space_layout::layout_shape;
 use crate::space_tab::PaneTerminal;
 use crate::ui_prefs::prefs_path;
@@ -375,7 +375,7 @@ impl Workspace {
                     space.title.clone(),
                     Some(SpaceHeaderInfo {
                         shape: layout_shape(space.shape),
-                        graph_open: tab.graph_open,
+                        flow_open: tab.flow_open,
                         production: space.production,
                         // The status line shows the branch and env; the title bar only warns about production,
                         // so the title and actions keep their room.
@@ -401,10 +401,10 @@ impl Workspace {
         if let Some(info) = info {
             bar = bar
                 .space(info)
-                .on_graph(move |window, cx| {
+                .on_toggle_flow(move |window, cx| {
                     let _ = graph.update(cx, |this, cx| {
                         if this.dialog.is_none() {
-                            this.toggle_graph(window, cx);
+                            this.toggle_flow(window, cx);
                         }
                     });
                 })
@@ -532,10 +532,16 @@ impl Workspace {
                 action("focus-next", "Focus next pane", Some("⌘]"), &[]),
                 action("focus-prev", "Focus previous pane", Some("⌘["), &[]),
                 action(
-                    "graph",
-                    "Toggle agent graph",
+                    "flow",
+                    if tab.flow_open {
+                        "Show panes"
+                    } else {
+                        "Show Flow (loop, agent graph, activity)"
+                    },
                     Some("⌘G"),
-                    &["shared", "channel", "contract"],
+                    &[
+                        "graph", "agents", "loop", "shared", "channel", "contract", "timeline",
+                    ],
                 ),
                 action(
                     "add-agent",
@@ -661,7 +667,7 @@ impl Workspace {
             "zoom" => self.toggle_zoom(window, cx),
             "focus-next" => self.cycle_focus(true, window, cx),
             "focus-prev" => self.cycle_focus(false, window, cx),
-            "graph" => self.toggle_graph(window, cx),
+            "flow" => self.toggle_flow(window, cx),
             "add-agent" => self.open_add_agent_dialog(window, cx),
             "add-repo" => self.open_add_repo_dialog(window, cx),
             "review" => self.open_review(window, cx),

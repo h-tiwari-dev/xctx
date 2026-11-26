@@ -3,7 +3,7 @@
 //! them; and which agent each pane runs.
 //!
 //! Everything here works without a window, so it is tested directly; the workspace applies it in
-//! `graph_panel.rs` and `control.rs`.
+//! `flow.rs` and `control.rs`.
 
 use std::collections::HashMap;
 use std::ffi::OsString;

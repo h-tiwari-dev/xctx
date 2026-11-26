@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+xctx-channel = { path = "../xctx-channel" }
 xctx-core = { path = "../xctx-core" }
 xctx-graph = { path = "../xctx-graph" }
 xctx-inbox = { path = "../xctx-inbox" }

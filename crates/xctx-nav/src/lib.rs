@@ -1,12 +1,13 @@
 //! UI-free navigation models for the xctx shell: the fleet [`roster`] (spaces and agents grouped by
-//! rolled-up state in shortcut order) and the command [`palette`] (prefix-filtered fuzzy matcher
-//! with recent-command ordering).
+//! rolled-up state in shortcut order), the command [`palette`] (prefix-filtered fuzzy matcher
+//! with recent-command ordering), and the [`flow`] view (loop stages, the agent canvas, the timeline).
 //!
 //! This crate never depends on GPUI so every rollup, ordering and fuzzy-matching rule can be tested
 //! without a window.
 
 #![warn(missing_docs)]
 
+pub mod flow;
 pub mod palette;
 pub mod roster;
 

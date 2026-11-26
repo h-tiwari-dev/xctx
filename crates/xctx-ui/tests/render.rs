@@ -216,7 +216,7 @@ impl Render for BarsHost {
                 TitleBar::new("make checkout retry safe")
                     .space(SpaceHeaderInfo {
                         shape: Shape::Review,
-                        graph_open: false,
+                        flow_open: false,
                         production: true,
                         branch: "space/fix-retry".into(),
                         env: "production,fix-retry".into(),
@@ -261,4 +261,45 @@ fn bars_draw_with_every_item(cx: &mut TestAppContext) {
     if let Some(center) = cx.debug_bounds("title-palette").map(|b| b.center()) {
         cx.simulate_click(center, Modifiers::default());
     }
+}
+
+struct ModeHost {
+    toggles: Rc<RefCell<usize>>,
+}
+
+impl Render for ModeHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let toggles = self.toggles.clone();
+        let bar = TitleBar::new("add rate limiting")
+            .space(SpaceHeaderInfo {
+                shape: Shape::Dev,
+                flow_open: true,
+                production: false,
+                branch: "space/rate-limit".into(),
+                env: "rate-limit".into(),
+            })
+            .on_toggle_flow(move |_, _| *toggles.borrow_mut() += 1);
+        div().w(px(1400.0)).h_full().child(bar)
+    }
+}
+
+#[gpui::test]
+fn the_title_bar_mode_switch_flips_only_from_the_other_side(cx: &mut TestAppContext) {
+    let toggles = Rc::new(RefCell::new(0));
+    let host_toggles = toggles.clone();
+    let (_host, cx) = cx.add_window_view(move |_, _| ModeHost {
+        toggles: host_toggles,
+    });
+    cx.run_until_parked();
+    // Flow is shown: clicking Flow again does nothing, Panes flips back.
+    for selector in ["title-mode-flow", "title-mode-panes"] {
+        let center = cx.debug_bounds(selector).map(|b| b.center());
+        assert!(center.is_some(), "{selector} not drawn");
+        if let Some(center) = center {
+            cx.simulate_click(center, Modifiers::default());
+        }
+    }
+    assert_eq!(*toggles.borrow(), 1);
+    // Shapes arrange panes, so the shape control is hidden while Flow is shown.
+    assert!(cx.debug_bounds("title-shape-0").is_none());
 }

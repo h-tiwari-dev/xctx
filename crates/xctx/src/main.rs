@@ -12,7 +12,7 @@ mod attempts;
 mod control;
 mod dev_setup;
 mod dialogs;
-mod graph_panel;
+mod flow;
 mod home;
 mod inbox_view;
 mod keymap;
