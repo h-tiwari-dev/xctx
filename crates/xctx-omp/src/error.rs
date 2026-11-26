@@ -32,5 +32,5 @@ pub enum OmpError {
     Closed,
 }
 
-/// A result carrying an [`OmpError`].
-pub type Result<T> = std::result::Result<T, OmpError>;
+/// A result whose error is an [`OmpError`] unless another is given.
+pub type Result<T, E = OmpError> = std::result::Result<T, E>;
