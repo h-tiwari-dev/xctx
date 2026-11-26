@@ -1370,6 +1370,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.rpc_pane_is_live(id, pane.id) {
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(id) else {
             return;
         };

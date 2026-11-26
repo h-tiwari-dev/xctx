@@ -292,6 +292,9 @@ impl Workspace {
             session,
             format!("the writer's agent of {id}"),
             move |this, window, cx| {
+                if this.rpc_pane_is_live(&id, pane.id) {
+                    return;
+                }
                 let Some(tab) = this.tabs.get_mut(&id) else {
                     return;
                 };
@@ -1083,6 +1086,15 @@ impl Workspace {
         let Some((pane, _)) = self.writer_pane(id, &attempt.agent, cx) else {
             return;
         };
+        if self.rpc_pane_is_live(id, pane.id) {
+            self.error(
+                format!(
+                    "the writer of {id} is still running; stop it to switch to the adopted session"
+                ),
+                cx,
+            );
+            return;
+        }
         if let Some(tab) = self.tabs.get_mut(id) {
             tab.terminals.remove(&pane.id);
         }

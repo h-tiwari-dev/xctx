@@ -62,6 +62,10 @@ impl Workspace {
         if pane.role.kind != PaneKind::Agent {
             return false;
         }
+        if self.rpc_pane_is_live(id, pane.id) {
+            // Already running: a second child would replace it and abort its turn.
+            return true;
+        }
         let Some(space) = self.tabs.get(id).map(|tab| tab.space.clone()) else {
             return false;
         };
@@ -284,6 +288,15 @@ impl Workspace {
             PaneTerminal::Omp(omp) => Some(omp),
             _ => None,
         }
+    }
+
+    /// Whether pane `pane` of open space `id` is an RPC pane whose child runs. Such a child must not be replaced or
+    /// removed: dropping its client closes omp's input, and omp ends the running turn as aborted.
+    pub(crate) fn rpc_pane_is_live(&self, id: &SpaceId, pane: PaneId) -> bool {
+        matches!(
+            self.tabs.get(id).and_then(|tab| tab.terminals.get(&pane)),
+            Some(PaneTerminal::Omp(omp)) if omp.agent.is_live()
+        )
     }
 
     /// Open in terminal: stop the RPC child of pane `pane` of open space `id` (closing its input, as omp
