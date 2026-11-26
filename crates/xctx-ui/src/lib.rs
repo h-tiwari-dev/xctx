@@ -18,6 +18,7 @@ pub mod flow_timeline;
 pub mod flow_view;
 pub mod fork_dialog;
 pub mod frame_overlay;
+pub mod home_hero;
 pub mod icon;
 pub mod inbox;
 pub mod motion;
@@ -61,6 +62,7 @@ pub use frame_overlay::{
     DEFAULT_FRAME_CAPACITY, FRAME_BUDGET_MS, FRAME_WINDOW, FrameMetrics, FrameOverlay, FrameStats,
     SLOW_FRAME_LOG_MS, SlowFrameEvent,
 };
+pub use home_hero::{ComposerCard, ComposerChip, HomeBackdrop, HomeHero};
 pub use icon::{Icon, IconName, IconSize, UiAssets};
 pub use inbox::{INBOX_EMPTY, InboxAction, InboxEntry, InboxKind, InboxPanel};
 pub use motion::{

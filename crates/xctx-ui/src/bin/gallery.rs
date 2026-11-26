@@ -11,9 +11,9 @@ use gpui::{
     div, prelude::*, px, size,
 };
 use xctx_ui::{
-    Badge, Button, ButtonSize, ButtonVariant, FrameOverlay, Icon, IconName, IconSize,
-    MotionSettings, Overlay, OverlayPlacement, Pill, Spinner, Theme, Toast, ToastAction,
-    ToastStack, Tone, UiAssets,
+    Badge, Button, ButtonSize, ButtonVariant, ComposerCard, ComposerChip, FrameOverlay,
+    HomeBackdrop, HomeHero, Icon, IconName, IconSize, MotionSettings, Overlay, OverlayPlacement,
+    Pill, Spinner, Theme, Toast, ToastAction, ToastStack, Tone, UiAssets,
 };
 
 actions!(
@@ -697,6 +697,108 @@ impl Render for GalleryView {
                 ),
         );
 
+        // 5. Home hero & composer
+        let home_hero_section = Self::section(
+            "Home Hero & Composer",
+            "Dot-grid backdrop, pixel logo hero, and composer card in empty and ready-to-submit states",
+            &theme,
+        )
+        .child(
+            div()
+                .relative()
+                .overflow_hidden()
+                .rounded(Theme::RADIUS_LG)
+                .border_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.chrome)
+                .px(Theme::SPACE_6)
+                .pb(Theme::SPACE_6)
+                .child(HomeBackdrop::new())
+                .child(
+                    div()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .gap(Theme::SPACE_6)
+                        .child(HomeHero::new("v0.1 · parent agent"))
+                        .child(
+                            div().id("gallery-composer-empty").child(
+                                ComposerCard::new(
+                                    div()
+                                        .text_size(Theme::TEXT_LG)
+                                        .text_color(theme.text_subtle)
+                                        .child("What are we building?"),
+                                )
+                                .focused(false)
+                                .can_submit(false)
+                                .left_readout("parent agent · idle")
+                                .right_readout("0 spaces")
+                                .chip(
+                                    ComposerChip::new("gallery-chip-agent-empty", "omp")
+                                        .icon(IconName::Orchestrator)
+                                        .tone(Tone::Accent)
+                                        .pill(true)
+                                        .tooltip("Parent agent")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.last_event =
+                                                "Clicked empty composer agent chip".into();
+                                            cx.notify();
+                                        })),
+                                )
+                                .chip(
+                                    ComposerChip::new("gallery-chip-folder-empty", "~/Desktop/xctx")
+                                        .icon(IconName::Folder)
+                                        .tooltip("Working folder"),
+                                )
+                                .chip(
+                                    ComposerChip::new("gallery-chip-busy", "Indexing")
+                                        .tone(Tone::Success)
+                                        .busy(true),
+                                ),
+                            ),
+                        )
+                        .child(
+                            div().id("gallery-composer-ready").child(
+                                ComposerCard::new(
+                                    div()
+                                        .text_size(Theme::TEXT_LG)
+                                        .text_color(theme.text)
+                                        .child("Reimagine the Home screen with a centred composer card."),
+                                )
+                                .focused(true)
+                                .can_submit(true)
+                                .left_readout("parent agent · ready")
+                                .right_readout("2 spaces · 3 agents")
+                                .chip(
+                                    ComposerChip::new("gallery-chip-agent-ready", "omp")
+                                        .icon(IconName::Orchestrator)
+                                        .tone(Tone::Accent)
+                                        .pill(true)
+                                        .active(true)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.last_event =
+                                                "Clicked ready composer agent chip".into();
+                                            cx.notify();
+                                        })),
+                                )
+                                .chip(
+                                    ComposerChip::new("gallery-chip-folder-ready", "~/Desktop/xctx")
+                                        .icon(IconName::Folder)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.last_event =
+                                                "Clicked ready composer folder chip".into();
+                                            cx.notify();
+                                        })),
+                                )
+                                .on_submit(cx.listener(|this, _, _, cx| {
+                                    this.last_event = "Submitted gallery composer prompt".into();
+                                    cx.notify();
+                                })),
+                            ),
+                        ),
+                ),
+        );
+
         // Status footer
         let footer = div()
             .flex()
@@ -729,7 +831,8 @@ impl Render for GalleryView {
                     .child(icons_section)
                     .child(spinner_section)
                     .child(buttons_section)
-                    .child(interactive_section),
+                    .child(interactive_section)
+                    .child(home_hero_section),
             );
 
         div()
