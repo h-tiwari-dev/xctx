@@ -411,7 +411,8 @@ pub enum Method {
     AgentList,
     /// `agent.read`: the last lines an agent's terminal shows, secrets masked.
     AgentRead,
-    /// `agent.send`: type a message into an agent's terminal and submit it.
+    /// `agent.send`: type a message into an agent's terminal and submit it, or send it to an RPC agent as a
+    /// prompt (a steer or follow-up while it works).
     AgentSend,
     /// `agent.start`: start an agent's pane when its terminal does not run it.
     AgentStart,
@@ -630,9 +631,13 @@ impl Method {
                 "every open space's agents (or one space's): role, folder, graph state, pane and whether it runs"
             }
             Method::AgentRead => {
-                "the last lines an agent's terminal shows (default 40, at most 200), secrets masked"
+                "the last lines an agent's terminal (or an RPC agent's transcript) shows (default 40, at most \
+                 200), secrets masked"
             }
-            Method::AgentSend => "type a message into an agent's terminal and press Enter",
+            Method::AgentSend => {
+                "send an agent a message: typed into its terminal, or for an RPC agent a prompt (steering or \
+                 queued while it works)"
+            }
             Method::AgentStart => {
                 "start an agent that is not running in a pane of its own, with its role brief"
             }
@@ -696,7 +701,9 @@ impl Method {
             Method::PluginEmit => "space=<slug> plugin=<name> event=<name> [detail=<text>]",
             Method::AgentList => "[space=<slug>]",
             Method::AgentRead => "space=<slug> agent=<id> [lines=<1-200>]",
-            Method::AgentSend => "space=<slug> agent=<id> text=<message>",
+            Method::AgentSend => {
+                "space=<slug> agent=<id> text=<message> [while_running=steer|follow_up]"
+            }
             Method::AgentStart => "space=<slug> agent=<id>",
             Method::SpaceOpen => "space=<slug>",
         }
@@ -1231,8 +1238,39 @@ pub struct AgentSendParams {
     /// The agent's id in the space's graph.
     pub agent: String,
     /// The message. Control characters (newlines, escapes) are typed as spaces, so it is one line that cannot
-    /// press keys of its own; Enter is pressed after it.
+    /// press keys of its own; Enter is pressed after it. An agent xctx runs over RPC gets it unchanged, as a
+    /// message rather than keys.
     pub text: String,
+    /// For an agent xctx runs over RPC that is working: whether the message interrupts at the next step
+    /// (`steer`, the default) or waits until the turn ends (`follow_up`). Ignored for a terminal agent, which gets
+    /// the message typed in either way, and for an idle one, which gets it as a new prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub while_running: Option<WhileRunning>,
+}
+
+/// How `agent.send` delivers a message to an RPC agent that is working.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhileRunning {
+    /// Interrupt the running turn at its next step.
+    #[default]
+    Steer,
+    /// Queue it for when the turn ends.
+    FollowUp,
+}
+
+/// How `agent.send` delivered its message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDelivery {
+    /// Typed into the agent's terminal, then Enter.
+    Typed,
+    /// Sent to an idle RPC agent as a new prompt.
+    Prompt,
+    /// Sent to a working RPC agent to steer its running turn.
+    Steer,
+    /// Queued on a working RPC agent for when its turn ends.
+    FollowUp,
 }
 
 /// A parsed request: a method and its typed parameters.
@@ -2022,6 +2060,9 @@ pub struct AgentReadResult {
 pub struct AgentSendResult {
     /// Always `true`: the message was typed and submitted.
     pub sent: bool,
+    /// How it was delivered; absent from xctx versions before RPC agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<AgentDelivery>,
 }
 
 /// The result of `agent.start`.
@@ -2676,6 +2717,7 @@ mod tests {
                 space: "s".into(),
                 agent: "helper-browser-1".into(),
                 text: "Parent Agent here: check /login".into(),
+                while_running: Some(WhileRunning::FollowUp),
             }),
         ]
     }
@@ -2867,8 +2909,18 @@ mod tests {
             json!({"space": "s", "agent": "orchestrator", "process": "running", "text": "done"})
         );
         assert_eq!(
-            serde_json::to_value(AgentSendResult { sent: true })?,
+            serde_json::to_value(AgentSendResult {
+                sent: true,
+                delivered: None
+            })?,
             json!({"sent": true})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentSendResult {
+                sent: true,
+                delivered: Some(AgentDelivery::FollowUp)
+            })?,
+            json!({"sent": true, "delivered": "follow_up"})
         );
         Ok(())
     }

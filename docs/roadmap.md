@@ -60,3 +60,11 @@ See [`docs/m6.md`](m6.md).
   gallery.
 - **Shipped so far**: the Roster, the title bar row, the command palette, a translucent blurred window, and drag
   and drop for panes, dock tools, Finder files and folders.
+
+### Milestone 7 — Native omp agents (in progress)
+See [`docs/omp-native.md`](omp-native.md).
+- **Goal**: an omp agent pane that speaks `omp --mode rpc-ui` instead of drawing omp's terminal UI: composer,
+  transcript, queue, `ask` forms, tool approvals and a subagent tray, with the agent's state in the Roster, Inbox
+  and Flow like any other pane.
+- **Shipped so far**: `xctx-omp` (protocol codec, child-process client, the session model, the `ask` form parser,
+  a replaying `fake-omp` and fixtures recorded from a real omp). No window yet.

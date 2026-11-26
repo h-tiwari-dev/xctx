@@ -13,15 +13,15 @@ use gpui::{App, Context, Task, Window};
 use serde::Serialize;
 use serde_json::Value;
 use xctx_control::protocol::{
-    Ack, AgentListResult, AgentProcess, AgentReadParams, AgentReadResult, AgentSendParams,
-    AgentSendResult, AgentSpaceSummary, AgentStartResult, AgentSummary, AttemptDiffParams,
-    AttemptListParams, AttemptListResult, AttemptProposeParams, AttemptProposeResult,
-    AttemptReportParams, DraftRepoSummary, InboxItemSummary, InboxListParams, InboxListResult,
-    InboxPostParams, InboxPostResult, LayoutInfo, PaneSplitResult, PaneZoomResult, PingResult,
-    PluginCallParams, PluginCallResult, PluginEmitParams, PluginEmitResult, PluginListResult,
-    PluginMountResult, PluginSummary, PluginToolsResult, PluginUnmountResult, RepoSummary,
-    SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary, SpaceWidenProposeParams,
-    SpaceWidenProposeResult, StatusSetParams,
+    Ack, AgentDelivery, AgentListResult, AgentProcess, AgentReadParams, AgentReadResult,
+    AgentSendParams, AgentSendResult, AgentSpaceSummary, AgentStartResult, AgentSummary,
+    AttemptDiffParams, AttemptListParams, AttemptListResult, AttemptProposeParams,
+    AttemptProposeResult, AttemptReportParams, DraftRepoSummary, InboxItemSummary, InboxListParams,
+    InboxListResult, InboxPostParams, InboxPostResult, LayoutInfo, PaneSplitResult, PaneZoomResult,
+    PingResult, PluginCallParams, PluginCallResult, PluginEmitParams, PluginEmitResult,
+    PluginListResult, PluginMountResult, PluginSummary, PluginToolsResult, PluginUnmountResult,
+    RepoSummary, SpaceDraftParams, SpaceDraftResult, SpaceListResult, SpaceSummary,
+    SpaceWidenProposeParams, SpaceWidenProposeResult, StatusSetParams,
 };
 use xctx_control::{
     Call, Incoming, Responder, RpcError, Server, ServerConfig, StatusLevel, socket_path,
@@ -43,6 +43,8 @@ use crate::attempts::{
     round_done_notice,
 };
 use crate::lifecycle::{home_dir, repo_for_draft};
+use crate::omp_agent::{rpc_agent_read, rpc_agent_send};
+use crate::omp_panes::OmpPane;
 use crate::persist::restore_layout;
 use crate::plugin_host::{MountSettings, event_action, plugin_summary, tool_specs};
 use crate::plugin_jobs::{MountOutcome, ToolCallResult, UnmountTarget};
@@ -902,7 +904,24 @@ impl Workspace {
                     session: Some(session),
                 }
             }
+            PaneTerminal::Omp(omp) => match omp.agent.exit() {
+                Some(code) => AgentTerminal {
+                    process: AgentProcess::Exited,
+                    exit_code: code,
+                    session: None,
+                },
+                None => AgentTerminal {
+                    process: AgentProcess::Running,
+                    exit_code: None,
+                    session: None,
+                },
+            },
         }
+    }
+
+    /// The RPC pane of the agent bound to `pane` in the open space `id`, when it runs over RPC.
+    fn agent_rpc_pane(&mut self, id: &SpaceId, pane: Option<u64>) -> Option<&mut OmpPane> {
+        self.rpc_pane_mut(id, PaneId(pane?))
     }
 
     /// `agent.list`: the agents of every active space (or of the active space `name`), with what their terminals
@@ -978,17 +997,29 @@ impl Workspace {
         Ok((id, node, terminal))
     }
 
-    /// `agent.read`: the last lines the agent's terminal shows, masked.
+    /// `agent.read`: the last lines the agent's terminal shows (an RPC agent's transcript), masked.
     fn control_agent_read(
         &mut self,
         p: &AgentReadParams,
         cx: &App,
     ) -> Result<AgentReadResult, RpcError> {
         let (id, node, terminal) = self.open_agent(&p.space, &p.agent, cx)?;
+        let lines = usize::try_from(p.line_count()).unwrap_or(usize::MAX);
+        let rpc = node
+            .pane_id
+            .and_then(|pane| self.tabs.get(&id)?.terminals.get(&PaneId(pane))?.omp());
+        if let Some(omp) = rpc {
+            return Ok(rpc_agent_read(
+                &omp.agent,
+                &id,
+                &node.id,
+                lines,
+                &self.redactor,
+            ));
+        }
         let Some(session) = terminal.session else {
             return Err(no_terminal("agent.read", &id, &node, terminal.process));
         };
-        let lines = usize::try_from(p.line_count()).unwrap_or(usize::MAX);
         let text = last_screen_lines(&session.snapshot().text(), lines);
         Ok(AgentReadResult {
             space: id.as_str().to_owned(),
@@ -1010,6 +1041,11 @@ impl Workspace {
             return Err(RpcError::invalid_params("agent.send: text is empty"));
         }
         let (id, node, terminal) = self.open_agent(&p.space, &p.agent, cx)?;
+        if let Some(omp) = self.agent_rpc_pane(&id, node.pane_id) {
+            let sent = rpc_agent_send(&mut omp.agent, &node.id, &p.text, p.while_running)?;
+            self.announce_agent_message(&id, &node, &p.text, cx);
+            return Ok(sent);
+        }
         let session = match (terminal.process, terminal.session) {
             (AgentProcess::Running, Some(session)) => session,
             (process, _) => return Err(no_terminal("agent.send", &id, &node, process)),
@@ -1021,13 +1057,27 @@ impl Workspace {
         };
         session.write(line.as_bytes()).map_err(write_failed)?;
         session.write(b"\r").map_err(write_failed)?;
-        let mut preview: String = line.chars().take(AGENT_SEND_PREVIEW_CHARS).collect();
-        if line.chars().count() > AGENT_SEND_PREVIEW_CHARS {
+        self.announce_agent_message(&id, &node, line, cx);
+        Ok(AgentSendResult {
+            sent: true,
+            delivered: Some(AgentDelivery::Typed),
+        })
+    }
+
+    /// Say in the window that `node` of space `id` got message `text` (its start, masked).
+    fn announce_agent_message(
+        &mut self,
+        id: &SpaceId,
+        node: &AgentNode,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let mut preview: String = text.chars().take(AGENT_SEND_PREVIEW_CHARS).collect();
+        if text.chars().count() > AGENT_SEND_PREVIEW_CHARS {
             preview.push('…');
         }
         let preview = self.redactor.redact(&preview).into_owned();
         self.info(format!("message to {} in {id}: {preview}", node.label), cx);
-        Ok(AgentSendResult { sent: true })
     }
 
     /// `space.open`: open the active space `name` (starting its panes, as clicking it on Home does) and show it.

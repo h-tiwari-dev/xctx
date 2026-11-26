@@ -915,6 +915,7 @@ mod tests {
                     space: "s".into(),
                     agent: "helper-browser-1".into(),
                     text: "Parent Agent here: open /login and click Sign in".into(),
+                    while_running: None,
                 }),
             },
             "the agent written to is never defaulted"

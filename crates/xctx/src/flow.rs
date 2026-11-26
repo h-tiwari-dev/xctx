@@ -27,7 +27,8 @@ use crate::workspace::Workspace;
 /// The plugin a Browser helper drives.
 const BROWSER_PLUGIN: &str = "browser";
 
-/// What each agent of `graph` in `tab` is doing, as its pane's terminal shows: running, exited, or no pane.
+/// What each agent of `graph` in `tab` is doing, as its pane's terminal shows: running, exited, or no pane. Agents
+/// run over RPC are left out: their graph state comes from their frames, so it is what they show.
 pub(crate) fn pane_lives(
     graph: &AgentGraph,
     tab: &SpaceTab,
@@ -36,12 +37,13 @@ pub(crate) fn pane_lives(
     graph
         .nodes()
         .iter()
-        .map(|node| {
+        .filter_map(|node| {
             let terminal = node
                 .pane_id
                 .and_then(|pane| tab.terminals.get(&PaneId(pane)));
             let live = match terminal {
                 None => PaneLive::NoPane,
+                Some(PaneTerminal::Omp(_)) => return None,
                 // The shell opened after an agent quit is not the agent.
                 Some(PaneTerminal::Running {
                     after_agent: true, ..
@@ -50,7 +52,7 @@ pub(crate) fn pane_lives(
                 Some(PaneTerminal::Running { exited, .. }) => PaneLive::Exited(exited.flatten()),
                 Some(PaneTerminal::Failed(_)) => PaneLive::Exited(None),
             };
-            (node.id.clone(), live)
+            Some((node.id.clone(), live))
         })
         .collect()
 }

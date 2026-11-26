@@ -216,6 +216,10 @@ impl Workspace {
                         let live = lives
                             .as_ref()
                             .and_then(|lives| lives.get(&agent.id).copied());
+                        let activity = match tab.and_then(|tab| tab.rpc_retry_badge(&agent.id)) {
+                            Some(badge) => badge.to_owned(),
+                            None => agent_activity(&agent.state, live, &agent.activity),
+                        };
                         RosterAgentItem {
                             id: agent.id.as_str().to_owned().into(),
                             label: agent.label.clone().into(),
@@ -223,7 +227,7 @@ impl Workspace {
                                 .color_index
                                 .map_or(theme.accent, |index| theme.agent_color(index)),
                             state: agent_row_state(&agent.state, live),
-                            activity: agent_activity(&agent.state, live, &agent.activity).into(),
+                            activity: activity.into(),
                         }
                     })
                     .collect();

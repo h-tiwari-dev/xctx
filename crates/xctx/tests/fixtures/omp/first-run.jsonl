@@ -1,0 +1,20 @@
+< {"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}
+> {"id":"neg","type":"negotiate_protocol","protocolVersion":2}
+< {"id":"neg","type":"response","command":"negotiate_protocol","success":true,"data":{"protocolVersion":2}}
+> {"id":"st","type":"get_state"}
+< {"id":"st","type":"response","command":"get_state","success":true,"data":{"sessionId":"sess-1","sessionFile":"{sessionDir}/sess-1.jsonl","isStreaming":false}}
+> {"id":"p1","type":"prompt","message":"make checkout retries safe"}
+< {"id":"p1","type":"response","command":"prompt","success":true}
+< {"type":"agent_start"}
+< {"type":"turn_start"}
+< {"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"make checkout retries safe"}],"attribution":"user"},"messageId":"msg-1"}
+< {"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"make checkout retries safe"}],"attribution":"user"},"messageId":"msg-1"}
+< {"type":"message_start","message":{"role":"assistant","content":[]},"messageId":"msg-2"}
+< {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Retries now reuse one idempotency key."}],"stopReason":"stop"},"messageId":"msg-2"}
+< {"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"Retries now reuse one idempotency key."}]}}
+< {"type":"agent_end","messages":[]}
+< {"type":"prompt_result","id":"p1","agentInvoked":true,"status":"completed","sessionSettled":true}
+< {"type":"session_settled"}
+> {"id":"st2","type":"get_state"}
+! touch {sessionDir}/sess-1.jsonl
+< {"id":"st2","type":"response","command":"get_state","success":true,"data":{"sessionId":"sess-1","sessionFile":"{sessionDir}/sess-1.jsonl","isStreaming":false,"isSettled":true}}

@@ -72,6 +72,12 @@ pub(crate) struct Workspace {
     pub(crate) scanning: bool,
     scan_generation: u64,
     pub(crate) root_input: Entity<PromptInput>,
+    /// The task composer input on Home that sends prompts to the Parent Agent.
+    pub(crate) task_input: Entity<PromptInput>,
+    /// Whether the Parent Agent's terminal card is shown on Home.
+    pub(crate) home_agent_open: bool,
+    /// Whether the indexed-folders panel is shown on Home.
+    pub(crate) home_roots_open: bool,
     pub(crate) view: View,
     /// Open space tabs, by space; a space's terminals start when it is first shown.
     pub(crate) tabs: HashMap<SpaceId, SpaceTab>,
@@ -105,6 +111,8 @@ pub(crate) struct Workspace {
     pub(crate) widen_approvals: HashSet<ItemId>,
     /// Each space's competing attempts, loaded when first needed.
     pub(crate) attempts: SpaceAttempts,
+    /// The data directory (the store's), which holds the RPC agents' session folders; `None` when there is none.
+    pub(crate) data_dir: Option<PathBuf>,
     /// Spaces whose fork, adopt or discard of attempts is running: one at a time per space, and no Ship or
     /// Discard of the space meanwhile.
     pub(crate) attempt_jobs: HashSet<SpaceId>,
@@ -210,12 +218,19 @@ impl Workspace {
         let (inbox, inbox_error) = Workspace::open_inbox();
         let root_input =
             cx.new(|cx| PromptInput::new(cx).placeholder("A folder with your repos, e.g. ~/code"));
+        let task_input = cx.new(|cx| {
+            PromptInput::new(cx)
+                .multiline(true)
+                .borderless(true)
+                .placeholder("What are we building?")
+        });
         let plan_repo_input = cx.new(|cx| {
             PromptInput::new(cx)
                 .placeholder("Add repos: type to search yours, or a folder such as ~/code/web")
         });
         let palette = cx.new(|cx| CommandPalette::new(window, cx));
         let subscriptions = vec![
+            cx.observe(&task_input, |_, _, cx| cx.notify()),
             cx.observe(&plan_repo_input, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.apply_theme(window.appearance(), cx);
@@ -234,6 +249,15 @@ impl Workspace {
                 |this, _, event: &PromptEvent, _, cx| {
                     if let PromptEvent::Submit(path) = event {
                         this.add_root(path.clone(), cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &task_input,
+                window,
+                |this, _, event: &PromptEvent, window, cx| {
+                    if let PromptEvent::Submit(text) = event {
+                        this.submit_task(text.clone(), window, cx);
                     }
                 },
             ),
@@ -272,6 +296,9 @@ impl Workspace {
             scanning: false,
             scan_generation: 0,
             root_input,
+            task_input,
+            home_agent_open: false,
+            home_roots_open: false,
             view: View::Home,
             tabs: HashMap::new(),
             dialog: None,
@@ -292,6 +319,7 @@ impl Workspace {
             graphs: SpaceGraphs::new(data_dir.clone()),
             widen_approvals: HashSet::new(),
             attempts: SpaceAttempts::new(data_dir.clone()),
+            data_dir: data_dir.clone(),
             attempt_jobs: HashSet::new(),
             unsaved_adoptions: HashMap::new(),
             sessions: SessionStorage::from_env(),
@@ -503,11 +531,15 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Give keyboard focus to Home's input: the Parent Agent's terminal, else the window.
+    /// Give keyboard focus to Home's input: the Parent Agent's terminal when its drawer is open and running,
+    /// else the task composer input.
     pub(crate) fn focus_home(&self, window: &mut Window, cx: &mut Context<Self>) {
-        match &self.parent.view {
-            Some(view) => view.focus_handle(cx).focus(window, cx),
-            None => self.focus_handle.focus(window, cx),
+        if self.home_agent_open
+            && let Some(view) = &self.parent.view
+        {
+            view.focus_handle(cx).focus(window, cx);
+        } else {
+            self.task_input.focus_handle(cx).focus(window, cx);
         }
     }
 

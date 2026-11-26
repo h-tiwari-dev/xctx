@@ -1,0 +1,5 @@
+< {"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}
+> {"id":"neg","type":"negotiate_protocol","protocolVersion":2}
+< {"id":"neg","type":"response","command":"negotiate_protocol","success":true,"data":{"protocolVersion":2}}
+> {"id":"lease","type":"get_session_lease","sessionIds":["sess-1"]}
+< {"id":"lease","type":"response","command":"get_session_lease","success":true,"data":{"held":[],"unknown":[]}}

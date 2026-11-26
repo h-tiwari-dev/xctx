@@ -19,6 +19,8 @@ mod keymap;
 mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
+mod omp_agent;
+mod omp_panes;
 mod overlays;
 mod parent_agent;
 mod persist;

@@ -6,7 +6,7 @@
 //! tested without touching the user's `PATH` or home directory. The one exception is the scratch directory, which
 //! follows `XCTX_DATA_DIR` (see [`scratch_dir_for`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
@@ -380,17 +380,175 @@ pub struct PaneAgent {
 }
 
 impl PaneLaunch {
-    /// The same launch, run as `agent` when there is one: [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`] are set. Without
-    /// one they stay empty, as [`pane_launch`] sets them.
+    /// The same launch, run as `agent` when there is one: [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`] are set (see
+    /// [`agent_env`]). Without one they stay empty, as [`pane_launch`] sets them.
     pub fn with_agent(mut self, agent: Option<&PaneAgent>) -> PaneLaunch {
         if let Some(agent) = agent {
-            self.config = self
-                .config
-                .env(AGENT_ID_ENV, agent.id.clone())
-                .env(AGENT_ROLE_ENV, agent.role.clone());
+            self.config.env.extend(agent_env(agent));
         }
         self
     }
+}
+
+/// The variables that make a pane's program run as `agent`: [`AGENT_ID_ENV`] and [`AGENT_ROLE_ENV`].
+pub fn agent_env(agent: &PaneAgent) -> [(String, String); 2] {
+    [
+        (AGENT_ID_ENV.to_owned(), agent.id.clone()),
+        (AGENT_ROLE_ENV.to_owned(), agent.role.clone()),
+    ]
+}
+
+static EMPTY_ENV: BTreeMap<String, String> = BTreeMap::new();
+
+/// The environment every pane program of `space` gets on top of xctx's own, terminal or RPC child alike: the
+/// runner's `[env]` (`runner_env`), then the space's `PORT`, `XCTX_SPACE` and `MISE_ENV`, [`AGENT_ID_ENV`],
+/// [`AGENT_ROLE_ENV`], [`ATTEMPT_ID_ENV`] and [`ATTEMPT_TOKEN_ENV`] set empty (so an outer xctx's agent identity
+/// never leaks in), the space's scratch directory as [`SCRATCH_DIR_ENV`], `XCTX_CONTROL_SOCKET` when the control
+/// socket is serving, and the pane `PATH` for `program` (see [`ProgramSearch::pane_path`]).
+pub fn pane_env(
+    space: &Space,
+    search: &ProgramSearch,
+    program: Option<&Path>,
+    runner_env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = runner_env.clone();
+    env.extend(space.env());
+    for key in [
+        AGENT_ID_ENV,
+        AGENT_ROLE_ENV,
+        ATTEMPT_ID_ENV,
+        ATTEMPT_TOKEN_ENV,
+    ] {
+        env.insert(key.to_owned(), String::new());
+    }
+    if let Ok(scratch) = scratch_dir_for(space.id.as_str()) {
+        env.insert(
+            SCRATCH_DIR_ENV.to_owned(),
+            scratch.root().to_string_lossy().into_owned(),
+        );
+    }
+    if let Some(control) = &search.control {
+        env.insert(
+            xctx_control::CONTROL_SOCKET_ENV.to_owned(),
+            control.socket.to_string_lossy().into_owned(),
+        );
+    }
+    env.insert("PATH".to_owned(), search.pane_path(program));
+    env
+}
+
+/// How an RPC runner's agent starts as a child process (see [`rpc_launch`]). omp's own `--mode rpc-ui` is added
+/// by `xctx_omp::OmpClient::start`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcLaunch {
+    /// The program, found as a terminal pane would find it.
+    pub program: PathBuf,
+    /// The runner's skills arguments, then its `rpc_args`: everything but the session folder.
+    pub base_args: Vec<String>,
+    /// The agent's own worktree, where it runs.
+    pub cwd: PathBuf,
+    /// Exactly the environment a terminal pane of the same agent gets ([`pane_env`] and [`agent_env`]).
+    pub env: BTreeMap<String, String>,
+    /// The agent's own session folder, given as `--session-dir`.
+    pub session_dir: PathBuf,
+}
+
+impl RpcLaunch {
+    /// The arguments the agent's child runs with: [`RpcLaunch::base_args`], then `--session-dir <dir>`.
+    pub fn args(&self) -> Vec<String> {
+        let mut args = self.base_args.clone();
+        args.push("--session-dir".to_owned());
+        args.push(self.session_dir.to_string_lossy().into_owned());
+        args
+    }
+
+    /// The arguments of a short-lived child that only answers questions about sessions (such as
+    /// `get_session_lease`): [`RpcLaunch::base_args`], then `--no-session`, so it opens and holds none.
+    pub fn probe_args(&self) -> Vec<String> {
+        let mut args = self.base_args.clone();
+        args.push("--no-session".to_owned());
+        args
+    }
+}
+
+/// How the agent of pane `role` in `space`, running RPC runner `runner` as `agent`, starts as an RPC child: in
+/// its worktree, with the environment a terminal pane gets (one function builds both, see [`pane_env`]), the
+/// runner's skills overlay unchanged, its `rpc_args`, and `session_dir` as its session folder. No approval,
+/// `--no-ui` or `--add-dir` flag is ever added (the manifest refuses them in `rpc_args`). Fails, saying why, when
+/// the runner is not an RPC runner, its program is missing, or the pane has no worktree.
+pub fn rpc_launch(
+    space: &Space,
+    role: &PaneRole,
+    search: &ProgramSearch,
+    runner: &RunnerManifest,
+    agent: Option<&PaneAgent>,
+    session_dir: &Path,
+) -> Result<RpcLaunch, String> {
+    if !runner.is_rpc() {
+        return Err(format!("runner {} does not run over RPC", runner.name));
+    }
+    let program = find_runner_program(search, &runner.program).ok_or_else(|| {
+        format!(
+            "{} was not found on PATH, in ~/.pi/agent/bin, ~/.local/bin, /opt/homebrew/bin or \
+             /usr/local/bin",
+            runner.program
+        )
+    })?;
+    let cwd = pane_worktree(space, role)
+        .ok_or_else(|| format!("space {} has no worktree for {}", space.id, role.repo))?
+        .to_path_buf();
+    let mut base_args = match &search.skills {
+        Some(dir) => xctx_plugin::skills_args(runner, dir).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    base_args.extend(runner.rpc_args.iter().cloned());
+    let mut env = pane_env(space, search, Some(&program), &runner.env);
+    if let Some(agent) = agent {
+        env.extend(agent_env(agent));
+    }
+    Ok(RpcLaunch {
+        program,
+        base_args,
+        cwd,
+        env,
+        session_dir: session_dir.to_path_buf(),
+    })
+}
+
+/// "Open in terminal" for an RPC agent: the launch of [`pane_launch_for_runner`] for a fresh agent of `runner`,
+/// run as `agent`, whose arguments resume omp session `session` (when one was recorded) in the agent's own
+/// session folder: the skills arguments, `extra_args`, then `--resume <id> --session-dir <dir>`, or only
+/// `--session-dir <dir>` when no session was recorded yet.
+pub fn terminal_resume_launch(
+    space: &Space,
+    role: &PaneRole,
+    search: &ProgramSearch,
+    runner: &RunnerManifest,
+    agent: Option<&PaneAgent>,
+    session: Option<&str>,
+    session_dir: &Path,
+) -> PaneLaunch {
+    let mut launch = pane_launch_for_runner(
+        space,
+        role,
+        &AgentStart::Fresh,
+        &AgentSession::Unnamed,
+        search,
+        Some(runner),
+    )
+    .with_agent(agent);
+    if launch.notice.is_some() {
+        return launch;
+    }
+    // A fresh start with no session gives exactly the skills arguments and `extra_args`.
+    let args = &mut launch.config.args;
+    if let Some(id) = session {
+        args.push("--resume".to_owned());
+        args.push(id.to_owned());
+    }
+    args.push("--session-dir".to_owned());
+    args.push(session_dir.to_string_lossy().into_owned());
+    launch
 }
 
 /// The worktree a pane of `role` works in: its repo's worktree, else the space's first repo's.
@@ -521,7 +679,7 @@ pub fn pane_launch_for_runner(
 ) -> PaneLaunch {
     let mut stdin = None;
     let mut session_named = false;
-    let mut runner_env: Vec<(String, String)> = Vec::new();
+    let mut runner_env: &BTreeMap<String, String> = &EMPTY_ENV;
     let (program, args, notice) = match role.kind {
         PaneKind::Shell => (None, Vec::new(), None),
         // A plugin pane's own command is chosen by the plugin (see `plugin_pane_launch`); without one it opens a
@@ -540,11 +698,7 @@ pub fn pane_launch_for_runner(
                     Ok((args, named)) => {
                         session_named = named;
                         stdin = stdin_task(runner, &runner_start(agent)).map(str::to_owned);
-                        runner_env = runner
-                            .env
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
+                        runner_env = &runner.env;
                         (Some(path), args, None)
                     }
                     Err(e) => (
@@ -595,27 +749,9 @@ pub fn pane_launch_for_runner(
     if let Some(worktree) = pane_worktree(space, role) {
         config = config.cwd(worktree);
     }
-    for (key, value) in runner_env {
-        config = config.env(key, value);
-    }
-    for (key, value) in space.env() {
-        config = config.env(key, value);
-    }
-    config = config
-        .env(AGENT_ID_ENV, "")
-        .env(AGENT_ROLE_ENV, "")
-        .env(ATTEMPT_ID_ENV, "")
-        .env(ATTEMPT_TOKEN_ENV, "");
-    if let Ok(scratch) = scratch_dir_for(space.id.as_str()) {
-        config = config.env(SCRATCH_DIR_ENV, scratch.root().to_string_lossy());
-    }
-    if let Some(control) = &search.control {
-        config = config.env(
-            xctx_control::CONTROL_SOCKET_ENV,
-            control.socket.to_string_lossy(),
-        );
-    }
-    config = config.env("PATH", search.pane_path(program.as_deref()));
+    config
+        .env
+        .extend(pane_env(space, search, program.as_deref(), runner_env));
     PaneLaunch {
         config,
         notice,
