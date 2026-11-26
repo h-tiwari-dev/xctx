@@ -270,6 +270,7 @@ impl Workspace {
         self.start_plugin_pane(id, &pane, window, cx);
         self.layout_changed(id, window, cx);
         self.info(format!("Mounted {plugin} in {id}"), cx);
+        self.plugins_changed(id);
         Ok(pane.id)
     }
 
@@ -323,6 +324,7 @@ impl Workspace {
         if let Err(e) = self.plugins.remove_mount(id, pane) {
             self.error(format!("could not record the unmount: {e}"), cx);
         }
+        self.plugins_changed(id);
     }
 
     /// Stop what the plugins of `id` run, as its tab closes.

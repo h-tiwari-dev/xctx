@@ -142,6 +142,8 @@ pub(crate) struct Workspace {
     pub(crate) plugin_panes: crate::plugin_panes::PluginPanes,
     /// The open spaces' live browsers (the browser panes' pages), drawn over the window.
     pub(crate) browsers: crate::plugin_browser::Browsers,
+    /// The hint bubbles for local servers seen in the open spaces' terminals.
+    pub(crate) serve_hints: crate::serve_hints::ServeHints,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -185,6 +187,7 @@ impl Workspace {
             .as_ref()
             .map(|store| store.dir().to_path_buf())
             .or_else(|| xctx_core::store::data_dir().ok());
+        let agent_skills = data_dir.as_deref().map(crate::agent_skills::install);
         let (inbox, inbox_error) = Workspace::open_inbox();
         let root_input =
             cx.new(|cx| PromptInput::new(cx).placeholder("A folder with your repos, e.g. ~/code"));
@@ -283,6 +286,7 @@ impl Workspace {
             plugin_ticker: false,
             plugin_panes: Default::default(),
             browsers: Default::default(),
+            serve_hints: Default::default(),
             _subscriptions: subscriptions,
         };
         // The window's close button must not end a launch, ship or discard halfway.
@@ -291,9 +295,17 @@ impl Workspace {
             weak.update(cx, |this, cx| !this.refuse_while_busy(cx))
                 .unwrap_or(true)
         });
+        match agent_skills {
+            Some(Ok(skills)) => workspace.search.skills = Some(skills),
+            Some(Err(e)) => {
+                workspace.error(format!("could not write xctx's agent skills: {e}"), cx)
+            }
+            None => {}
+        }
         // Before any pane starts, so every pane gets the socket.
         workspace.start_control(window, cx);
         workspace.start_parent_agent(window, cx);
+        workspace.start_serve_hints(cx);
         if let Some(e) = workspace.inbox_error.clone() {
             workspace.error(e, cx);
         }

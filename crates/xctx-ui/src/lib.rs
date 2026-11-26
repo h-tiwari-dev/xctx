@@ -63,8 +63,9 @@ pub use overlay::{Overlay, OverlayPlacement};
 pub use parent_agent::{AgentStatus, DRAWER_HEIGHT, PARENT_AGENT_ROLE, ParentAgentDrawer};
 pub use plan_gate::{PLAN_GATE_HINT, PLAN_NEEDS_REPO, PlanGateCard, PlanGateView, PlanRepo};
 pub use plugin_menu::{
-    PLUGIN_MENU_EMPTY, PLUGIN_PROBLEM_LIMIT, PLUGIN_ROW_LIMIT, PLUGIN_TRUST_HINT, PluginEntry,
-    PluginMenu, PluginMenuView, PluginProblemRow, PluginSource,
+    MountedEntry, PLUGIN_MENU_EMPTY, PLUGIN_PROBLEM_LIMIT, PLUGIN_ROW_LIMIT, PLUGIN_TRUST_HINT,
+    PluginEntry, PluginGroup, PluginMenu, PluginMenuView, PluginProblemRow, PluginSetting,
+    PluginSource,
 };
 pub use prompt::{PromptBuffer, PromptEvent, PromptInput};
 pub use repo_picker::{RepoChoice, RepoPicker};

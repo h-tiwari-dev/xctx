@@ -5,6 +5,7 @@ mod add_agent;
 mod add_repo;
 mod agent_brief;
 mod agent_session;
+mod agent_skills;
 mod attempt_jobs;
 mod attempt_ui;
 mod attempts;
@@ -29,6 +30,7 @@ mod plugin_panes;
 #[cfg(test)]
 mod plugin_tests;
 mod repo_links;
+mod serve_hints;
 mod space_graph;
 mod space_layout;
 mod space_tab;

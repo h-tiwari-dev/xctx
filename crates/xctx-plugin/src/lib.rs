@@ -41,6 +41,6 @@ pub use registry::{LoadProblem, Plugin, REPO_PLUGINS_DIR, Registry, Source, mani
 pub use run::{ToolOutput, run_plan, run_plan_isolated};
 pub use runner::{
     ArgsTemplate, BUILTIN_RUNNERS, Capability, DEFAULT_RUNNER, RUNNER_FILE, Runner, RunnerError,
-    RunnerManifest, RunnerProblem, RunnerRegistry, RunnerSession, RunnerStart, TaskStyle,
-    build_args, builtin_runner_origin, stdin_task,
+    RunnerManifest, RunnerProblem, RunnerRegistry, RunnerSession, RunnerStart,
+    SKILLS_DIR_PLACEHOLDER, TaskStyle, build_args, builtin_runner_origin, skills_args, stdin_task,
 };

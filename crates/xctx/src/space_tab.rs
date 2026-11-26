@@ -1048,9 +1048,12 @@ impl Workspace {
                 let terminal = tab.terminals.get(&pane.id);
                 let title = pane_title(&pane.role, terminal);
                 let content: AnyElement = match terminal {
-                    Some(PaneTerminal::Running { view, .. }) => {
-                        div().size_full().child(view.clone()).into_any_element()
-                    }
+                    Some(PaneTerminal::Running { view, .. }) => div()
+                        .relative()
+                        .size_full()
+                        .child(view.clone())
+                        .children(self.render_serve_hint(&tab.space.id, pane.id, cx))
+                        .into_any_element(),
                     Some(PaneTerminal::Failed(message)) => div()
                         .size_full()
                         .p(Theme::SPACE_3)

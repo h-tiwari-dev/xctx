@@ -124,9 +124,9 @@ impl Default for ParentAgent {
     }
 }
 
-/// The config that starts the Parent Agent: `omp --continue` with only [`PARENT_AGENT_TOOLS`] and
-/// [`PARENT_AGENT_PROMPT`], in `dir`, with the control socket and `xctx-ctl` from `search`. Fails, saying why,
-/// when `omp` cannot be found.
+/// The config that starts the Parent Agent: `omp --continue` with only [`PARENT_AGENT_TOOLS`],
+/// [`PARENT_AGENT_PROMPT`] and xctx's agent skills (when `search` has their folder), in `dir`, with the control
+/// socket and `xctx-ctl` from `search`. Fails, saying why, when `omp` cannot be found.
 pub fn parent_agent_config(search: &ProgramSearch, dir: &Path) -> Result<TerminalConfig, String> {
     let Some(program) = search.find(PARENT_AGENT_PROGRAM) else {
         return Err(format!(
@@ -134,13 +134,27 @@ pub fn parent_agent_config(search: &ProgramSearch, dir: &Path) -> Result<Termina
              /usr/local/bin, so the Parent Agent cannot run. Install {PARENT_AGENT_PROGRAM} and press Restart."
         ));
     };
-    let mut config = TerminalConfig::new(program.to_string_lossy()).args([
-        "--continue",
-        "--tools",
-        PARENT_AGENT_TOOLS,
-        "--append-system-prompt",
-        PARENT_AGENT_PROMPT,
-    ]);
+    let mut args: Vec<String> = Vec::new();
+    if let Some(skills) = &search.skills {
+        args.push("--config".to_owned());
+        args.push(
+            skills
+                .join(crate::agent_skills::OMP_CONFIG_FILE)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    args.extend(
+        [
+            "--continue",
+            "--tools",
+            PARENT_AGENT_TOOLS,
+            "--append-system-prompt",
+            PARENT_AGENT_PROMPT,
+        ]
+        .map(str::to_owned),
+    );
+    let mut config = TerminalConfig::new(program.to_string_lossy()).args(args);
     config = config.cwd(dir);
     if let Some(control) = &search.control {
         config = config.env(
@@ -248,6 +262,7 @@ mod tests {
             shell: Some("/bin/zsh".to_owned()),
             system_dirs: Vec::new(),
             control: None,
+            skills: None,
         }
     }
 

@@ -51,6 +51,9 @@ pub struct ProgramSearch {
     /// The window's control socket and where `xctx-ctl` is, given to every pane; `None` when the socket is not
     /// serving.
     pub control: Option<ControlEnv>,
+    /// The folder of xctx's agent skills (see [`crate::agent_skills`]), given to agents whose runner loads
+    /// skills; `None` when it could not be written.
+    pub skills: Option<PathBuf>,
 }
 
 /// What panes need to drive the window: `XCTX_CONTROL_SOCKET`, and `xctx-ctl` on their `PATH`.
@@ -192,6 +195,7 @@ impl ProgramSearch {
             shell: shell.filter(|s| !s.is_empty()),
             system_dirs: SYSTEM_PROGRAM_DIRS.iter().map(PathBuf::from).collect(),
             control: None,
+            skills: None,
         }
     }
 
@@ -525,7 +529,14 @@ pub fn pane_launch_for_runner(
         PaneKind::Plugin => (None, Vec::new(), None),
         PaneKind::Agent => match runner.or(default_runner()) {
             Some(runner) => match find_runner_program(search, &runner.program) {
-                Some(path) => match runner_args(runner, agent, session) {
+                Some(path) => match runner_args(runner, agent, session).and_then(|(args, named)| {
+                    let mut all = match &search.skills {
+                        Some(dir) => xctx_plugin::skills_args(runner, dir)?,
+                        None => Vec::new(),
+                    };
+                    all.extend(args);
+                    Ok((all, named))
+                }) {
                     Ok((args, named)) => {
                         session_named = named;
                         stdin = stdin_task(runner, &runner_start(agent)).map(str::to_owned);
@@ -771,6 +782,7 @@ mod tests {
             shell: Some("/bin/fish".to_owned()),
             system_dirs: Vec::new(),
             control: None,
+            skills: None,
         }
     }
 
@@ -862,6 +874,32 @@ mod tests {
         );
         assert_eq!(launch.config.args, ["--continue"]);
         assert_space_env(&launch, &space.repos[0].worktree);
+        Ok(())
+    }
+
+    #[test]
+    fn agents_get_the_skills_overlay_before_their_task_or_resume() -> TestResult {
+        let root = tempfile::tempdir()?;
+        executable(&root.path().join("bin/omp"))?;
+        let space = space(root.path());
+        let skills = root.path().join("data/agent-skills");
+        let with_skills = ProgramSearch {
+            skills: Some(skills.clone()),
+            ..search(root.path())
+        };
+        let overlay = skills.join("omp-config.yml").to_string_lossy().into_owned();
+        let agent = role(PaneKind::Agent, "api");
+        let fresh = pane_launch(&space, &agent, &AgentStart::Task("go".into()), &with_skills);
+        assert_eq!(fresh.config.args, ["--config", &overlay, "--", "go"]);
+        let resumed = pane_launch(&space, &agent, &AgentStart::Continue, &with_skills);
+        assert_eq!(resumed.config.args, ["--config", &overlay, "--continue"]);
+        let shell = pane_launch(
+            &space,
+            &role(PaneKind::Shell, "api"),
+            &AgentStart::Continue,
+            &with_skills,
+        );
+        assert_eq!(shell.config.args, ["-l"], "only agents load skills");
         Ok(())
     }
 
@@ -1176,6 +1214,7 @@ mod tests {
             shell: None,
             system_dirs: SYSTEM_PROGRAM_DIRS.iter().map(PathBuf::from).collect(),
             control: None,
+            skills: None,
         };
         assert_eq!(
             search.pane_path(Some(Path::new("/Users/me/.pi/agent/bin/pi"))),

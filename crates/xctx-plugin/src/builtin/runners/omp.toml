@@ -10,3 +10,7 @@ task = { style = "after-double-dash" }
 
 # Resume the worktree's most recent session.
 resume = ["--continue"]
+
+# xctx's agent skills (such as opening the space's browser beside the agent), through an `omp --config` overlay
+# that lists the skills folder in `skills.customDirectories`.
+skills = ["--config", "{skills_dir}/omp-config.yml"]

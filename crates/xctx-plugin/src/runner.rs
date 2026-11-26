@@ -10,8 +10,12 @@
 //! open_session = ["--session-id", "{session}"]   # optional: open or create the named session
 //! fork_session = ["--fork", "{source}", "--session-id", "{session}"]   # optional: copy a session
 //! extra_args = []                                # optional: given first, every time, as written
+//! skills = ["--config", "{skills_dir}/omp-config.yml"]   # optional: load xctx's agent skills
 //! [env]                                          # optional: set in the agent's environment
 //! ```
+//!
+//! In `skills`, `{skills_dir}` is the folder of skills xctx gives every agent session (`<name>/SKILL.md` each),
+//! which also holds `omp-config.yml`, an `omp --config` overlay listing that folder in `skills.customDirectories`.
 //!
 //! In the session templates, `{session}` is the session xctx names and `{source}` the session (an id or a session
 //! file) being forked; `{{`/`}}` are literal braces. A placeholder fills its own element and never adds or splits
@@ -50,6 +54,9 @@ pub const SESSION_PLACEHOLDER: &str = "session";
 
 /// The placeholder for the session being forked, in `fork_session`.
 pub const SOURCE_PLACEHOLDER: &str = "source";
+
+/// The placeholder for the folder of xctx's agent skills, in `skills`.
+pub const SKILLS_DIR_PLACEHOLDER: &str = "skills_dir";
 
 /// What a runner can be asked to do, named in [`RunnerError::Unsupported`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +190,8 @@ pub struct RunnerManifest {
     pub fork_session: Option<ArgsTemplate>,
     /// Arguments given first, every time, as written (no placeholders).
     pub extra_args: Vec<String>,
+    /// The arguments that load the skills in folder `{skills_dir}` (see [`skills_args`]).
+    pub skills: Option<ArgsTemplate>,
     /// Environment variables set for the program, by name.
     pub env: BTreeMap<String, String>,
 }
@@ -333,6 +342,24 @@ pub fn stdin_task<'a>(runner: &RunnerManifest, start: &'a RunnerStart) -> Option
         (RunnerStart::Task(task), TaskStyle::Stdin) => Some(task),
         _ => None,
     }
+}
+
+/// The arguments that give `runner` the agent skills in `dir`, placed before its other arguments; empty for a
+/// runner whose manifest has no `skills`.
+pub fn skills_args(runner: &RunnerManifest, dir: &Path) -> Result<Vec<String>, RunnerError> {
+    let Some(skills) = &runner.skills else {
+        return Ok(Vec::new());
+    };
+    let dir = dir.to_string_lossy();
+    skills
+        .fill(&[(SKILLS_DIR_PLACEHOLDER, &dir)])
+        .map_err(|message| {
+            RunnerError::Manifest(PluginError::Invalid {
+                origin: format!("runner {}", runner.name),
+                field: "skills".to_owned(),
+                message,
+            })
+        })
 }
 
 /// The origin a built-in runner manifest is named by in errors.
@@ -525,6 +552,7 @@ struct RawRunner {
     fork_session: Option<Vec<String>>,
     #[serde(default)]
     extra_args: Vec<String>,
+    skills: Option<Vec<String>>,
     #[serde(default)]
     env: BTreeMap<String, String>,
 }
@@ -621,6 +649,13 @@ impl RawRunner {
             &[SOURCE_PLACEHOLDER, SESSION_PLACEHOLDER],
             &[SOURCE_PLACEHOLDER, SESSION_PLACEHOLDER],
         )?;
+        let skills = template_field(
+            &err,
+            "skills",
+            self.skills,
+            &[SKILLS_DIR_PLACEHOLDER],
+            &[SKILLS_DIR_PLACEHOLDER],
+        )?;
         for name in self.env.keys() {
             if !is_env_name(name) {
                 return Err(err(
@@ -638,6 +673,7 @@ impl RawRunner {
             open_session,
             fork_session,
             extra_args: self.extra_args,
+            skills,
             env: self.env,
         })
     }
@@ -948,6 +984,22 @@ AGENT_MODE = "xctx"
         assert!(args(&none, &RunnerStart::Fresh, &RunnerSession::Unnamed).is_empty());
         let refused = build_args(&none, &task, &RunnerSession::Unnamed);
         assert!(refused.is_err_and(|e| e.to_string() == "runner agent cannot be given a task"));
+        Ok(())
+    }
+
+    #[test]
+    fn skills_fill_the_skills_folder_and_need_its_placeholder() -> TestResult {
+        let dir = Path::new("/data/agent skills");
+        assert_eq!(
+            skills_args(&builtin("omp")?, dir)?,
+            ["--config", "/data/agent skills/omp-config.yml"],
+            "a path with a space stays one argument"
+        );
+        assert!(skills_args(&builtin("pi")?, dir)?.is_empty());
+        assert_eq!(
+            invalid_field(&format!("{MINIMAL}skills = [\"--config\", \"x.yml\"]\n")),
+            "skills"
+        );
         Ok(())
     }
 

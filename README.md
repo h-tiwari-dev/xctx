@@ -19,9 +19,12 @@ xctx is an agent multiplexer for macOS: a native desktop app built with Rust and
 
 **Milestone 4 (complete):** git-branch a writer agent into competing attempts, each with its own worktree, `PORT` and forked `pi` session. Compare them on a review sheet (⌘⇧R), adopt the winner and discard the rest. Fork with ⌘⇧F. See [`docs/m4.md`](docs/m4.md).
 
-**Milestone 5 (complete):** plugins are live panes and agent tools. ⌘⇧P opens a space's Plugins menu, which mounts
-first-party plugins (terminal, logs, API client, database, browser, Jira, Figma) and plugins from user or repo
-`plugin.toml` manifests (repo plugins need trust first). Agents call a plugin's tools over the harness, and every
+**Milestone 5 (complete):** plugins are live panes and agent tools. ⌘⇧P opens a space's Plugins menu: what is in the
+space (Show focuses a plugin's pane, Remove unmounts it) and what can be added, grouped into panes, tools and
+connectors: first-party plugins (terminal, logs, API client, database, browser, files, Jira, Figma) and plugins from
+user or repo `plugin.toml` manifests (repo plugins need approval first). One click adds a plugin; one that takes a
+setting (a command, a database, a URL) opens an inline input prefilled with a default, such as the space's dev
+server or `http://localhost:$PORT`. Agents call a plugin's tools over the harness, and every
 write waits for approval in the Inbox. A plugin's events can start or stop the space's loop. See
 [`docs/m5.md`](docs/m5.md).
 
@@ -35,6 +38,8 @@ No further milestone is planned yet; see [`docs/roadmap.md`](docs/roadmap.md).
 - **In a space**, every agent card in the graph panel (⌘G) has **Open** or **Start**. New lanes (the orchestrator, helpers, the writer of an added repo) start with a brief of their role instead of a bare prompt. Closing an agent's pane keeps the agent: **+ Agent** in the tab bar lists the agents with no pane (**Start** brings one back) and adds helpers. **+ Repo** (tab bar or the graph's Writers row) adds as many repos as you pick in one go, each with its own worktree, writer and agent pane: click repos in the list, type to search and press Enter for the top match, or **Choose folders…** (a folder of repos adds each one in it).
 - **The browser plugin** is a live WebKit view in its pane: browse any site there (a bare host like `google.com` gets `https://`), with Back, Forward, Reload, a loading badge, the console and failed requests in a strip at the bottom, and Web Inspector on right-click. Agents drive the same view with its tools (`page.open`, `page.click`, `page.type`, `page.text`, `page.screenshot`, `page.console`), so you watch them work; the tools only open and read the space's own app (`localhost:$PORT`) and refuse a page you browsed elsewhere.
 - **Helpers** include **Browser**, which tests the app in xctx's own browser plugin (`page.open`, `page.click`, `page.type`, `page.text`, `page.screenshot`, `page.console`) and never in an outside browser.
+- **Agent skills.** Every agent session xctx starts (agent panes and the Parent Agent, on the `omp` runner) loads xctx's skills, written at startup to `<data dir>/agent-skills` with an `omp --config` overlay beside them. `xctx-browser` tells an agent to open the space's app in xctx's browser beside it (mounting one when there is none, then `page.open`) whenever you ask to see the site or it starts a dev server, never an outside browser. A runner manifest opts in with `skills = ["--config", "{skills_dir}/omp-config.yml"]`. The overlay sets `skills.customDirectories`, which replaces a list you set yourself in omp's settings for those sessions.
+- **Hint bubbles.** When a terminal or agent pane prints a local URL (`http://localhost:3000`, `127.0.0.1:8000/api`, "listening on port 4000") and something answers on that port, a bubble on that pane offers **Open beside**: the space's browser for a site, the API client for an API. When an agent names a local URL nothing serves yet and its repo has a dev script, the bubble offers to run it in a terminal pane. Each URL is offered once per space; a site's bubble closes once the browser shows that page.
 - **Pane headers** show the repo's git host address (click copies it), its branch, **Files** (the in-app file explorer of the worktree) and **Git** (lazygit in it).
 - **Launch** sets up web apps: the first repo whose `package.json` names a web framework and a `dev` or `start` script gets a terminal pane running that script on the space's `PORT` (installing dependencies first when `node_modules` is missing) and xctx's browser on it. The space's other repos (a backend beside a frontend) get the API client.
 

@@ -87,6 +87,7 @@ impl Fixture {
             shell: Some("/bin/zsh".to_owned()),
             system_dirs: Vec::new(),
             control: None,
+            skills: None,
         };
         Ok(Fixture {
             _dir: dir,
