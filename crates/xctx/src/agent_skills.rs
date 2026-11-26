@@ -1,7 +1,8 @@
 //! The skills xctx gives every agent session it starts (agent panes and the Parent Agent): written at startup to
 //! `<data dir>/agent-skills/<name>/SKILL.md`, with `omp-config.yml` beside them, an `omp --config` overlay that
-//! lists the folder in `skills.customDirectories`. A runner loads them through its manifest's `skills` arguments
-//! (see [`xctx_plugin::skills_args`]); only the built-in `omp` runner has them.
+//! lists the folder in `skills.customDirectories` and turns off omp's own browser (`browser.enabled: false`, the
+//! Tern picture-in-picture one), so agents show pages in the space's browser pane. A runner loads them through its
+//! manifest's `skills` arguments (see [`xctx_plugin::skills_args`]); only the built-in `omp` runner has them.
 
 use std::fs;
 use std::io;
@@ -19,12 +20,14 @@ pub const SKILLS: &[(&str, &str)] = &[(
     include_str!("agent_skills/xctx-browser/SKILL.md"),
 )];
 
-/// The `omp --config` overlay that makes omp load the skills in `dir`.
+/// The `omp --config` overlay that makes omp load the skills in `dir` and leaves it no browser of its own.
 pub fn omp_config(dir: &Path) -> String {
     // A JSON string is a YAML double-quoted scalar, so any path (spaces, quotes) survives.
     let dir = serde_json::Value::String(dir.to_string_lossy().into_owned());
     format!(
-        "# Written by xctx at startup; edits are replaced.\nskills:\n  customDirectories:\n    - {dir}\n"
+        "# Written by xctx at startup; edits are replaced.\nskills:\n  customDirectories:\n    - {dir}\n\
+         # Pages open in the space's browser pane (the xctx-browser skill), not omp's own browser.\n\
+         browser:\n  enabled: false\n"
     )
 }
 
@@ -72,6 +75,10 @@ mod tests {
         assert!(
             overlay.contains(&format!("    - \"{}\"\n", dir.display())),
             "the folder is quoted, spaces and all: {overlay}"
+        );
+        assert!(
+            overlay.ends_with("browser:\n  enabled: false\n"),
+            "omp's own browser is off: {overlay}"
         );
         // Installing again over its own files changes nothing and does not fail.
         assert_eq!(install(&data_dir)?, dir);
