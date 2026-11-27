@@ -13,6 +13,7 @@ use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, IconSize, Pill, Spinner,
 
 use crate::banner::{self, Banner, Exit, banners_for};
 use crate::composer::{Composer, ComposerOutput, FileCompleter, PaneEscape};
+use crate::gate::GateState;
 use crate::hud::{
     ModelChoice, TurnMeter, WorkingClock, context_is_high, context_label, cost_label, rate_label,
     todo_progress,
@@ -34,7 +35,9 @@ enum HudMenu {
 /// [`OmpView::client_exited`] and [`OmpView::malformed_frame`], and fill the model menu with
 /// [`OmpView::set_model_choices`] once the host has the answer to [`OmpIntent::ListModels`].
 pub struct OmpView {
-    session: Arc<SessionModel>,
+    pub(crate) session: Arc<SessionModel>,
+    /// The request omp waits on, while one is open (see [`crate::gate`]).
+    pub(crate) gate: Option<GateState>,
     transcript: Transcript,
     composer: Entity<Composer>,
     spinner: Entity<Spinner>,
@@ -74,6 +77,7 @@ impl OmpView {
         });
         let mut this = OmpView {
             session: Arc::new(SessionModel::new()),
+            gate: None,
             transcript: Transcript::new(),
             composer,
             spinner: cx.new(|_| Spinner::new().size(IconSize::Sm)),
@@ -101,6 +105,13 @@ impl OmpView {
         self.transcript.set_model(session.clone());
         self.composer
             .update(cx, |composer, cx| composer.set_session(session.clone(), cx));
+        self.gate = match session.next_gate().cloned() {
+            Some(request) if self.gate.as_ref().map(|g| &g.request_id) != Some(&request.id) => {
+                Some(GateState::new(&request, cx))
+            }
+            Some(_) => self.gate.take(),
+            None => None,
+        };
         self.session = session;
         cx.notify();
     }
@@ -440,6 +451,7 @@ impl Render for OmpView {
                     .py(Theme::SPACE_2)
                     .child(body),
             )
+            .children(self.render_gate(&theme, cx))
             .children(banner)
             .child(div().pt(Theme::SPACE_2).child(self.composer.clone()))
     }

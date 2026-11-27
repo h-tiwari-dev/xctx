@@ -5,6 +5,8 @@
 //! The pane draws the session with `xctx-omp-view`'s [`OmpView`]: transcript, tool cards and a composer whose
 //! messages go to the agent's omp.
 
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,8 +29,61 @@ use crate::omp_agent::{
     AgentStatus, AgentUpdate, OmpAgent, Opening, agent_session_dir, session_lease_held,
 };
 use crate::space_tab::PaneTerminal;
-use crate::spawn::{AgentStart, rpc_launch, terminal_resume_launch};
+use crate::spawn::{AgentStart, pane_worktree, rpc_launch, terminal_resume_launch};
 use crate::workspace::Workspace;
+
+/// The most files a pane's `@file` completion indexes of its worktree.
+const FILE_INDEX_CAP: usize = 50_000;
+
+/// The most `@file` matches offered at once.
+const FILE_MATCH_CAP: usize = 20;
+
+/// The files git knows in `root` (tracked, or untracked and not ignored), relative with `/`, capped at
+/// [`FILE_INDEX_CAP`]. Empty when `root` is not a git worktree. Blocks: it runs on the background executor.
+fn worktree_files(root: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|path| !path.is_empty())
+        .take(FILE_INDEX_CAP)
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
+/// The `@file` matches for `query` among `files`: those containing it (ignoring case), the ones whose file name
+/// starts with it first, then the shorter paths. At most [`FILE_MATCH_CAP`].
+fn file_matches(files: &[String], query: &str) -> Vec<gpui::SharedString> {
+    let query = query.to_lowercase();
+    let mut hits: Vec<&String> = files
+        .iter()
+        .filter(|path| path.to_lowercase().contains(&query))
+        .collect();
+    hits.sort_by_key(|path| {
+        let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+        (!name.starts_with(&query), path.len())
+    });
+    hits.into_iter()
+        .take(FILE_MATCH_CAP)
+        .map(|path| gpui::SharedString::from(path.clone()))
+        .collect()
+}
 
 /// Numbers each start of an RPC agent's child, so frames of a child that was replaced are dropped.
 static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -153,8 +208,44 @@ impl Workspace {
                 })),
             );
         }
+        self.index_rpc_files(id, pane.id, &space, &pane.role, window, cx);
         self.boot_rpc_agent(id, pane.id, opening_for(start), window, cx);
         true
+    }
+
+    /// Index the files of the worktree RPC pane `pane` runs in, off the UI thread, and give its composer `@file`
+    /// completion once the index is ready. Nothing is offered before then.
+    fn index_rpc_files(
+        &mut self,
+        id: &SpaceId,
+        pane: PaneId,
+        space: &xctx_core::Space,
+        role: &xctx_layout::PaneRole,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = pane_worktree(space, role).map(PathBuf::from) else {
+            return;
+        };
+        let executor = cx.background_executor().clone();
+        let space_id = id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let files = executor.spawn(async move { worktree_files(&root) }).await;
+            let files = Rc::new(files);
+            let _ = this.update(cx, |this, cx| {
+                let Some(omp) = this.rpc_pane_mut(&space_id, pane) else {
+                    return;
+                };
+                let view = omp.view.clone();
+                view.update(cx, |view, cx| {
+                    view.set_file_completer(
+                        Rc::new(move |query: &str| file_matches(&files, query)),
+                        cx,
+                    );
+                });
+            });
+        })
+        .detach();
     }
 
     /// Start the child of RPC pane `pane` off the UI thread, then read its frames into the workspace.
@@ -349,9 +440,18 @@ impl Workspace {
         let Some(omp) = self.rpc_pane_mut(id, pane) else {
             return;
         };
-        if let Err(e) = omp.agent.send_command(intent.command()) {
-            self.error(format!("could not send to the agent: {e}"), cx);
+        let result = match intent {
+            OmpIntent::Answer { .. } => omp.agent.respond_ui(&intent.command()),
+            _ => omp
+                .agent
+                .send_command(intent.command())
+                .map(|()| Vec::new()),
+        };
+        match result {
+            Ok(updates) => self.rpc_updates(id, pane, &updates, cx),
+            Err(e) => self.error(format!("could not send to the agent: {e}"), cx),
         }
+        self.refresh_rpc_view(id, pane, cx);
         cx.notify();
     }
 
@@ -534,5 +634,44 @@ impl Workspace {
             }))
             .child(div().flex_1().min_h_0().child(omp.view.clone()))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_matches;
+
+    #[test]
+    fn at_file_matches_rank_file_names_that_start_with_the_query_first() {
+        let files: Vec<String> = [
+            "docs/notes/readme.md",
+            "src/app/readme.rs",
+            "README.md",
+            "src/thread.rs",
+        ]
+        .map(String::from)
+        .to_vec();
+        let hits: Vec<String> = file_matches(&files, "READ")
+            .into_iter()
+            .map(|h| h.to_string())
+            .collect();
+        // Names starting with the query come first, shorter paths first; a match inside a name ranks last even
+        // though its path is the shortest.
+        assert_eq!(
+            hits,
+            vec![
+                "README.md",
+                "src/app/readme.rs",
+                "docs/notes/readme.md",
+                "src/thread.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn at_file_matches_are_capped() {
+        let files: Vec<String> = (0..100).map(|i| format!("f{i}.txt")).collect();
+        assert_eq!(file_matches(&files, "f").len(), super::FILE_MATCH_CAP);
+        assert!(file_matches(&files, "missing").is_empty());
     }
 }

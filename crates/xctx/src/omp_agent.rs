@@ -437,7 +437,6 @@ impl OmpAgent {
 
     /// Answer a pending request with `answer` (an `extension_ui_response` the user chose), and return what
     /// changed. Refused for a request that does not wait.
-    #[cfg_attr(not(test), allow(dead_code))] // No caller yet: the native session pane is still to come.
     pub fn respond_ui(&mut self, answer: &Command) -> Result<Vec<AgentUpdate>, String> {
         let id = answer
             .as_value()

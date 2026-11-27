@@ -20,6 +20,7 @@
 pub mod banner;
 pub mod composer;
 pub mod draft;
+mod gate;
 pub mod hud;
 pub mod intent;
 pub mod markdown;
@@ -31,5 +32,5 @@ pub use banner::{Banner, BannerKind};
 pub use composer::{Composer, FileCompleter, PaneEscape};
 pub use draft::DraftMode;
 pub use hud::ModelChoice;
-pub use intent::OmpIntent;
+pub use intent::{GateAnswer, OmpIntent};
 pub use view::OmpView;

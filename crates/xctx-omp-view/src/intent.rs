@@ -1,6 +1,20 @@
 //! What the user asked the pane to do, for the host to send to omp.
 
+use serde_json::{Map, Value};
 use xctx_omp::{Command, Image, Queue, Streaming};
+
+/// The user's answer to a request omp waits on (see [`OmpIntent::Answer`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GateAnswer {
+    /// The text or the option chosen (a `select`, `input` or `editor`).
+    Value(String),
+    /// Yes or no (a `confirm`).
+    Confirmed(bool),
+    /// Dismissed without an answer: a `select` stays undecided, a `confirm` is no.
+    Cancelled,
+    /// The submitted form values, by control name (a `form`).
+    Form(Map<String, Value>),
+}
 
 /// One thing the user did in an [`crate::OmpView`] that omp has to hear about. The view never talks to omp
 /// itself: the host subscribes to these and sends [`OmpIntent::command`] through its `OmpClient`.
@@ -82,6 +96,13 @@ pub enum OmpIntent {
         /// The question.
         question: String,
     },
+    /// Answer the request `request_id` that omp waits on (a tool approval, a dialog or a form).
+    Answer {
+        /// The request's id, as omp sent it.
+        request_id: String,
+        /// What the user chose.
+        answer: GateAnswer,
+    },
 }
 
 /// How many model picker rows [`OmpIntent::ListModels`] asks for.
@@ -120,6 +141,12 @@ impl OmpIntent {
                 exclude_from_context,
             } => Command::bash(command, *exclude_from_context),
             OmpIntent::Btw { question } => Command::btw(question),
+            OmpIntent::Answer { request_id, answer } => match answer {
+                GateAnswer::Value(value) => Command::ui_value(request_id, value),
+                GateAnswer::Confirmed(confirmed) => Command::ui_confirmed(request_id, *confirmed),
+                GateAnswer::Cancelled => Command::ui_cancelled(request_id),
+                GateAnswer::Form(data) => Command::ui_form(request_id, data.clone()),
+            },
         }
     }
 }
@@ -184,6 +211,31 @@ mod tests {
                 message: "x".into()
             }),
             json!({"type": "promote_queued_message", "message": "x"})
+        );
+    }
+
+    #[test]
+    fn answers_go_back_as_extension_ui_responses_with_the_request_id() {
+        assert_eq!(
+            wire(OmpIntent::Answer {
+                request_id: "r1".into(),
+                answer: GateAnswer::Value("Allow once".into())
+            }),
+            json!({"type": "extension_ui_response", "id": "r1", "value": "Allow once"})
+        );
+        assert_eq!(
+            wire(OmpIntent::Answer {
+                request_id: "r2".into(),
+                answer: GateAnswer::Confirmed(false)
+            }),
+            json!({"type": "extension_ui_response", "id": "r2", "confirmed": false})
+        );
+        assert_eq!(
+            wire(OmpIntent::Answer {
+                request_id: "r3".into(),
+                answer: GateAnswer::Cancelled
+            }),
+            json!({"type": "extension_ui_response", "id": "r3", "cancelled": true})
         );
     }
 
