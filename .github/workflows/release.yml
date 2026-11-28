@@ -11,7 +11,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-    branches: [release/ci-signing]
   workflow_dispatch:
     inputs:
       tag:
@@ -111,6 +110,8 @@ jobs:
     needs: dmg
     if: github.ref_type == 'tag' || inputs.tag != ''
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
