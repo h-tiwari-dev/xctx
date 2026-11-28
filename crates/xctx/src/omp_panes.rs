@@ -16,11 +16,12 @@ use gpui::{
     AnyElement, AppContext, Context, Entity, IntoElement, ParentElement, Styled, Subscription,
     Window, div,
 };
-use xctx_core::SpaceId;
+use xctx_core::{Redactor, SpaceId};
 use xctx_graph::AgentNodeId;
 use xctx_layout::{PaneId, PaneKind, RolePane};
 use xctx_omp::{Frame, Incoming};
-use xctx_omp_view::{ModelChoice, OmpIntent, OmpView};
+use xctx_omp_view::changes::diff_counts;
+use xctx_omp_view::{ChangeKind, ChangedFile, ModelChoice, OmpIntent, OmpView, SessionChanges};
 use xctx_plugin::RunnerManifest;
 use xctx_term_view::TerminalView;
 use xctx_ui::Theme;
@@ -28,6 +29,7 @@ use xctx_ui::Theme;
 use crate::omp_agent::{
     AgentStatus, AgentUpdate, OmpAgent, Opening, agent_session_dir, session_lease_held,
 };
+use crate::plugin_host::{GitChange, PreviewText, file_diff, git_status_files};
 use crate::space_tab::PaneTerminal;
 use crate::spawn::{AgentStart, pane_worktree, rpc_launch, terminal_resume_launch};
 use crate::workspace::Workspace;
@@ -85,6 +87,55 @@ fn file_matches(files: &[String], query: &str) -> Vec<gpui::SharedString> {
         .collect()
 }
 
+/// The most changed files collected for one in-session Changes snapshot.
+const SESSION_CHANGES_CAP: usize = 60;
+
+fn map_change_kind(change: GitChange) -> ChangeKind {
+    match change {
+        GitChange::Modified => ChangeKind::Modified,
+        GitChange::Added => ChangeKind::Added,
+        GitChange::Deleted => ChangeKind::Deleted,
+        GitChange::Renamed => ChangeKind::Renamed,
+        GitChange::Untracked => ChangeKind::Untracked,
+        GitChange::Conflicted => ChangeKind::Conflicted,
+    }
+}
+
+/// Collect uncommitted git changes and redacted unified diffs for `root`. Blocks: runs on the background executor.
+fn worktree_changes(root: &Path, branch: Option<String>, redactor: &Redactor) -> SessionChanges {
+    let entries = match git_status_files(root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return SessionChanges {
+                branch: branch.map(Into::into),
+                files: Vec::new(),
+                error: Some(err.into()),
+            };
+        }
+    };
+    let mut files = Vec::with_capacity(entries.len().min(SESSION_CHANGES_CAP));
+    for (path, change) in entries.into_iter().take(SESSION_CHANGES_CAP) {
+        let diff = match file_diff(root, &path, change, redactor) {
+            Ok(PreviewText::Text { text, .. }) => text,
+            Ok(PreviewText::Binary) => "Binary file differs.".to_owned(),
+            Err(err) => format!("Could not read diff: {err}"),
+        };
+        let (additions, deletions) = diff_counts(&diff);
+        files.push(ChangedFile {
+            path: path.into(),
+            kind: map_change_kind(change),
+            additions,
+            deletions,
+            diff: diff.into(),
+        });
+    }
+    SessionChanges {
+        branch: branch.map(Into::into),
+        files,
+        error: None,
+    }
+}
+
 /// Numbers each start of an RPC agent's child, so frames of a child that was replaced are dropped.
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -98,6 +149,8 @@ pub(crate) struct OmpPane {
     generation: u64,
     /// Whether Open in terminal waits for its child to exit.
     open_in_terminal: bool,
+    /// Worktree root and branch for the in-session Changes panel.
+    worktree: Option<(PathBuf, Option<String>)>,
     /// The chat pane drawing the agent's session.
     pub(crate) view: Entity<OmpView>,
     /// Carries what the user does in [`OmpPane::view`] to the agent's omp.
@@ -197,6 +250,7 @@ impl Workspace {
             .iter()
             .find(|r| r.name == pane.role.repo)
             .or_else(|| space.repos.first());
+        let worktree_info = repo.map(|r| (r.worktree.clone(), Some(r.branch.clone())));
         if let Some(repo) = repo {
             let worktree = repo.worktree.to_string_lossy().into_owned();
             view.update(cx, |view, cx| {
@@ -204,6 +258,16 @@ impl Workspace {
             });
         }
         let (space_id, pane_id) = (id.clone(), pane.id);
+        let ws = cx.weak_entity();
+        let (refresh_space, refresh_pane) = (id.clone(), pane.id);
+        view.update(cx, |view, _| {
+            view.set_changes_refresher(Rc::new(move |cx| {
+                ws.update(cx, |this, cx| {
+                    this.refresh_rpc_changes(&refresh_space, refresh_pane, cx);
+                })
+                .ok();
+            }));
+        });
         let intents = cx.subscribe(&view, move |this, _, intent: &OmpIntent, cx| {
             this.rpc_intent(&space_id, pane_id, intent, cx);
         });
@@ -215,14 +279,42 @@ impl Workspace {
                     runner,
                     generation: 0,
                     open_in_terminal: false,
+                    worktree: worktree_info,
                     view,
                     _intents: intents,
                 })),
             );
         }
         self.index_rpc_files(id, pane.id, &space, &pane.role, window, cx);
+        self.refresh_rpc_changes(id, pane.id, cx);
         self.boot_rpc_agent(id, pane.id, opening_for(start), window, cx);
         true
+    }
+
+    /// Scan git status and diffs for RPC pane `pane`'s worktree off the UI thread and update its Changes panel.
+    fn refresh_rpc_changes(&mut self, id: &SpaceId, pane: PaneId, cx: &mut Context<Self>) {
+        let Some((root, branch)) = self
+            .rpc_pane_mut(id, pane)
+            .and_then(|omp| omp.worktree.clone())
+        else {
+            return;
+        };
+        let redactor = self.redactor.clone();
+        let executor = cx.background_executor().clone();
+        let space_id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let snapshot = executor
+                .spawn(async move { worktree_changes(&root, branch, &redactor) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(omp) = this.rpc_pane_mut(&space_id, pane) else {
+                    return;
+                };
+                let view = omp.view.clone();
+                view.update(cx, |view, cx| view.set_changes(snapshot, cx));
+            });
+        })
+        .detach();
     }
 
     /// Index the files of the worktree RPC pane `pane` runs in, off the UI thread, and give its composer `@file`
@@ -354,6 +446,7 @@ impl Workspace {
         };
         let view = omp.view.clone();
         let mut exit = None;
+        let mut refresh_changes = false;
         match &incoming {
             Incoming::Malformed(detail) => {
                 view.update(cx, |view, cx| view.malformed_frame(detail, cx));
@@ -362,11 +455,19 @@ impl Workspace {
                 let choices = ModelChoice::from_picker(&r.data);
                 view.update(cx, |view, cx| view.set_model_choices(choices, cx));
             }
+            Incoming::Frame(Frame::Event { kind, .. })
+                if matches!(kind.as_str(), "agent_end" | "tool_execution_end") =>
+            {
+                refresh_changes = true;
+            }
             Incoming::Exited { code, stderr } => exit = Some((*code, stderr.clone())),
             Incoming::Frame(_) => {}
         }
         let updates = omp.agent.apply(incoming);
         self.rpc_updates(id, pane, &updates, cx);
+        if refresh_changes {
+            self.refresh_rpc_changes(id, pane, cx);
+        }
         let Some(unexpected) = updates.iter().find_map(|update| match update {
             AgentUpdate::Exited { unexpected, .. } => Some(*unexpected),
             _ => None,

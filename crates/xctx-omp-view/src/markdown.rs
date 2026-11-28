@@ -5,11 +5,13 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, StyledText,
-    UnderlineStyle, div, prelude::*, px,
+    AnyElement, FontStyle, FontWeight, HighlightStyle, SharedString, StrikethroughStyle,
+    StyledText, UnderlineStyle, div, prelude::*, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use xctx_ui::Theme;
+use xctx_ui::{Button, ButtonSize, ButtonVariant, IconName, Theme};
+
+use crate::changes::CopyCallback;
 
 /// How a run of inline text is set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -386,6 +388,10 @@ fn styled(inline: &Inline, theme: &Theme) -> StyledText {
 
 /// A monospace block of `text`: plain, or coloured line by line when `diff` is set.
 pub fn code_block(text: &str, diff: bool, theme: &Theme) -> AnyElement {
+    code_block_inner(text, diff, theme).into_any_element()
+}
+
+fn code_block_inner(text: &str, diff: bool, theme: &Theme) -> gpui::Div {
     let body = div()
         .flex()
         .flex_col()
@@ -404,14 +410,109 @@ pub fn code_block(text: &str, diff: bool, theme: &Theme) -> AnyElement {
                 .text_color(diff_line_color(line, theme))
                 .child(line.to_owned())
         }))
-        .into_any_element()
     } else {
-        body.child(text.to_owned()).into_any_element()
+        body.child(text.to_owned())
     }
+}
+
+/// A monospace code block with a Tern-style header bar showing `lang` and a one-click Copy button.
+pub fn code_block_with_copy(
+    lang: &str,
+    text: &str,
+    diff: bool,
+    copy_key: String,
+    copied: Option<&str>,
+    on_copy: CopyCallback,
+    theme: &Theme,
+) -> AnyElement {
+    let is_copied = copied == Some(copy_key.as_str());
+    let label = if lang.trim().is_empty() {
+        if diff { "diff" } else { "code" }
+    } else {
+        lang.trim()
+    };
+    let payload = text.to_owned();
+    let selector = format!("omp-copy-{copy_key}");
+    let header = div()
+        .flex()
+        .items_center()
+        .w_full()
+        .h(px(26.0))
+        .px(Theme::SPACE_2)
+        .border_b_1()
+        .border_color(theme.border_subtle)
+        .bg(theme.surface)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family("Menlo")
+                .text_size(Theme::TEXT_XS)
+                .text_color(theme.text_subtle)
+                .child(label.to_owned()),
+        )
+        .child(
+            Button::new(
+                SharedString::from(format!("omp-code-copy-{copy_key}")),
+                if is_copied { "Copied" } else { "Copy" },
+            )
+            .icon(if is_copied {
+                IconName::Check
+            } else {
+                IconName::Copy
+            })
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Compact)
+            .tooltip("Copy code block")
+            .selector(selector)
+            .on_click(move |_, _, cx| on_copy(copy_key.clone(), payload.clone(), cx)),
+        );
+    let body = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .p(Theme::SPACE_2)
+        .font_family("Menlo")
+        .text_size(Theme::TEXT_SM)
+        .text_color(theme.text);
+    let body = if diff {
+        body.children(text.lines().map(|line| {
+            div()
+                .text_color(diff_line_color(line, theme))
+                .child(line.to_owned())
+        }))
+    } else {
+        body.child(text.to_owned())
+    };
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .rounded(Theme::RADIUS_SM)
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border_subtle)
+        .overflow_hidden()
+        .child(header)
+        .child(body)
+        .into_any_element()
 }
 
 /// Draw parsed markdown as a column of blocks.
 pub fn render(blocks: &[MdBlock], theme: &Theme) -> AnyElement {
+    render_with_copy(blocks, "md", None, None, theme)
+}
+
+/// Draw parsed markdown as a column of blocks, adding a header with a Copy button to fenced code blocks when
+/// `on_copy` is provided.
+pub fn render_with_copy(
+    blocks: &[MdBlock],
+    scope: &str,
+    copied: Option<&str>,
+    on_copy: Option<CopyCallback>,
+    theme: &Theme,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -420,11 +521,25 @@ pub fn render(blocks: &[MdBlock], theme: &Theme) -> AnyElement {
         .min_w_0()
         .text_size(Theme::TEXT_MD)
         .text_color(theme.text)
-        .children(blocks.iter().map(|block| render_block(block, theme)))
+        .children(blocks.iter().enumerate().map(|(i, block)| {
+            render_block(
+                block,
+                &format!("{scope}-code-{i}"),
+                copied,
+                on_copy.clone(),
+                theme,
+            )
+        }))
         .into_any_element()
 }
 
-fn render_block(block: &MdBlock, theme: &Theme) -> AnyElement {
+fn render_block(
+    block: &MdBlock,
+    code_key: &str,
+    copied: Option<&str>,
+    on_copy: Option<CopyCallback>,
+    theme: &Theme,
+) -> AnyElement {
     match block {
         MdBlock::Paragraph { text, quoted } => div()
             .w_full()
@@ -446,7 +561,18 @@ fn render_block(block: &MdBlock, theme: &Theme) -> AnyElement {
             .font_weight(FontWeight::SEMIBOLD)
             .child(styled(text, theme))
             .into_any_element(),
-        MdBlock::Code { lang, text } => code_block(text, lang == "diff", theme),
+        MdBlock::Code { lang, text } => match on_copy {
+            Some(cb) => code_block_with_copy(
+                lang,
+                text,
+                lang == "diff",
+                code_key.to_owned(),
+                copied,
+                cb,
+                theme,
+            ),
+            None => code_block(text, lang == "diff", theme),
+        },
         MdBlock::Item {
             depth,
             marker,

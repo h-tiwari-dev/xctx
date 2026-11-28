@@ -119,6 +119,8 @@ pub enum IconName {
     Layers,
     /// The command key: the command palette.
     Command,
+    /// Copy text or diffs to the clipboard.
+    Copy,
 }
 
 impl IconName {
@@ -169,6 +171,7 @@ impl IconName {
         Self::Minimize,
         Self::Layers,
         Self::Command,
+        Self::Copy,
     ];
 
     /// The asset path used with [`UiAssets`] and [`gpui::svg`].
@@ -219,6 +222,7 @@ impl IconName {
             Self::Minimize => "icons/minimize.svg",
             Self::Layers => "icons/layers.svg",
             Self::Command => "icons/command.svg",
+            Self::Copy => "icons/copy.svg",
         }
     }
 
@@ -270,6 +274,7 @@ impl IconName {
             Self::Minimize => "minimize",
             Self::Layers => "layers",
             Self::Command => "command",
+            Self::Copy => "copy",
         }
     }
 
@@ -321,6 +326,7 @@ impl IconName {
             Self::Minimize => include_bytes!("../assets/icons/minimize.svg"),
             Self::Layers => include_bytes!("../assets/icons/layers.svg"),
             Self::Command => include_bytes!("../assets/icons/command.svg"),
+            Self::Copy => include_bytes!("../assets/icons/copy.svg"),
         }
     }
 

@@ -4,8 +4,9 @@
 use gpui::{AnyElement, App, ClickEvent, FontWeight, SharedString, Window, div, prelude::*, px};
 use serde_json::Value;
 use xctx_omp::{ToolRun, ToolState};
-use xctx_ui::{Badge, Icon, IconName, IconSize, Theme, Tone};
+use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Theme, Tone};
 
+use crate::changes::CopyCallback;
 use crate::markdown::code_block;
 
 /// The kinds of tool card, each with its own summary and body.
@@ -333,25 +334,131 @@ fn column(parts: Vec<AnyElement>) -> AnyElement {
         .into_any_element()
 }
 
+/// The most useful text to copy from `run` (unified diff for `edit`, file content for `write`, command/output for
+/// `bash`, output or JSON args for others). Returns `None` when nothing meaningful is available yet.
+pub fn copyable_text(run: &ToolRun) -> Option<String> {
+    let kind = ToolKind::of(&run.name);
+    let failed = run.state == ToolState::Failed;
+    match kind {
+        ToolKind::Edit if !failed => {
+            if let Some(diff) = edit_diff(run) {
+                return Some(diff.to_owned());
+            }
+        }
+        ToolKind::Write if !failed => {
+            if let Some(content) = arg(run, &["content"]) {
+                return Some(content.to_owned());
+            }
+        }
+        ToolKind::Bash => {
+            let cmd = arg(run, &["command", "cmd"]);
+            return match (cmd, run.output.is_empty()) {
+                (Some(c), false) => Some(format!("$ {c}\n{}", run.output)),
+                (Some(c), true) => Some(c.to_owned()),
+                (None, false) => Some(run.output.clone()),
+                (None, true) => None,
+            };
+        }
+        ToolKind::Eval => {
+            if !run.output.is_empty() {
+                return Some(run.output.clone());
+            }
+            if let Some(code) = arg(run, &["code", "input", "source"]) {
+                return Some(code.to_owned());
+            }
+        }
+        _ => {}
+    }
+    if !run.output.is_empty() {
+        return Some(run.output.clone());
+    }
+    if !run.args.is_null() {
+        let pretty = serde_json::to_string_pretty(&run.args).unwrap_or_default();
+        if !pretty.is_empty() && pretty != "{}" {
+            return Some(pretty);
+        }
+    }
+    None
+}
+
+/// Short tooltip label describing what the Copy button copies for `run`.
+pub fn copy_tooltip(run: &ToolRun) -> &'static str {
+    match ToolKind::of(&run.name) {
+        ToolKind::Edit if edit_diff(run).is_some() => "Copy diff",
+        ToolKind::Write if arg(run, &["content"]).is_some() => "Copy written content",
+        ToolKind::Bash if run.output.is_empty() => "Copy command",
+        ToolKind::Bash => "Copy command and output",
+        _ => "Copy tool output",
+    }
+}
+
 type Toggle = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// A card for `run`: a header row (icon, title, summary, state) that toggles `expanded` through `on_toggle`, and
 /// the body when expanded. Failed calls are outlined in the danger colour. Test selectors: `omp-tool-<slug>` on
 /// the header, `omp-tool-expanded` on an open body, `omp-tool-error` on a failed call's output.
 pub fn card(run: &ToolRun, expanded: bool, on_toggle: Toggle, theme: &Theme) -> AnyElement {
+    card_with_copy(run, expanded, on_toggle, None, None, theme)
+}
+
+/// Like [`card`], plus a one-click Copy button in the header (copies diff, written content, command, or output
+/// without toggling expansion).
+pub fn card_with_copy(
+    run: &ToolRun,
+    expanded: bool,
+    on_toggle: Toggle,
+    copied: Option<&str>,
+    on_copy: Option<CopyCallback>,
+    theme: &Theme,
+) -> AnyElement {
     let kind = ToolKind::of(&run.name);
     let failed = run.state == ToolState::Failed;
     let selector = format!("omp-tool-{}", kind.slug());
     let hover = theme.hover;
-    let header = div()
+    let edit_stat = (kind == ToolKind::Edit)
+        .then(|| edit_diff(run).map(diffstat))
+        .flatten();
+    let header_summary = if edit_stat.is_some() {
+        arg(run, &["path", "file_path", "file"])
+            .map(|p| clip(p, SUMMARY_CHARS))
+            .unwrap_or_default()
+    } else {
+        summary(run)
+    };
+    let copy_button = on_copy.and_then(|cb| {
+        let payload = copyable_text(run)?;
+        let copy_key = format!("tool-{}", run.id);
+        let is_copied = copied == Some(copy_key.as_str());
+        let tip = copy_tooltip(run);
+        let sel = format!("omp-copy-tool-{}", run.id);
+        Some(
+            Button::new(
+                SharedString::from(format!("omp-tool-copy-{}", run.id)),
+                if is_copied { "Copied" } else { "" },
+            )
+            .icon(if is_copied {
+                IconName::Check
+            } else {
+                IconName::Copy
+            })
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Compact)
+            .tooltip(tip)
+            .selector(sel)
+            .on_click(move |_, _, cx| cb(copy_key.clone(), payload.clone(), cx)),
+        )
+    });
+
+    let toggle_area = div()
         .id(SharedString::from(format!("omp-tool-header-{}", run.id)))
         .debug_selector(move || selector)
         .flex()
+        .flex_1()
+        .min_w_0()
         .items_center()
         .gap(Theme::SPACE_2)
-        .w_full()
-        .px(Theme::SPACE_2)
         .h(px(28.0))
+        .px(Theme::SPACE_2)
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
         .on_click(on_toggle)
@@ -385,9 +492,29 @@ pub fn card(run: &ToolRun, expanded: bool, on_toggle: Toggle, theme: &Theme) -> 
                 .font_family("Menlo")
                 .text_size(Theme::TEXT_SM)
                 .text_color(theme.text_muted)
-                .child(summary(run)),
+                .child(header_summary),
         )
+        .children(edit_stat.map(|(added, removed)| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(Theme::SPACE_1)
+                .font_family("Menlo")
+                .text_size(Theme::TEXT_XS)
+                .child(div().text_color(theme.success).child(format!("+{added}")))
+                .child(div().text_color(theme.danger).child(format!("−{removed}")))
+        }))
         .child(state_badge(run.state));
+
+    let header = div()
+        .flex()
+        .items_center()
+        .w_full()
+        .pr(Theme::SPACE_1)
+        .child(toggle_area)
+        .children(copy_button);
+
     div()
         .flex()
         .flex_col()
@@ -520,5 +647,27 @@ mod tests {
         assert_eq!(shown.lines().count(), BODY_LINES);
         assert_eq!(more, 5);
         assert_eq!(clip_lines("a\nb"), ("a\nb", 0));
+    }
+
+    #[test]
+    fn copyable_text_picks_diff_content_command_or_output() {
+        let edit = run(
+            "edit",
+            json!({"path": "a.rs"}),
+            json!({"diff": "-old\n+new\n"}),
+        );
+        assert_eq!(copyable_text(&edit).as_deref(), Some("-old\n+new\n"));
+
+        let write = run(
+            "write",
+            json!({"path": "b.rs", "content": "fn main() {}\n"}),
+            Value::Null,
+        );
+        assert_eq!(copyable_text(&write).as_deref(), Some("fn main() {}\n"));
+
+        let mut bash = run("bash", json!({"command": "cargo test"}), Value::Null);
+        assert_eq!(copyable_text(&bash).as_deref(), Some("cargo test"));
+        bash.output = "ok".into();
+        assert_eq!(copyable_text(&bash).as_deref(), Some("$ cargo test\nok"));
     }
 }

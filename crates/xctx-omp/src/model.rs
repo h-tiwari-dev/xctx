@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
-use crate::command::Command;
+use crate::command::{Command, SubagentLevel};
 use crate::frame::{Frame, PromptResult, Ready, Response, UiMethod, UiRequest};
 
 /// How loud a [`Entry::Notice`] is.
@@ -389,12 +389,14 @@ impl SessionModel {
     }
 
     /// The commands to send once the handshake is done, so the pane has its first picture: the state, the slash
-    /// commands and the session stats.
+    /// commands, the session stats, and subagent progress updates.
     pub fn startup_commands() -> Vec<Command> {
         vec![
             Command::get_state().with_id("startup-state"),
             Command::get_available_commands().with_id("startup-commands"),
             Command::get_session_stats().with_id("startup-stats"),
+            Command::set_subagent_subscription(SubagentLevel::Progress)
+                .with_id("startup-subagents"),
         ]
     }
 

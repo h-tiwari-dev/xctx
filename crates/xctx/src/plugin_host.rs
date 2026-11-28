@@ -2310,6 +2310,22 @@ pub fn git_status(root: &Path) -> Result<GitStatus, String> {
     ))
 }
 
+/// Every changed file in worktree `root`, from `git status --porcelain=v1 -uall -z`, with paths relative to `root`.
+pub fn git_status_files(root: &Path) -> Result<Vec<(String, GitChange)>, String> {
+    let dir = resolve_inside(root, "")?;
+    let prefix = run_git_bytes(&dir, &["rev-parse", "--show-prefix"], false)?;
+    let prefix = String::from_utf8_lossy(&prefix);
+    let prefix = prefix.trim_end_matches('\n');
+    let text = run_git_bytes(&dir, &["status", "--porcelain=v1", "-uall", "-z"], false)?;
+    Ok(parse_porcelain_z(&String::from_utf8_lossy(&text))
+        .into_iter()
+        .filter_map(|(path, change)| {
+            let rel = path.strip_prefix(prefix)?;
+            (!rel.is_empty() && !rel.ends_with('/')).then(|| (rel.to_owned(), change))
+        })
+        .collect())
+}
+
 /// What file `rel` of worktree `root`, with `change`, changed: `git diff HEAD -- <file>` (staged and unstaged;
 /// plain `git diff -- <file>` before the first commit), or the whole file as added when it is untracked. Masked
 /// with `redactor` and capped like a preview.

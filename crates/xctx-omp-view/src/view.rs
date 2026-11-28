@@ -1,17 +1,23 @@
-//! [`OmpView`]: the native omp pane. It draws a read-only [`SessionModel`] snapshot (HUD, transcript, banner,
-//! composer) and emits [`OmpIntent`]s; it never talks to omp itself.
+//! [`OmpView`]: the native omp pane. It draws a read-only [`SessionModel`] snapshot (session bar, Changes/Diff
+//! panel, HUD, transcript, subagent tray, side questions, todo drawer, banner, composer) and emits [`OmpIntent`]s;
+//! it never talks to omp itself.
 
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, Hsla, SharedString, Window, div, prelude::*, px, relative,
+    AnyElement, App, ClipboardItem, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, FontWeight, Hsla, SharedString, Window, div, prelude::*, px, relative,
 };
 use xctx_omp::{Phase, SessionModel};
-use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, IconSize, Pill, Spinner, Theme, Tone};
+use xctx_ui::{
+    Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Pill, PromptInput, Spinner,
+    Theme, Tone,
+};
 
 use crate::banner::{self, Banner, Exit, banners_for};
+use crate::changes::{self, ChangesPanelProps, ChangesRefresher, CopyCallback, SessionChanges};
 use crate::composer::{Composer, ComposerOutput, FileCompleter, PaneEscape, mode_border};
 use crate::draft::WhileRunning;
 use crate::gate::GateState;
@@ -20,7 +26,11 @@ use crate::hud::{
     todo_progress,
 };
 use crate::intent::OmpIntent;
+use crate::panels::{self, IntentCallback, SessionInfoProps, SubagentTrayProps};
 use crate::transcript::Transcript;
+
+/// How long a Copy button shows its "Copied" confirmation before returning to "Copy".
+const COPY_FEEDBACK_MS: u64 = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HudMenu {
@@ -33,7 +43,8 @@ enum HudMenu {
 /// Create it with `cx.new(|cx| OmpView::new(session, cx))`, subscribe to its [`OmpIntent`]s (send each one's
 /// [`OmpIntent::command`] to the `OmpClient`) and to [`PaneEscape`] (Esc the pane did not use), and call
 /// [`OmpView::set_session`] with a fresh snapshot whenever the model changed. Tell it about the client with
-/// [`OmpView::client_exited`] and [`OmpView::malformed_frame`], and fill the model menu with
+/// [`OmpView::client_exited`] and [`OmpView::malformed_frame`], push worktree git diffs via
+/// [`OmpView::set_changes`] (and [`OmpView::set_changes_refresher`]), and fill the model menu with
 /// [`OmpView::set_model_choices`] once the host has the answer to [`OmpIntent::ListModels`].
 pub struct OmpView {
     pub(crate) session: Arc<SessionModel>,
@@ -47,10 +58,26 @@ pub struct OmpView {
     /// The folder the pane runs in and its git branch, shown in the footer.
     location: Option<(SharedString, Option<SharedString>)>,
     models: Option<Vec<ModelChoice>>,
+    model_filter: Entity<PromptInput>,
     menu: Option<HudMenu>,
     exit: Option<Exit>,
     malformed: Option<String>,
     dismissed: Option<Banner>,
+    /// Worktree git changes snapshot for the in-session Changes panel.
+    changes: SessionChanges,
+    changes_refresher: Option<ChangesRefresher>,
+    changes_open: bool,
+    selected_change: usize,
+    /// Collapsible drawers inspired by Tern's native omp UI.
+    info_open: bool,
+    tray_open: bool,
+    selected_subagent: Option<String>,
+    steer_input: Entity<PromptInput>,
+    btw_open: bool,
+    todos_open: bool,
+    /// Key of the Copy control currently showing its brief "Copied" state.
+    copied: Option<String>,
+    copied_gen: u64,
 }
 
 /// The most todo dots the rail draws; more become a `+N`.
@@ -90,7 +117,7 @@ impl OmpView {
         let view = cx.weak_entity();
         let composer = cx.new(|cx| {
             Composer::new(
-                std::rc::Rc::new(move |output, cx| {
+                Rc::new(move |output, cx| {
                     view.update(cx, |_, cx| match output {
                         ComposerOutput::Intent(intent) => cx.emit(intent),
                         ComposerOutput::Escape(escape) => cx.emit(escape),
@@ -103,6 +130,21 @@ impl OmpView {
         // The footer's Send depends on the draft text, which the composer's input holds.
         let input = composer.read(cx).input().clone();
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
+
+        let model_filter = cx.new(|cx| {
+            PromptInput::new(cx)
+                .placeholder("Filter models…")
+                .borderless(true)
+        });
+        cx.observe(&model_filter, |_, _, cx| cx.notify()).detach();
+
+        let steer_input = cx.new(|cx| {
+            PromptInput::new(cx)
+                .placeholder("Steer this subagent…")
+                .borderless(true)
+        });
+        cx.observe(&steer_input, |_, _, cx| cx.notify()).detach();
+
         let mut this = OmpView {
             session: Arc::new(SessionModel::new()),
             gate: None,
@@ -113,10 +155,23 @@ impl OmpView {
             meter: TurnMeter::default(),
             location: None,
             models: None,
+            model_filter,
             menu: None,
             exit: None,
             malformed: None,
             dismissed: None,
+            changes: SessionChanges::default(),
+            changes_refresher: None,
+            changes_open: false,
+            selected_change: 0,
+            info_open: false,
+            tray_open: false,
+            selected_subagent: None,
+            steer_input,
+            btw_open: false,
+            todos_open: false,
+            copied: None,
+            copied_gen: 0,
         };
         this.set_session(session, cx);
         this
@@ -124,6 +179,9 @@ impl OmpView {
 
     /// Show a new snapshot of the session.
     pub fn set_session(&mut self, session: Arc<SessionModel>, cx: &mut Context<Self>) {
+        let prev_btw = self.session.btw.len();
+        let prev_subagents = self.session.subagents.len();
+
         self.meter.observe(&session, Instant::now());
         let started = self.meter.started();
         self.clock
@@ -141,8 +199,96 @@ impl OmpView {
             Some(_) => self.gate.take(),
             None => None,
         };
+        if session.btw.len() > prev_btw {
+            self.btw_open = true;
+        }
+        if session.btw.is_empty() {
+            self.btw_open = false;
+        }
+        if session.subagents.len() > prev_subagents {
+            self.tray_open = true;
+        }
+        if session.subagents.is_empty() {
+            self.tray_open = false;
+            self.selected_subagent = None;
+        } else if let Some(selected) = &self.selected_subagent
+            && !session.subagents.contains_key(selected)
+        {
+            self.selected_subagent = None;
+        }
+        if session.todos.is_empty() {
+            self.todos_open = false;
+        }
         self.session = session;
         cx.notify();
+    }
+
+    /// Push a fresh snapshot of uncommitted worktree changes for the in-session Changes panel.
+    pub fn set_changes(&mut self, changes: SessionChanges, cx: &mut Context<Self>) {
+        let count = changes.files.len();
+        if count == 0 {
+            self.selected_change = 0;
+        } else {
+            self.selected_change = self.selected_change.min(count - 1);
+        }
+        self.changes = changes;
+        cx.notify();
+    }
+
+    /// Register the host callback used when the user clicks Refresh or opens the Changes panel.
+    pub fn set_changes_refresher(&mut self, refresher: ChangesRefresher) {
+        self.changes_refresher = Some(refresher);
+    }
+
+    /// Open or close the in-session Changes panel.
+    pub fn set_changes_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.changes_open = open;
+        if open && let Some(refresher) = &self.changes_refresher {
+            refresher(cx);
+        }
+        cx.notify();
+    }
+
+    /// The latest worktree git changes snapshot shown by the Changes panel.
+    pub fn changes(&self) -> &SessionChanges {
+        &self.changes
+    }
+
+    /// Write `text` to the system clipboard and flash "Copied" on the control identified by `key`.
+    fn copy_text(&mut self, key: String, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.copied = Some(key);
+        self.copied_gen = self.copied_gen.wrapping_add(1);
+        let copy_gen = self.copied_gen;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(COPY_FEEDBACK_MS))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.copied_gen == copy_gen {
+                    this.copied = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn copy_callback(&self, cx: &Context<Self>) -> CopyCallback {
+        let view = cx.weak_entity();
+        Rc::new(move |key, text, cx| {
+            view.update(cx, |this, cx| this.copy_text(key, text, cx))
+                .ok();
+        })
+    }
+
+    fn intent_callback(&self, cx: &Context<Self>) -> IntentCallback {
+        let view = cx.weak_entity();
+        Rc::new(move |intent, cx| {
+            view.update(cx, |_, cx| cx.emit(intent)).ok();
+        })
     }
 
     /// Send the draft from the footer's Send button, as the composer's own submit would.
@@ -212,18 +358,206 @@ impl OmpView {
             self.menu = None;
         } else {
             self.menu = Some(menu);
-            if menu == HudMenu::Model && self.models.is_none() {
-                self.models = Some(Vec::new());
-                cx.emit(OmpIntent::ListModels);
+            if menu == HudMenu::Model {
+                self.model_filter.update(cx, |input, cx| input.clear(cx));
+                if self.models.is_none() {
+                    self.models = Some(Vec::new());
+                    cx.emit(OmpIntent::ListModels);
+                }
             }
         }
         cx.notify();
     }
 
-    /// The dock's top rail: the working state with Stop, the needs-you badge, the turn's todos, and the context meter.
+    /// Compact session top bar (Tern's `omp.app.head`): session title & goal, Changes diff toggle, Subagents and
+    /// Btw toggles, Expand/collapse tools, quick Copy last reply, and Session info/actions.
+    fn render_session_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let session = &self.session;
+        let title: SharedString = session
+            .session
+            .name
+            .clone()
+            .map(SharedString::from)
+            .unwrap_or_else(|| "Agent session".into());
+        let goal = session.goal.as_ref().and_then(panels::goal_summary);
+
+        let change_count = self.changes.files.len();
+        let changes_label: SharedString = if change_count > 0 {
+            format!("Changes ({change_count})").into()
+        } else {
+            "Changes".into()
+        };
+
+        let subagent_count = session.subagents.len();
+        let subagent_running = session
+            .subagents
+            .values()
+            .filter(|s| panels::subagent_is_active(s))
+            .count();
+        let btw_count = session.btw.len();
+
+        let has_tools = !session.tools.is_empty();
+        let all_open = self.transcript.all_tools_open();
+
+        let last_reply = self.transcript.last_reply();
+        let copied_last = self.copied.as_deref() == Some("last-reply");
+
+        div()
+            .debug_selector(|| "omp-session-bar".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(Theme::SPACE_1)
+            .w_full()
+            .h(px(30.0))
+            .px(Theme::SPACE_3)
+            .border_b_1()
+            .border_color(theme.border_subtle)
+            .bg(theme.raised)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap(Theme::SPACE_2)
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(180.0))
+                            .truncate()
+                            .text_size(Theme::TEXT_XS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(title),
+                    )
+                    .children(goal.map(|g| {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(Theme::TEXT_XS)
+                            .text_color(theme.text_muted)
+                            .child(g)
+                    }))
+                    .children(
+                        session
+                            .status_segments
+                            .values()
+                            .take(2)
+                            .map(|seg| Badge::new(seg.clone()).tone(Tone::Neutral)),
+                    ),
+            )
+            .child(
+                Button::new("omp-changes-toggle", changes_label)
+                    .icon(IconName::Git)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .selected(self.changes_open)
+                    .tooltip("View and copy worktree git changes")
+                    .selector("omp-changes-toggle")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let next = !this.changes_open;
+                        this.set_changes_open(next, cx);
+                    })),
+            )
+            .when(subagent_count > 0, |row| {
+                let label: SharedString = if subagent_running > 0 {
+                    format!("Agents ({subagent_running}/{subagent_count})").into()
+                } else {
+                    format!("Agents ({subagent_count})").into()
+                };
+                row.child(
+                    Button::new("omp-tray-toggle", label)
+                        .icon(IconName::Orchestrator)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .selected(self.tray_open)
+                        .tooltip("Show or hide subagent tray")
+                        .selector("omp-tray-toggle")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.tray_open = !this.tray_open;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(btw_count > 0, |row| {
+                row.child(
+                    Button::new("omp-btw-toggle", format!("Btw ({btw_count})"))
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .selected(self.btw_open)
+                        .tooltip("Show or hide side question answers")
+                        .selector("omp-btw-toggle")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.btw_open = !this.btw_open;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(has_tools, |row| {
+                row.child(
+                    Button::new(
+                        "omp-tools-toggle",
+                        if all_open {
+                            "Collapse tools"
+                        } else {
+                            "Expand tools"
+                        },
+                    )
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .tooltip("Expand or collapse all tool cards")
+                    .selector("omp-tools-toggle")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.transcript.all_tools_open() {
+                            this.transcript.collapse_all_tools();
+                        } else {
+                            this.transcript.expand_all_tools();
+                        }
+                        cx.notify();
+                    })),
+                )
+            })
+            .children(last_reply.map(|reply| {
+                Button::new(
+                    "omp-copy-last",
+                    if copied_last { "Copied" } else { "Copy reply" },
+                )
+                .icon(if copied_last {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                })
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip("Copy the assistant's latest reply")
+                .selector("omp-copy-last")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.copy_text("last-reply".to_owned(), reply.clone(), cx);
+                }))
+            }))
+            .child(
+                Button::new("omp-session-info", "Session")
+                    .icon(IconName::More)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .selected(self.info_open)
+                    .tooltip("Session info, copy transcript, compact, fork, new session")
+                    .selector("omp-session-info")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.info_open = !this.info_open;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// The dock's top rail: the working state with Stop, the needs-you badge, clickable todos, and the context
+    /// meter (with a quick Compact button when context gets full).
     fn render_rail(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let session = &self.session;
         let running = session.is_running();
+        let hover = theme.hover;
         let working = running.then(|| {
             div()
                 .debug_selector(|| "omp-working".to_owned())
@@ -261,9 +595,21 @@ impl OmpView {
                 .map(|task| task.status.as_str())
                 .collect();
             div()
+                .id("omp-todos-toggle")
+                .debug_selector(|| "omp-todos-toggle".to_owned())
                 .flex()
                 .items_center()
                 .gap(px(3.0))
+                .px(Theme::SPACE_1)
+                .py(px(2.0))
+                .rounded(Theme::RADIUS_SM)
+                .cursor_pointer()
+                .when(self.todos_open, |d| d.bg(theme.selection))
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.todos_open = !this.todos_open;
+                    cx.notify();
+                }))
                 .children(statuses.iter().take(TODO_DOTS).map(|status| {
                     div()
                         .size(px(6.0))
@@ -298,18 +644,16 @@ impl OmpView {
             .children(needs_you)
             .children(todos)
             .child(div().flex_1())
-            .children(self.render_context(theme))
+            .children(self.render_context(theme, cx))
     }
 
-    /// The context meter: how full the model's window is, with the window's size. Warns from 80%.
-    fn render_context(&self, theme: &Theme) -> Option<impl IntoElement> {
+    /// The context meter: how full the model's window is, with the window's size. Warns from 80% and offers a
+    /// one-click Compact action when high.
+    fn render_context(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let usage = self.session.context?;
         let percent = usage.percent.clamp(0.0, 100.0);
-        let color = if context_is_high(&self.session) {
-            theme.warning
-        } else {
-            theme.accent
-        };
+        let high = context_is_high(&self.session);
+        let color = if high { theme.warning } else { theme.accent };
         Some(
             div()
                 .debug_selector(|| "omp-hud-context".to_owned())
@@ -343,7 +687,19 @@ impl OmpView {
                     "omp-hud-context-window",
                     compact_tokens(usage.window),
                     theme.meta,
-                )),
+                ))
+                .when(high && !self.session.compacting, |row| {
+                    row.child(
+                        Button::new("omp-hud-compact", "Compact")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Compact)
+                            .tooltip("Compact conversation context")
+                            .selector("omp-hud-compact")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(OmpIntent::Compact { instructions: None });
+                            })),
+                    )
+                }),
         )
     }
 
@@ -472,79 +828,134 @@ impl OmpView {
             }))
     }
 
-    fn render_menu(
-        &self,
-        menu: HudMenu,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let row = div()
-            .debug_selector(move || {
-                match menu {
-                    HudMenu::Model => "omp-model-menu",
-                    HudMenu::Effort => "omp-effort-menu",
-                }
-                .to_owned()
-            })
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(Theme::SPACE_1)
-            .w_full()
-            .px(Theme::SPACE_3)
-            .py(Theme::SPACE_1)
-            .border_b_1()
-            .border_color(theme.border_subtle)
-            .bg(theme.raised);
+    fn render_menu(&self, menu: HudMenu, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         match menu {
             HudMenu::Effort => {
                 let current = self.session.thinking.as_deref();
-                row.children(self.session.thinking_levels.iter().map(|level| {
-                    let pick = level.clone();
-                    Pill::new(
-                        SharedString::from(format!("omp-effort-{level}")),
-                        level.clone(),
-                    )
-                    .selected(current == Some(level.as_str()))
-                    .selector(format!("omp-effort-{level}"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.menu = None;
-                        cx.emit(OmpIntent::SetThinkingLevel {
-                            level: pick.clone(),
-                        });
-                        cx.notify();
-                    }))
-                    .into_any_element()
-                }))
-            }
-            HudMenu::Model => {
-                let choices = self.models.as_deref().unwrap_or_default();
-                if choices.is_empty() {
-                    return row.child(
-                        div()
-                            .text_size(Theme::TEXT_SM)
-                            .text_color(theme.text_subtle)
-                            .child("Loading models…"),
-                    );
-                }
-                let current = self.session.model.as_ref();
-                row.children(choices.iter().enumerate().map(|(i, choice)| {
-                    let selected =
-                        current.is_some_and(|m| m.provider == choice.provider && m.id == choice.id);
-                    let (provider, id) = (choice.provider.clone(), choice.id.clone());
-                    Pill::new(("omp-model", i), choice.label().to_owned())
-                        .selected(selected)
-                        .selector(format!("omp-model-{i}"))
+                div()
+                    .debug_selector(|| "omp-effort-menu".to_owned())
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(Theme::SPACE_1)
+                    .w_full()
+                    .px(Theme::SPACE_3)
+                    .py(Theme::SPACE_1)
+                    .border_t_1()
+                    .border_color(theme.border_subtle)
+                    .bg(theme.raised)
+                    .children(self.session.thinking_levels.iter().map(|level| {
+                        let pick = level.clone();
+                        Pill::new(
+                            SharedString::from(format!("omp-effort-{level}")),
+                            level.clone(),
+                        )
+                        .selected(current == Some(level.as_str()))
+                        .selector(format!("omp-effort-{level}"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.menu = None;
-                            cx.emit(OmpIntent::SetModel {
-                                provider: provider.clone(),
-                                model_id: id.clone(),
+                            cx.emit(OmpIntent::SetThinkingLevel {
+                                level: pick.clone(),
                             });
                             cx.notify();
                         }))
                         .into_any_element()
-                }))
+                    }))
+                    .into_any_element()
+            }
+            HudMenu::Model => {
+                let choices = self.models.as_deref().unwrap_or_default();
+                let query = self.model_filter.read(cx).value().trim().to_lowercase();
+                let current = self.session.model.as_ref();
+
+                let body: AnyElement = if choices.is_empty() {
+                    div()
+                        .text_size(Theme::TEXT_SM)
+                        .text_color(theme.text_subtle)
+                        .child("Loading models…")
+                        .into_any_element()
+                } else {
+                    let filtered: Vec<(usize, &ModelChoice)> = choices
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            query.is_empty()
+                                || c.label().to_lowercase().contains(&query)
+                                || c.id.to_lowercase().contains(&query)
+                                || c.provider.to_lowercase().contains(&query)
+                        })
+                        .collect();
+                    if filtered.is_empty() {
+                        div()
+                            .text_size(Theme::TEXT_SM)
+                            .text_color(theme.text_subtle)
+                            .child("No models match.")
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id("omp-model-list")
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(Theme::SPACE_1)
+                            .w_full()
+                            .max_h(px(180.0))
+                            .overflow_y_scroll()
+                            .children(filtered.into_iter().map(|(i, choice)| {
+                                let selected = current.is_some_and(|m| {
+                                    m.provider == choice.provider && m.id == choice.id
+                                });
+                                let (provider, id) = (choice.provider.clone(), choice.id.clone());
+                                Pill::new(("omp-model", i), choice.label().to_owned())
+                                    .selected(selected)
+                                    .selector(format!("omp-model-{i}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.menu = None;
+                                        cx.emit(OmpIntent::SetModel {
+                                            provider: provider.clone(),
+                                            model_id: id.clone(),
+                                        });
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            }))
+                            .into_any_element()
+                    }
+                };
+
+                div()
+                    .debug_selector(|| "omp-model-menu".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap(Theme::SPACE_1)
+                    .w_full()
+                    .px(Theme::SPACE_3)
+                    .py(Theme::SPACE_2)
+                    .border_t_1()
+                    .border_color(theme.border_subtle)
+                    .bg(theme.raised)
+                    .when(!choices.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(Theme::SPACE_1)
+                                .px(Theme::SPACE_2)
+                                .py(px(2.0))
+                                .rounded(Theme::RADIUS_SM)
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border_subtle)
+                                .child(
+                                    Icon::new(IconName::Search)
+                                        .size(IconSize::Xs)
+                                        .color(theme.text_subtle),
+                                )
+                                .child(div().flex_1().min_w_0().child(self.model_filter.clone())),
+                        )
+                    })
+                    .child(body)
+                    .into_any_element()
             }
         }
     }
@@ -599,11 +1010,152 @@ impl OmpView {
 impl Render for OmpView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
+        let on_copy = self.copy_callback(cx);
+        let on_intent = self.intent_callback(cx);
+
         let body = if self.transcript.is_empty() {
             Self::render_empty(&theme).into_any_element()
         } else {
-            self.transcript.render(cx.entity_id())
+            self.transcript.render_with_copy(
+                cx.entity_id(),
+                self.copied.clone(),
+                Some(on_copy.clone()),
+            )
         };
+
+        let show_jump = !self.transcript.is_empty() && !self.transcript.is_scrolled_to_end();
+
+        let changes_panel = self.changes_open.then(|| {
+            let view = cx.weak_entity();
+            let view_refresh = cx.weak_entity();
+            let view_close = cx.weak_entity();
+            changes::render_changes_panel(
+                ChangesPanelProps {
+                    changes: &self.changes,
+                    selected: self.selected_change,
+                    copied: self.copied.as_deref(),
+                    has_refresher: self.changes_refresher.is_some(),
+                    on_select: Rc::new(move |ix, cx| {
+                        view.update(cx, |this, cx| {
+                            this.selected_change = ix;
+                            cx.notify();
+                        })
+                        .ok();
+                    }),
+                    on_copy: on_copy.clone(),
+                    on_refresh: Rc::new(move |cx| {
+                        view_refresh
+                            .update(cx, |this, cx| {
+                                if let Some(refresher) = &this.changes_refresher {
+                                    refresher(cx);
+                                }
+                            })
+                            .ok();
+                    }),
+                    on_close: Rc::new(move |cx| {
+                        view_close
+                            .update(cx, |this, cx| {
+                                this.changes_open = false;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+                },
+                &theme,
+            )
+        });
+
+        let info_panel = self.info_open.then(|| {
+            let view_close = cx.weak_entity();
+            panels::render_session_info(
+                SessionInfoProps {
+                    session: &self.session,
+                    transcript_text: self.transcript.format_markdown(),
+                    last_reply: self.transcript.last_reply(),
+                    copied: self.copied.as_deref(),
+                    on_copy: on_copy.clone(),
+                    on_intent: on_intent.clone(),
+                    on_close: Rc::new(move |cx| {
+                        view_close
+                            .update(cx, |this, cx| {
+                                this.info_open = false;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+                },
+                &theme,
+            )
+        });
+
+        let subagent_tray = (self.tray_open && !self.session.subagents.is_empty()).then(|| {
+            let view_sel = cx.weak_entity();
+            let view_close = cx.weak_entity();
+            panels::render_subagent_tray(
+                SubagentTrayProps {
+                    session: &self.session,
+                    selected: self.selected_subagent.as_deref(),
+                    steer_input: self.steer_input.clone(),
+                    copied: self.copied.as_deref(),
+                    on_select: Rc::new(move |id, cx| {
+                        view_sel
+                            .update(cx, |this, cx| {
+                                this.selected_subagent = id;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+                    on_intent: on_intent.clone(),
+                    on_copy: on_copy.clone(),
+                    on_close: Rc::new(move |cx| {
+                        view_close
+                            .update(cx, |this, cx| {
+                                this.tray_open = false;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+                },
+                &theme,
+            )
+        });
+
+        let btw_panel = (self.btw_open && !self.session.btw.is_empty()).then(|| {
+            let view_close = cx.weak_entity();
+            panels::render_btw_panel(
+                &self.session.btw,
+                self.copied.as_deref(),
+                on_copy.clone(),
+                Rc::new(move |cx| {
+                    view_close
+                        .update(cx, |this, cx| {
+                            this.btw_open = false;
+                            cx.notify();
+                        })
+                        .ok();
+                }),
+                &theme,
+            )
+        });
+
+        let todo_drawer = (self.todos_open && !self.session.todos.is_empty()).then(|| {
+            let view_close = cx.weak_entity();
+            panels::render_todo_drawer(
+                &self.session.todos,
+                self.copied.as_deref(),
+                on_copy,
+                Rc::new(move |cx| {
+                    view_close
+                        .update(cx, |this, cx| {
+                            this.todos_open = false;
+                            cx.notify();
+                        })
+                        .ok();
+                }),
+                &theme,
+            )
+        });
+
         let banner = self.banner().map(|b| {
             let shown = b.clone();
             banner::render(
@@ -656,15 +1208,41 @@ impl Render for OmpView {
                 this.composer
                     .update(cx, |composer, cx| composer.attach_paths(paths.paths(), cx));
             }))
+            .child(self.render_session_bar(&theme, cx))
+            .children(info_panel)
+            .children(changes_panel)
             .child(
                 div()
                     .debug_selector(|| "omp-transcript".to_owned())
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
                     .py(Theme::SPACE_2)
-                    .child(body),
+                    .child(body)
+                    .when(show_jump, |wrap| {
+                        wrap.child(
+                            div()
+                                .absolute()
+                                .bottom(Theme::SPACE_2)
+                                .right(Theme::SPACE_3)
+                                .child(
+                                    Button::new("omp-scroll-bottom", "Jump to bottom")
+                                        .icon(IconName::ChevronDown)
+                                        .variant(ButtonVariant::Secondary)
+                                        .size(ButtonSize::Compact)
+                                        .selector("omp-scroll-bottom")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.transcript.scroll_to_end();
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    }),
             )
+            .children(todo_drawer)
+            .children(btw_panel)
+            .children(subagent_tray)
             .children(self.render_gate(&theme, cx))
             .children(banner)
             .children(self.menu.map(|menu| self.render_menu(menu, &theme, cx)))

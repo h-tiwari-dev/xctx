@@ -103,6 +103,27 @@ pub enum OmpIntent {
         /// What the user chose.
         answer: GateAnswer,
     },
+    /// Compact the conversation context, optionally with instructions for what to keep.
+    Compact {
+        /// Optional guidance passed to omp's compactor.
+        instructions: Option<String>,
+    },
+    /// Fork the current session into a new branch.
+    Fork,
+    /// Start a fresh session in this pane.
+    NewSession,
+    /// Cancel a running subagent by id.
+    CancelSubagent {
+        /// The subagent's id.
+        id: String,
+    },
+    /// Send a steering message to a running subagent.
+    SteerSubagent {
+        /// The subagent's id.
+        id: String,
+        /// The guidance to deliver.
+        message: String,
+    },
 }
 
 /// How many model picker rows [`OmpIntent::ListModels`] asks for.
@@ -147,6 +168,11 @@ impl OmpIntent {
                 GateAnswer::Cancelled => Command::ui_cancelled(request_id),
                 GateAnswer::Form(data) => Command::ui_form(request_id, data.clone()),
             },
+            OmpIntent::Compact { instructions } => Command::compact(instructions.as_deref()),
+            OmpIntent::Fork => Command::fork(None),
+            OmpIntent::NewSession => Command::new_session(),
+            OmpIntent::CancelSubagent { id } => Command::cancel_subagent(id),
+            OmpIntent::SteerSubagent { id, message } => Command::steer_subagent(id, message),
         }
     }
 }
@@ -276,5 +302,28 @@ mod tests {
             json!({"type": "set_thinking_level", "level": "high"})
         );
         assert_eq!(wire(OmpIntent::ListModels)["type"], "get_model_picker");
+        assert_eq!(
+            wire(OmpIntent::Compact { instructions: None }),
+            json!({"type": "compact"})
+        );
+        assert_eq!(
+            wire(OmpIntent::Compact {
+                instructions: Some("keep diff".into())
+            }),
+            json!({"type": "compact", "customInstructions": "keep diff"})
+        );
+        assert_eq!(wire(OmpIntent::Fork), json!({"type": "fork"}));
+        assert_eq!(wire(OmpIntent::NewSession), json!({"type": "new_session"}));
+        assert_eq!(
+            wire(OmpIntent::CancelSubagent { id: "Sub1".into() }),
+            json!({"type": "cancel_subagent", "subagentId": "Sub1"})
+        );
+        assert_eq!(
+            wire(OmpIntent::SteerSubagent {
+                id: "Sub1".into(),
+                message: "focus on tests".into()
+            }),
+            json!({"type": "steer_subagent", "subagentId": "Sub1", "message": "focus on tests"})
+        );
     }
 }

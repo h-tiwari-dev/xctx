@@ -11,8 +11,9 @@ use gpui::{
     prelude::*, px,
 };
 use xctx_omp::{AssistantEntry, Block, Entry, Level, SessionModel};
-use xctx_ui::{Badge, Icon, IconName, IconSize, Theme, Tone};
+use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Theme, Tone};
 
+use crate::changes::CopyCallback;
 use crate::markdown::{self, MdBlock};
 use crate::tool_card;
 
@@ -174,8 +175,64 @@ impl Transcript {
         self.rows.is_empty()
     }
 
+    /// Whether every tool call in the current session is expanded.
+    pub fn all_tools_open(&self) -> bool {
+        !self.model.tools.is_empty() && {
+            let open = self.open_tools.borrow();
+            self.model.tools.keys().all(|id| open.contains(id))
+        }
+    }
+
+    /// Expand every tool card in the transcript and remeasure list heights.
+    pub fn expand_all_tools(&self) {
+        {
+            let mut open = self.open_tools.borrow_mut();
+            for id in self.model.tools.keys() {
+                open.insert(id.clone());
+            }
+        }
+        self.state.remeasure();
+    }
+
+    /// Collapse every tool card in the transcript and remeasure list heights.
+    pub fn collapse_all_tools(&self) {
+        self.open_tools.borrow_mut().clear();
+        self.state.remeasure();
+    }
+
+    /// Whether the list is currently at (or near) the bottom.
+    pub fn is_scrolled_to_end(&self) -> bool {
+        self.state.is_scrolled_to_end().unwrap_or(true)
+    }
+
+    /// Scroll to the newest row in the transcript and resume tail following.
+    pub fn scroll_to_end(&self) {
+        self.state.scroll_to_end();
+        self.state.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// Format the full session transcript as Markdown (messages, tool summaries/diffs, and notices).
+    pub fn format_markdown(&self) -> String {
+        format_transcript_markdown(&self.model)
+    }
+
+    /// The last non-empty assistant text response in the transcript, if any.
+    pub fn last_reply(&self) -> Option<String> {
+        last_assistant_reply(&self.model)
+    }
+
     /// The list element; `view` is notified when a card is opened or closed.
     pub fn render(&self, view: EntityId) -> AnyElement {
+        self.render_with_copy(view, None, None)
+    }
+
+    /// The list element with one-click Copy buttons wired to `on_copy` and active `copied` feedback key.
+    pub fn render_with_copy(
+        &self,
+        view: EntityId,
+        copied: Option<String>,
+        on_copy: Option<CopyCallback>,
+    ) -> AnyElement {
         let ctx = RowContext {
             model: self.model.clone(),
             rows: self.rows.clone(),
@@ -184,11 +241,102 @@ impl Transcript {
             open_thinking: self.open_thinking.clone(),
             state: self.state.clone(),
             view,
+            copied,
+            on_copy,
         };
         gpui::list(self.state.clone(), move |ix, _window, cx| ctx.row(ix, cx))
             .size_full()
             .into_any_element()
     }
+}
+
+/// Format `model`'s transcript as readable Markdown for the clipboard.
+pub fn format_transcript_markdown(model: &SessionModel) -> String {
+    let mut out = String::new();
+    for entry in &model.entries {
+        match entry {
+            Entry::User {
+                text, from_agent, ..
+            } => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(if *from_agent {
+                    "## Agent\n\n"
+                } else {
+                    "## You\n\n"
+                });
+                out.push_str(text.trim_end());
+            }
+            Entry::Notice { text, .. } => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str("> ");
+                out.push_str(text.trim());
+            }
+            Entry::Assistant(a) => {
+                let mut parts: Vec<String> = Vec::new();
+                for block in &a.blocks {
+                    match block {
+                        Block::Text(text) if !text.trim().is_empty() => {
+                            parts.push(text.trim_end().to_owned());
+                        }
+                        Block::ToolCall(id) => {
+                            if let Some(run) = model.tools.get(id) {
+                                let head = format!(
+                                    "### {} `{}`",
+                                    tool_card::title(run),
+                                    tool_card::summary(run)
+                                );
+                                if let Some(payload) = tool_card::copyable_text(run) {
+                                    let lang = if tool_card::ToolKind::of(&run.name)
+                                        == tool_card::ToolKind::Edit
+                                    {
+                                        "diff"
+                                    } else {
+                                        ""
+                                    };
+                                    parts.push(format!("{head}\n```{lang}\n{payload}\n```"));
+                                } else {
+                                    parts.push(head);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !parts.is_empty() {
+                    if !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    out.push_str("## Assistant\n\n");
+                    out.push_str(&parts.join("\n\n"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Return the last assistant entry's text blocks joined by blank lines, if any.
+pub fn last_assistant_reply(model: &SessionModel) -> Option<String> {
+    for entry in model.entries.iter().rev() {
+        if let Entry::Assistant(a) = entry {
+            let texts: Vec<&str> = a
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text(t) if !t.trim().is_empty() => Some(t.trim_end()),
+                    _ => None,
+                })
+                .collect();
+            if !texts.is_empty() {
+                return Some(texts.join("\n\n"));
+            }
+        }
+    }
+    None
 }
 
 impl Default for Transcript {
@@ -212,9 +360,43 @@ struct RowContext {
     open_thinking: Rc<RefCell<HashSet<RowKey>>>,
     state: ListState,
     view: EntityId,
+    copied: Option<String>,
+    on_copy: Option<CopyCallback>,
 }
 
 impl RowContext {
+    fn copy_button(
+        &self,
+        copy_key: String,
+        selector: String,
+        tooltip: &'static str,
+        payload: String,
+        show_label: bool,
+    ) -> Option<Button> {
+        let on_copy = self.on_copy.clone()?;
+        let is_copied = self.copied.as_deref() == Some(copy_key.as_str());
+        let label = if is_copied {
+            "Copied"
+        } else if show_label {
+            "Copy"
+        } else {
+            ""
+        };
+        Some(
+            Button::new(SharedString::from(format!("omp-btn-{copy_key}")), label)
+                .icon(if is_copied {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                })
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip(tooltip)
+                .selector(selector)
+                .on_click(move |_, _, cx| on_copy(copy_key.clone(), payload.clone(), cx)),
+        )
+    }
+
     fn row(&self, ix: usize, cx: &mut App) -> AnyElement {
         let theme = Theme::of(cx);
         let Some(&key) = self.rows.get(ix) else {
@@ -226,11 +408,37 @@ impl RowContext {
                     text,
                     images,
                     from_agent,
-                }) => user_row(text, *images, *from_agent, &theme),
+                }) => {
+                    let copy_btn = (!text.trim().is_empty())
+                        .then(|| {
+                            self.copy_button(
+                                format!("user-{ix}"),
+                                format!("omp-copy-user-{ix}"),
+                                "Copy message",
+                                text.clone(),
+                                false,
+                            )
+                        })
+                        .flatten();
+                    user_row(text, *images, *from_agent, copy_btn, &theme)
+                }
                 _ => div().into_any_element(),
             },
             RowKey::Notice(i) => match self.model.entries.get(i) {
-                Some(Entry::Notice { level, text }) => notice_row(*level, text, &theme),
+                Some(Entry::Notice { level, text }) => {
+                    let copy_btn = (!text.trim().is_empty())
+                        .then(|| {
+                            self.copy_button(
+                                format!("notice-{ix}"),
+                                format!("omp-copy-notice-{ix}"),
+                                "Copy notice",
+                                text.clone(),
+                                false,
+                            )
+                        })
+                        .flatten();
+                    notice_row(*level, text, copy_btn, &theme)
+                }
                 _ => div().into_any_element(),
             },
             RowKey::Stop(i) => match assistant(&self.model, i) {
@@ -245,10 +453,48 @@ impl RowContext {
                         .entry(key)
                         .or_insert_with(|| Rc::new(markdown::parse(text)))
                         .clone();
+                    let model_badge = assistant(&self.model, entry)
+                        .and_then(|a| a.model.as_deref())
+                        .filter(|_| b == 0)
+                        .map(|m| {
+                            div()
+                                .text_size(Theme::TEXT_XS)
+                                .text_color(theme.text_subtle)
+                                .child(m.to_owned())
+                        });
+                    let copy_btn = self.copy_button(
+                        format!("assistant-{ix}"),
+                        format!("omp-copy-assistant-{ix}"),
+                        "Copy response",
+                        text.clone(),
+                        true,
+                    );
+                    let show_bar = model_badge.is_some() || copy_btn.is_some();
                     div()
                         .debug_selector(|| "omp-assistant-text".to_owned())
+                        .flex()
+                        .flex_col()
+                        .gap(Theme::SPACE_1)
                         .w_full()
-                        .child(markdown::render(&parsed, &theme))
+                        .child(markdown::render_with_copy(
+                            &parsed,
+                            &format!("row-{ix}"),
+                            self.copied.as_deref(),
+                            self.on_copy.clone(),
+                            &theme,
+                        ))
+                        .when(show_bar, |col| {
+                            col.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(Theme::SPACE_2)
+                                    .w_full()
+                                    .children(model_badge)
+                                    .child(div().flex_1())
+                                    .children(copy_btn),
+                            )
+                        })
                         .into_any_element()
                 }
                 Some(Block::Thinking(text)) => self.thinking_row(ix, key, text, &theme),
@@ -259,7 +505,7 @@ impl RowContext {
                         let state = self.state.clone();
                         let view = self.view;
                         let id = id.clone();
-                        tool_card::card(
+                        tool_card::card_with_copy(
                             run,
                             open,
                             Box::new(move |_, _, cx| {
@@ -267,6 +513,8 @@ impl RowContext {
                                 state.remeasure_items(ix..ix + 1);
                                 cx.notify(view);
                             }),
+                            self.copied.as_deref(),
+                            self.on_copy.clone(),
                             &theme,
                         )
                     }
@@ -300,6 +548,17 @@ impl RowContext {
         let state = self.state.clone();
         let view = self.view;
         let hover = theme.hover;
+        let copy_btn = (open && !text.trim().is_empty())
+            .then(|| {
+                self.copy_button(
+                    format!("thinking-{ix}"),
+                    format!("omp-copy-thinking-{ix}"),
+                    "Copy thinking",
+                    text.to_owned(),
+                    false,
+                )
+            })
+            .flatten();
         div()
             .debug_selector(|| "omp-thinking".to_owned())
             .flex()
@@ -307,53 +566,61 @@ impl RowContext {
             .w_full()
             .child(
                 div()
-                    .id(SharedString::from(format!("omp-thinking-{ix}")))
                     .flex()
                     .items_center()
-                    .gap(Theme::SPACE_1)
                     .w_full()
-                    .cursor_pointer()
-                    .rounded(Theme::RADIUS_SM)
-                    .hover(move |s| s.bg(hover))
-                    .on_click(move |_, _, cx| {
-                        {
-                            let mut open = thinking.borrow_mut();
-                            if !open.remove(&key) {
-                                open.insert(key);
-                            }
-                        }
-                        state.remeasure_items(ix..ix + 1);
-                        cx.notify(view);
-                    })
-                    .child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(IconSize::Xs)
-                        .color(theme.text_subtle),
-                    )
                     .child(
                         div()
-                            .flex_none()
-                            .text_size(Theme::TEXT_SM)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text_muted)
-                            .child("Thinking"),
+                            .id(SharedString::from(format!("omp-thinking-{ix}")))
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(Theme::SPACE_1)
+                            .cursor_pointer()
+                            .rounded(Theme::RADIUS_SM)
+                            .hover(move |s| s.bg(hover))
+                            .on_click(move |_, _, cx| {
+                                {
+                                    let mut open = thinking.borrow_mut();
+                                    if !open.remove(&key) {
+                                        open.insert(key);
+                                    }
+                                }
+                                state.remeasure_items(ix..ix + 1);
+                                cx.notify(view);
+                            })
+                            .child(
+                                Icon::new(if open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(IconSize::Xs)
+                                .color(theme.text_subtle),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(Theme::TEXT_SM)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted)
+                                    .child("Thinking"),
+                            )
+                            .when(!open, |row| {
+                                row.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(Theme::TEXT_SM)
+                                        .italic()
+                                        .text_color(theme.text_subtle)
+                                        .child(preview),
+                                )
+                            }),
                     )
-                    .when(!open, |row| {
-                        row.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(Theme::TEXT_SM)
-                                .italic()
-                                .text_color(theme.text_subtle)
-                                .child(preview),
-                        )
-                    }),
+                    .children(copy_btn),
             )
             .when(open, |col| {
                 col.child(
@@ -369,7 +636,13 @@ impl RowContext {
     }
 }
 
-fn user_row(text: &str, images: usize, from_agent: bool, theme: &Theme) -> AnyElement {
+fn user_row(
+    text: &str,
+    images: usize,
+    from_agent: bool,
+    copy_btn: Option<Button>,
+    theme: &Theme,
+) -> AnyElement {
     div()
         .debug_selector(|| "omp-user-message".to_owned())
         .flex()
@@ -383,10 +656,18 @@ fn user_row(text: &str, images: usize, from_agent: bool, theme: &Theme) -> AnyEl
         .border_color(theme.border_subtle)
         .child(
             div()
-                .text_size(Theme::TEXT_XS)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text_subtle)
-                .child(if from_agent { "Agent" } else { "You" }),
+                .flex()
+                .items_center()
+                .w_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(Theme::TEXT_XS)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_subtle)
+                        .child(if from_agent { "Agent" } else { "You" }),
+                )
+                .children(copy_btn),
         )
         .child(
             div()
@@ -433,7 +714,7 @@ fn level_tone(level: Level) -> Tone {
     }
 }
 
-fn notice_row(level: Level, text: &str, theme: &Theme) -> AnyElement {
+fn notice_row(level: Level, text: &str, copy_btn: Option<Button>, theme: &Theme) -> AnyElement {
     let tone = level_tone(level);
     let colors = theme.tone(tone);
     div()
@@ -458,6 +739,7 @@ fn notice_row(level: Level, text: &str, theme: &Theme) -> AnyElement {
             .tone(tone),
         )
         .child(div().flex_1().min_w_0().child(text.to_owned()))
+        .children(copy_btn)
         .into_any_element()
 }
 

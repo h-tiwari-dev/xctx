@@ -35,6 +35,6 @@ pub use dialog::{
 pub use error::{OmpError, Result};
 pub use frame::{Approval, Frame, PromptResult, Ready, Response, UiMethod, UiRequest};
 pub use model::{
-    AssistantEntry, Block, Effect, Entry, Gate, GateKind, Level, Phase, SessionInfo, SessionModel,
-    ToolRun, ToolState,
+    AssistantEntry, Block, BtwRecord, Effect, Entry, Gate, GateKind, Level, Phase, SessionInfo,
+    SessionModel, Subagent, Todo, TodoPhase, ToolRun, ToolState,
 };

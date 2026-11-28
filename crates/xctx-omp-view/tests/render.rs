@@ -12,9 +12,13 @@ use gpui::{
 };
 use serde_json::{Value, json};
 use xctx_omp::codec::Decoder;
-use xctx_omp::{Block, Entry, Frame, Queue, SessionModel};
+use xctx_omp::{
+    AssistantEntry, Block, Entry, Frame, Queue, SessionModel, Subagent, ToolRun, ToolState,
+};
 use xctx_omp_view::transcript::RowKey;
-use xctx_omp_view::{DraftMode, ModelChoice, OmpIntent, OmpView, PaneEscape};
+use xctx_omp_view::{
+    ChangeKind, ChangedFile, DraftMode, ModelChoice, OmpIntent, OmpView, PaneEscape, SessionChanges,
+};
 use xctx_ui::{MotionSettings, Theme};
 
 /// A 1×1 transparent PNG.
@@ -526,4 +530,241 @@ fn a_new_session_shows_the_empty_state(cx: &mut TestAppContext) {
     assert!(shown(cx, "omp-empty"));
     assert!(!shown(cx, "omp-user-message"));
     assert!(shown(cx, "omp-composer"));
+}
+
+#[gpui::test]
+fn copy_buttons_write_reply_tool_diff_code_block_and_transcript_to_clipboard(
+    cx: &mut TestAppContext,
+) {
+    let mut model = SessionModel::new();
+    model.session.id = Some("sess-42".into());
+    model.entries.push(Entry::User {
+        text: "Fix the bug".into(),
+        images: 0,
+        from_agent: false,
+    });
+    model.tools.insert(
+        "edit-1".into(),
+        ToolRun {
+            id: "edit-1".into(),
+            name: "edit".into(),
+            args: json!({"path": "src/lib.rs"}),
+            state: ToolState::Done,
+            output: "ok".into(),
+            details: json!({"diff": "-let a = 1;\n+let a = 2;\n"}),
+        },
+    );
+    model.entries.push(Entry::Assistant(AssistantEntry {
+        message_id: "m1".into(),
+        blocks: vec![
+            Block::ToolCall("edit-1".into()),
+            Block::Text("Updated it:\n\n```rust\nlet a = 2;\n```".into()),
+        ],
+        streaming: false,
+        model: Some("claude-sonnet".into()),
+        ..AssistantEntry::default()
+    }));
+
+    let (host, cx) = host(cx, model);
+
+    // Copy tool diff directly from the tool card header without expanding it.
+    click(cx, "omp-copy-tool-edit-1");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("-let a = 1;\n+let a = 2;\n".into())
+    );
+    assert!(!shown(cx, "omp-tool-expanded"));
+
+    // Expand / collapse all tool cards from the session bar.
+    click(cx, "omp-tools-toggle");
+    assert!(shown(cx, "omp-tool-expanded"));
+    click(cx, "omp-tools-toggle");
+    assert!(!shown(cx, "omp-tool-expanded"));
+
+    // Copy the fenced code block from its header bar.
+    click(cx, "omp-copy-row-2-code-1");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("let a = 2;".into())
+    );
+
+    // Copy the latest assistant reply from the session bar.
+    click(cx, "omp-copy-last");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("Updated it:\n\n```rust\nlet a = 2;\n```".into())
+    );
+
+    // Open Session info: copy ID, copy full transcript, and fire Compact / Fork / NewSession.
+    click(cx, "omp-session-info");
+    assert!(shown(cx, "omp-info-panel"));
+    click(cx, "omp-info-copy-id");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("sess-42".into())
+    );
+    click(cx, "omp-info-copy-transcript");
+    let transcript = cx
+        .read_from_clipboard()
+        .and_then(|c| c.text())
+        .expect("transcript copied");
+    assert!(transcript.contains("## You"));
+    assert!(transcript.contains("Fix the bug"));
+    assert!(transcript.contains("-let a = 1;"));
+
+    click(cx, "omp-action-compact");
+    click(cx, "omp-action-fork");
+    click(cx, "omp-action-new");
+    assert_eq!(
+        intents(&host, cx),
+        [
+            OmpIntent::Compact { instructions: None },
+            OmpIntent::Fork,
+            OmpIntent::NewSession,
+        ]
+    );
+}
+
+#[gpui::test]
+fn changes_panel_lists_files_and_copies_single_or_all_diffs(cx: &mut TestAppContext) {
+    let (host, cx) = host(cx, SessionModel::new());
+    let view = view(&host, cx);
+    view.update(cx, |v, cx| {
+        v.set_changes(
+            SessionChanges {
+                branch: Some("feat/copy".into()),
+                files: vec![
+                    ChangedFile {
+                        path: "src/main.rs".into(),
+                        kind: ChangeKind::Modified,
+                        additions: 1,
+                        deletions: 1,
+                        diff: "diff --git a/src/main.rs b/src/main.rs\n-old\n+new\n".into(),
+                    },
+                    ChangedFile {
+                        path: "src/extra.rs".into(),
+                        kind: ChangeKind::Untracked,
+                        additions: 1,
+                        deletions: 0,
+                        diff: "+pub fn hi() {}\n".into(),
+                    },
+                ],
+                error: None,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    click(cx, "omp-changes-toggle");
+    assert!(shown(cx, "omp-changes-panel"));
+    assert!(shown(cx, "omp-changes-files"));
+    assert!(shown(cx, "omp-changes-diff"));
+
+    click(cx, "omp-changes-copy-path");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("src/main.rs".into())
+    );
+
+    click(cx, "omp-changes-copy-diff");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("diff --git a/src/main.rs b/src/main.rs\n-old\n+new\n".into())
+    );
+
+    click(cx, "omp-changes-copy-all");
+    let all = cx
+        .read_from_clipboard()
+        .and_then(|c| c.text())
+        .expect("combined patch");
+    assert!(all.contains("diff --git a/src/main.rs b/src/main.rs"));
+    assert!(all.contains("+pub fn hi() {}"));
+}
+
+#[gpui::test]
+fn subagent_tray_peeks_output_and_emits_cancel(cx: &mut TestAppContext) {
+    let (host, cx) = host(cx, SessionModel::new());
+    let mut model = SessionModel::new();
+    model.subagents.insert(
+        "ReadAB".into(),
+        Subagent {
+            id: "ReadAB".into(),
+            agent: "scout".into(),
+            task: "Inspect diff helpers".into(),
+            status: "running".into(),
+            tool_count: 3,
+            tokens: 1200,
+            duration_ms: 4000,
+            current_tool: "grep".into(),
+            recent_output: vec!["found plugin_host.rs".into()],
+            ..Subagent::default()
+        },
+    );
+    show(&host, cx, model);
+
+    // Tray auto-opens when a subagent arrives.
+    assert!(shown(cx, "omp-subagent-tray"));
+    assert!(shown(cx, "omp-subagent-ReadAB"));
+
+    // Clicking the row opens the peek card and lets us copy output or cancel.
+    click(cx, "omp-subagent-ReadAB");
+    assert!(shown(cx, "omp-subagent-peek"));
+    click(cx, "omp-subagent-copy-output");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("found plugin_host.rs".into())
+    );
+
+    click(cx, "omp-subagent-cancel-ReadAB");
+    assert_eq!(
+        intents(&host, cx),
+        [OmpIntent::CancelSubagent {
+            id: "ReadAB".into()
+        }]
+    );
+}
+
+#[gpui::test]
+fn btw_panel_and_todo_drawer_render_and_copy(cx: &mut TestAppContext) {
+    let (host, cx) = host(cx, SessionModel::new());
+    let mut model = replay("btw");
+    apply(
+        &mut model,
+        json!({"type": "btw_record", "record": {
+            "id": "15dd27bd55324ae2",
+            "question": "What is 2+2? Answer with one digit.",
+            "answer": "4",
+            "status": "done"
+        }}),
+    );
+    apply(
+        &mut model,
+        json!({"type": "response", "command": "get_state", "success": true, "data": {
+            "todoPhases": [{"name": "Ship", "tasks": [
+                {"content": "Add copy", "status": "completed"},
+                {"content": "Run ci", "status": "in_progress"}
+            ]}]
+        }}),
+    );
+    show(&host, cx, model);
+
+    // Side questions panel auto-opens when btw records arrive.
+    assert!(shown(cx, "omp-btw-panel"));
+    click(cx, "omp-btw-copy-0");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("4".into())
+    );
+
+    // Clicking the rail's todo indicator opens the checklist drawer and copies Markdown.
+    click(cx, "omp-todos-toggle");
+    assert!(shown(cx, "omp-todo-drawer"));
+    click(cx, "omp-todo-copy");
+    let md = cx
+        .read_from_clipboard()
+        .and_then(|c| c.text())
+        .expect("todos copied");
+    assert!(md.contains("- [x] Add copy"));
+    assert!(md.contains("- [-] Run ci"));
 }
