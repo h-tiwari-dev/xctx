@@ -5,17 +5,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
-    SharedString, Window, div, prelude::*, px,
+    App, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
+    Hsla, SharedString, Window, div, prelude::*, px, relative,
 };
 use xctx_omp::{Phase, SessionModel};
 use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, IconSize, Pill, Spinner, Theme, Tone};
 
 use crate::banner::{self, Banner, Exit, banners_for};
-use crate::composer::{Composer, ComposerOutput, FileCompleter, PaneEscape};
+use crate::composer::{Composer, ComposerOutput, FileCompleter, PaneEscape, mode_border};
 use crate::gate::GateState;
 use crate::hud::{
-    ModelChoice, TurnMeter, WorkingClock, context_is_high, context_label, cost_label, rate_label,
+    ModelChoice, TurnMeter, WorkingClock, compact_tokens, context_is_high, cost_label, rate_label,
     todo_progress,
 };
 use crate::intent::OmpIntent;
@@ -43,11 +43,35 @@ pub struct OmpView {
     spinner: Entity<Spinner>,
     clock: Entity<WorkingClock>,
     meter: TurnMeter,
+    /// The folder the pane runs in and its git branch, shown in the footer.
+    location: Option<(SharedString, Option<SharedString>)>,
     models: Option<Vec<ModelChoice>>,
     menu: Option<HudMenu>,
     exit: Option<Exit>,
     malformed: Option<String>,
     dismissed: Option<Banner>,
+}
+
+/// The most todo dots the rail draws; more become a `+N`.
+const TODO_DOTS: usize = 12;
+
+/// The colour of a todo's dot: done (completed or abandoned) in the accent, the one in progress in warning, the
+/// rest in the border colour.
+fn todo_dot(status: &str, theme: &Theme) -> Hsla {
+    match status {
+        "completed" | "abandoned" => theme.accent,
+        "in_progress" => theme.warning,
+        _ => theme.border,
+    }
+}
+
+/// A short label in the dock. The selector is for tests.
+fn readout(selector: &'static str, text: impl Into<SharedString>, color: Hsla) -> Div {
+    div()
+        .debug_selector(move || selector.to_owned())
+        .text_size(Theme::TEXT_SM)
+        .text_color(color)
+        .child(text.into())
 }
 
 impl EventEmitter<OmpIntent> for OmpView {}
@@ -83,6 +107,7 @@ impl OmpView {
             spinner: cx.new(|_| Spinner::new().size(IconSize::Sm)),
             clock: cx.new(|_| WorkingClock::new()),
             meter: TurnMeter::default(),
+            location: None,
             models: None,
             menu: None,
             exit: None,
@@ -113,6 +138,18 @@ impl OmpView {
             None => None,
         };
         self.session = session;
+        cx.notify();
+    }
+
+    /// Show where the pane runs: the folder (its last component is shown) and the git branch checked out there.
+    pub fn set_location(&mut self, folder: &str, branch: Option<&str>, cx: &mut Context<Self>) {
+        let name = std::path::Path::new(folder)
+            .file_name()
+            .map_or_else(|| folder.to_owned(), |n| n.to_string_lossy().into_owned());
+        self.location = Some((
+            name.into(),
+            branch.map(|b| SharedString::from(b.to_owned())),
+        ));
         cx.notify();
     }
 
@@ -173,7 +210,8 @@ impl OmpView {
         cx.notify();
     }
 
-    fn render_hud(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The dock's top rail: the working state with Stop, the needs-you badge, the turn's todos, and the context meter.
+    fn render_rail(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let session = &self.session;
         let running = session.is_running();
         let working = running.then(|| {
@@ -205,24 +243,38 @@ impl OmpView {
         });
         let needs_you = (session.phase() == Phase::NeedsYou)
             .then(|| Badge::new("needs you").tone(Tone::Warning));
-        let model_label: SharedString = session
-            .model
-            .as_ref()
-            .map_or_else(|| "model".into(), |m| m.label().to_owned().into());
-        let effort_label: SharedString = session
-            .thinking
-            .clone()
-            .map_or_else(|| "effort".into(), SharedString::from);
-        let readout = |selector: &'static str, text: String, color| {
+        let todos = todo_progress(session).map(|(done, total)| {
+            let statuses: Vec<&str> = session
+                .todos
+                .iter()
+                .flat_map(|phase| &phase.tasks)
+                .map(|task| task.status.as_str())
+                .collect();
             div()
-                .debug_selector(move || selector.to_owned())
-                .flex_none()
-                .text_size(Theme::TEXT_SM)
-                .text_color(color)
-                .child(text)
-        };
+                .flex()
+                .items_center()
+                .gap(px(3.0))
+                .children(statuses.iter().take(TODO_DOTS).map(|status| {
+                    div()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(todo_dot(status, theme))
+                }))
+                .children((statuses.len() > TODO_DOTS).then(|| {
+                    readout(
+                        "omp-hud-todos-more",
+                        format!("+{}", statuses.len() - TODO_DOTS),
+                        theme.text_subtle,
+                    )
+                }))
+                .child(readout(
+                    "omp-hud-todos",
+                    format!("{done}/{total}"),
+                    theme.text_muted,
+                ))
+        });
         div()
-            .debug_selector(|| "omp-hud".to_owned())
+            .debug_selector(|| "omp-rail".to_owned())
             .flex()
             .flex_none()
             .items_center()
@@ -234,6 +286,95 @@ impl OmpView {
             .border_color(theme.border_subtle)
             .children(working)
             .children(needs_you)
+            .children(todos)
+            .child(div().flex_1())
+            .children(self.render_context(theme))
+    }
+
+    /// The context meter: how full the model's window is, with the window's size. Warns from 80%.
+    fn render_context(&self, theme: &Theme) -> Option<impl IntoElement> {
+        let usage = self.session.context?;
+        let percent = usage.percent.clamp(0.0, 100.0);
+        let color = if context_is_high(&self.session) {
+            theme.warning
+        } else {
+            theme.accent
+        };
+        Some(
+            div()
+                .debug_selector(|| "omp-hud-context".to_owned())
+                .flex()
+                .items_center()
+                .gap(Theme::SPACE_1)
+                .child(
+                    div()
+                        .relative()
+                        .w(px(96.0))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(theme.border_subtle)
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .h_full()
+                                .w(relative(percent as f32 / 100.0))
+                                .rounded_full()
+                                .bg(color),
+                        ),
+                )
+                .child(readout(
+                    "omp-hud-context-percent",
+                    format!("{percent:.0}%"),
+                    color,
+                ))
+                .child(readout(
+                    "omp-hud-context-window",
+                    compact_tokens(usage.window),
+                    theme.meta,
+                )),
+        )
+    }
+
+    /// The dock's footer: the model and thinking level to change, the folder and branch the pane runs in, and the
+    /// turn's cost and speed.
+    fn render_footer(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let session = &self.session;
+        let model_label: SharedString = session
+            .model
+            .as_ref()
+            .map_or_else(|| "model".into(), |m| m.label().to_owned().into());
+        let effort_label: SharedString = session
+            .thinking
+            .clone()
+            .map_or_else(|| "effort".into(), SharedString::from);
+        let location = self.location.as_ref().map(|(folder, branch)| {
+            div()
+                .flex()
+                .items_center()
+                .gap(Theme::SPACE_1)
+                .min_w_0()
+                .child(
+                    readout("omp-location", folder.clone(), theme.text_muted)
+                        .min_w_0()
+                        .truncate(),
+                )
+                .children(branch.clone().map(|branch| {
+                    readout("omp-branch", format!("⎇ {branch}"), theme.meta).flex_none()
+                }))
+        });
+        div()
+            .debug_selector(|| "omp-footer".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(Theme::SPACE_2)
+            .w_full()
+            .h(px(32.0))
+            .px(Theme::SPACE_3)
+            .border_t_1()
+            .border_color(theme.border_subtle)
             .child(
                 Button::new("omp-hud-model", model_label)
                     .variant(ButtonVariant::Ghost)
@@ -253,28 +394,13 @@ impl OmpView {
                     .selector("omp-hud-effort")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(HudMenu::Effort, cx))),
             )
-            .child(div().flex_1())
-            .children(context_label(session).map(|label| {
-                let color = if context_is_high(session) {
-                    theme.warning
-                } else {
-                    theme.meta
-                };
-                readout("omp-hud-context", label, color)
-            }))
+            .child(div().flex_1().min_w_0().children(location))
             .child(readout("omp-hud-cost", cost_label(session), theme.meta))
             .children(
                 self.meter
                     .rate()
                     .map(|rate| readout("omp-hud-rate", rate_label(rate), theme.meta)),
             )
-            .children(todo_progress(session).map(|(done, total)| {
-                readout(
-                    "omp-hud-todos",
-                    format!("todo {done}/{total}"),
-                    theme.text_muted,
-                )
-            }))
             .children(session.session.name.clone().map(|name| {
                 readout("omp-hud-session", name, theme.text_muted)
                     .max_w(px(160.0))
@@ -407,7 +533,7 @@ impl OmpView {
 }
 
 impl Render for OmpView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let body = if self.transcript.is_empty() {
             Self::render_empty(&theme).into_any_element()
@@ -426,6 +552,32 @@ impl Render for OmpView {
             )
         });
         let accent = theme.accent;
+        let (mode, focused) = {
+            let composer = self.composer.read(cx);
+            (composer.mode(cx), composer.is_focused(window, cx))
+        };
+        let dock = div()
+            .debug_selector(|| "omp-dock".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .mx(Theme::SPACE_3)
+            .mt(Theme::SPACE_2)
+            .mb(Theme::SPACE_3)
+            .rounded(Theme::RADIUS_LG)
+            .border_1()
+            .when(mode.label().is_some(), |dock| dock.border_2())
+            .border_color(mode_border(mode, focused, &theme))
+            .bg(theme.raised)
+            .overflow_hidden()
+            .child(self.render_rail(&theme, cx))
+            .child(
+                div()
+                    .px(Theme::SPACE_2)
+                    .pt(Theme::SPACE_1)
+                    .child(self.composer.clone()),
+            )
+            .child(self.render_footer(&theme, cx));
         div()
             .debug_selector(|| "omp-view".to_owned())
             .flex()
@@ -440,8 +592,6 @@ impl Render for OmpView {
                 this.composer
                     .update(cx, |composer, cx| composer.attach_paths(paths.paths(), cx));
             }))
-            .child(self.render_hud(&theme, cx))
-            .children(self.menu.map(|menu| self.render_menu(menu, &theme, cx)))
             .child(
                 div()
                     .debug_selector(|| "omp-transcript".to_owned())
@@ -453,6 +603,7 @@ impl Render for OmpView {
             )
             .children(self.render_gate(&theme, cx))
             .children(banner)
-            .child(div().pt(Theme::SPACE_2).child(self.composer.clone()))
+            .children(self.menu.map(|menu| self.render_menu(menu, &theme, cx)))
+            .child(dock)
     }
 }

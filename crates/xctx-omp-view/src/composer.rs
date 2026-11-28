@@ -196,6 +196,12 @@ impl Composer {
     }
 
     /// The draft's mode.
+    /// Whether the input has keyboard focus.
+    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.input.focus_handle(cx).is_focused(window)
+    }
+
+    /// The draft's mode, as the dock colours its border.
     pub fn mode(&self, cx: &App) -> DraftMode {
         DraftMode::of(self.text(cx))
     }
@@ -616,9 +622,8 @@ impl Composer {
 }
 
 impl Render for Composer {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        let focused = self.input.focus_handle(cx).is_focused(window);
         let text = self.text(cx);
         let mode = DraftMode::of(text);
         let blank = text.trim().is_empty() && self.images.is_empty();
@@ -710,8 +715,6 @@ impl Render for Composer {
             .flex_col()
             .gap(Theme::SPACE_1)
             .w_full()
-            .px(Theme::SPACE_3)
-            .pb(Theme::SPACE_2)
             .children(self.render_queue(&theme, cx))
             .children(menu.as_ref().map(|m| self.render_menu(m, &theme, cx)))
             .child(
@@ -720,13 +723,6 @@ impl Render for Composer {
                     .flex_col()
                     .gap(Theme::SPACE_1)
                     .w_full()
-                    .px(Theme::SPACE_2)
-                    .pb(Theme::SPACE_1)
-                    .rounded(Theme::RADIUS_LG)
-                    .border_1()
-                    .when(mode.label().is_some(), |frame| frame.border_2())
-                    .border_color(mode_border(mode, focused, &theme))
-                    .bg(theme.raised)
                     .children(mode.label().map(|label| {
                         let selector = mode_selector(mode);
                         div()

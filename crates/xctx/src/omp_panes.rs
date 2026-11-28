@@ -191,6 +191,18 @@ impl Workspace {
             node.and_then(|n| n.session),
         );
         let view = cx.new(|cx| OmpView::new(Arc::new(agent.model().clone()), cx));
+        // The footer names the folder and branch the agent works in: the pane's repo, as `pane_worktree` picks it.
+        let repo = space
+            .repos
+            .iter()
+            .find(|r| r.name == pane.role.repo)
+            .or_else(|| space.repos.first());
+        if let Some(repo) = repo {
+            let worktree = repo.worktree.to_string_lossy().into_owned();
+            view.update(cx, |view, cx| {
+                view.set_location(&worktree, Some(&repo.branch), cx)
+            });
+        }
         let (space_id, pane_id) = (id.clone(), pane.id);
         let intents = cx.subscribe(&view, move |this, _, intent: &OmpIntent, cx| {
             this.rpc_intent(&space_id, pane_id, intent, cx);

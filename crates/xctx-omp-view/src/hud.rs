@@ -104,11 +104,13 @@ pub fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// `ctx 34%`, once omp reported context use.
-pub fn context_label(model: &SessionModel) -> Option<String> {
-    model
-        .context
-        .map(|c| format!("ctx {:.0}%", c.percent.clamp(0.0, 100.0)))
+/// `812`, `256K`, `1.0M`: a token count for the context meter.
+pub fn compact_tokens(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{}K", tokens / 1_000),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
+    }
 }
 
 /// Whether context use is high enough to warn about (80% or more).
@@ -245,14 +247,15 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(3_720)), "1h 02m");
 
         let mut model = SessionModel::new();
-        assert_eq!(context_label(&model), None);
         model.context = Some(xctx_omp::model::ContextUsage {
             tokens: 10,
             window: 100,
             percent: 83.4,
         });
-        assert_eq!(context_label(&model).as_deref(), Some("ctx 83%"));
         assert!(context_is_high(&model));
+        assert_eq!(compact_tokens(256_000), "256K");
+        assert_eq!(compact_tokens(1_000_000), "1.0M");
+        assert_eq!(compact_tokens(812), "812");
         model.stats.cost = 0.126;
         assert_eq!(cost_label(&model), "$0.13");
 
