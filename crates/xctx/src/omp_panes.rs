@@ -387,6 +387,60 @@ impl Workspace {
         );
     }
 
+    /// Answer the omp request of Inbox item `item` as the pane's card would: `approve` picks the call's approve
+    /// option, else its deny option. It goes to the RPC pane whose agent waits on it. When none does, the item is
+    /// stale (omp moved on or exited) and is dismissed.
+    pub(crate) fn answer_omp_gate(
+        &mut self,
+        item: xctx_inbox::ItemId,
+        approve: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(found) = self.inbox.as_ref().and_then(|inbox| inbox.get(&item)) else {
+            return;
+        };
+        let xctx_inbox::ItemBody::OmpGate(gate) = &found.body else {
+            return;
+        };
+        if !found.is_pending() {
+            return;
+        }
+        let request_id = gate.request_id.clone();
+        let value = if approve {
+            gate.approve.clone()
+        } else {
+            gate.deny.clone()
+        };
+        let waiting = self.tabs.iter().find_map(|(space, tab)| {
+            tab.terminals
+                .iter()
+                .find_map(|(pane, terminal)| match terminal {
+                    PaneTerminal::Omp(omp) if omp.agent.waits_for(&request_id) => {
+                        Some((space.clone(), *pane))
+                    }
+                    _ => None,
+                })
+        });
+        match waiting {
+            Some((space, pane)) => {
+                let Some(omp) = self.rpc_pane_mut(&space, pane) else {
+                    return;
+                };
+                let answer = xctx_omp::Command::ui_value(&request_id, &value);
+                match omp.agent.respond_ui(&answer) {
+                    Ok(updates) => self.rpc_updates(&space, pane, &updates, cx),
+                    Err(e) => self.error(format!("could not answer the agent: {e}"), cx),
+                }
+                self.refresh_rpc_view(&space, pane, cx);
+                cx.notify();
+            }
+            None => {
+                self.change_inbox(cx, |inbox| inbox.dismiss(&item));
+                self.info("omp no longer waits for that answer", cx);
+            }
+        }
+    }
+
     /// Carry `updates` of RPC pane `pane` of space `id` into its graph and the Inbox, and redraw.
     fn rpc_updates(
         &mut self,

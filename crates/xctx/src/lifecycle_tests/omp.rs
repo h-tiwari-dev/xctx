@@ -489,16 +489,18 @@ fn a_tool_approval_blocks_the_agent_and_waits_in_the_inbox_masked() -> TestResul
     let item = inbox.get(&item_id).ok_or("the Inbox item is gone")?;
     assert_eq!(item.state, ItemState::Pending);
     assert_eq!(item.space.as_ref(), Some(&space.id));
-    let ItemBody::Notice(notice) = &item.body else {
-        return Err(format!("not a notice: {:?}", item.body).into());
+    let ItemBody::OmpGate(item_gate) = &item.body else {
+        return Err(format!("not an omp gate: {:?}", item.body).into());
     };
-    assert_eq!(notice.title, "payments writer asks: Allow bash?");
-    let body = notice.body.clone().unwrap_or_default();
+    assert_eq!(item_gate.agent, "payments writer");
+    assert_eq!(item_gate.tool, "bash");
+    assert_eq!(item_gate.request_id, gate.request_id);
     assert!(
-        body.contains("Tool: bash")
-            && body.contains("[REDACTED:SHELL_CMD]")
-            && !body.contains("echo hi"),
-        "{body}"
+        item_gate.detail.contains("Tool: bash")
+            && item_gate.detail.contains("[REDACTED:SHELL_CMD]")
+            && !item_gate.detail.contains("echo hi"),
+        "{}",
+        item_gate.detail
     );
 
     // The user denies it: the gate clears, the Inbox item goes, the turn ends.

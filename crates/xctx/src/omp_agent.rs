@@ -25,7 +25,8 @@ use xctx_control::protocol::{
 };
 use xctx_core::{Redactor, SpaceId};
 use xctx_graph::{AgentNodeId, AgentState};
-use xctx_inbox::{Inbox, ItemBody, ItemId, Level, Notice, Source};
+use xctx_inbox::{Inbox, ItemBody, ItemId, Level, Notice, OmpGate, Source};
+use xctx_omp::dialog::permission_of;
 use xctx_omp::{
     Block, Command, Entry, Frame, Incoming, LaunchSpec, OmpClient, OmpError, SessionModel, Started,
     UiMethod, UiRequest,
@@ -148,6 +149,9 @@ pub struct GateNotice {
     pub title: String,
     /// The detail: for a tool approval, the exact tool and arguments.
     pub body: String,
+    /// The Inbox form of a tool approval that has an approve and a refuse option; `None` for other gates, which
+    /// the Inbox shows as a notice. The agent's name is filled in when it is posted.
+    pub inbox: Option<OmpGate>,
 }
 
 /// Something about an RPC agent the rest of xctx keeps.
@@ -534,16 +538,19 @@ impl OmpAgent {
                     let Some(inbox) = inbox.as_deref_mut() else {
                         continue;
                     };
-                    let notice = Notice {
-                        title: masked(&format!("{} asks: {}", self.label, gate.title)),
-                        body: Some(masked(&gate.body)),
-                        level: Level::Warning,
+                    let body = match &gate.inbox {
+                        Some(omp) => ItemBody::OmpGate(OmpGate {
+                            agent: self.label.clone(),
+                            detail: masked(&omp.detail),
+                            ..omp.clone()
+                        }),
+                        None => ItemBody::Notice(Notice {
+                            title: masked(&format!("{} asks: {}", self.label, gate.title)),
+                            body: Some(masked(&gate.body)),
+                            level: Level::Warning,
+                        }),
                     };
-                    match inbox.post(
-                        ItemBody::Notice(notice),
-                        Some(self.space.clone()),
-                        Source::App,
-                    ) {
+                    match inbox.post(body, Some(self.space.clone()), Source::App) {
                         Ok(item) => {
                             self.inbox_items.insert(gate.request_id.clone(), item);
                         }
@@ -567,6 +574,14 @@ impl OmpAgent {
             }
         }
         problems
+    }
+
+    /// Whether omp waits on request `request_id` for an answer.
+    pub fn waits_for(&self, request_id: &str) -> bool {
+        self.model
+            .pending_ui
+            .iter()
+            .any(|r| r.id == request_id && r.blocks())
     }
 
     /// The Inbox item of request `request_id`, while it waits.
@@ -708,7 +723,11 @@ impl OmpAgent {
                 continue;
             }
             if let Some(request) = self.model.pending_ui.iter().find(|r| r.id == id) {
-                updates.push(AgentUpdate::GateRaised(gate_notice(&self.model, request)));
+                updates.push(AgentUpdate::GateRaised(gate_notice(
+                    &self.model,
+                    request,
+                    &self.launch.cwd,
+                )));
             }
             self.raised.push(id);
         }
@@ -733,7 +752,7 @@ impl OmpAgent {
         }
         if let Some(request) = self.model.next_gate() {
             return AgentStatus::Blocked {
-                reason: blocked_reason(&self.model, request),
+                reason: blocked_reason(&self.model, request, &self.launch.cwd),
             };
         }
         if self.model.is_running() {
@@ -776,8 +795,8 @@ fn approval_args(model: &SessionModel, tool: &str) -> Option<Value> {
 }
 
 /// One line on what `request` waits for, for the graph's Blocked reason.
-fn blocked_reason(model: &SessionModel, request: &UiRequest) -> String {
-    let notice = gate_notice(model, request);
+fn blocked_reason(model: &SessionModel, request: &UiRequest, worktree: &Path) -> String {
+    let notice = gate_notice(model, request, worktree);
     match request.approval() {
         Some(approval) if !approval.detail.is_empty() => {
             format!("waiting on you: {} ({})", notice.title, approval.detail)
@@ -787,8 +806,9 @@ fn blocked_reason(model: &SessionModel, request: &UiRequest) -> String {
 }
 
 /// How `request` reads in the Inbox: for a tool approval, the exact tool, what it does and its arguments.
-fn gate_notice(model: &SessionModel, request: &UiRequest) -> GateNotice {
+fn gate_notice(model: &SessionModel, request: &UiRequest, worktree: &Path) -> GateNotice {
     let mut body: Vec<String> = Vec::new();
+    let permission = permission_of(request, worktree);
     let title = match (&request.method, request.approval()) {
         (_, Some(approval)) => {
             body.push(format!("Tool: {}", approval.tool));
@@ -826,11 +846,23 @@ fn gate_notice(model: &SessionModel, request: &UiRequest) -> GateNotice {
         (_, None) => "an answer".to_owned(),
     };
     body.retain(|line| !line.trim().is_empty());
+    let inbox = permission.and_then(|p| {
+        Some(OmpGate {
+            request_id: request.id.clone(),
+            agent: String::new(),
+            tool: p.tool.clone(),
+            detail: body.join("\n"),
+            approve: p.approve_once()?.to_owned(),
+            deny: p.deny()?.to_owned(),
+            danger: !p.one_click_allowed(),
+        })
+    });
     body.push("omp waits for your answer; xctx never answers for you.".to_owned());
     GateNotice {
         request_id: request.id.clone(),
         title,
         body: body.join("\n"),
+        inbox,
     }
 }
 
@@ -979,5 +1011,61 @@ pub fn session_lease_held(launch: &RpcLaunch, session_id: &str) -> Result<bool, 
             }
             Ok(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use std::path::Path;
+
+    use serde_json::json;
+    use xctx_omp::{Frame, SessionModel};
+
+    use super::gate_notice;
+
+    fn request(value: serde_json::Value) -> xctx_omp::UiRequest {
+        match Frame::parse(value) {
+            Frame::Ui(request) => request,
+            other => panic!("not a UI request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_approval_is_an_inbox_gate_with_its_approve_and_deny_options() {
+        let approval = request(json!({
+            "type": "extension_ui_request",
+            "id": "r1",
+            "method": "select",
+            "title": "Allow tool: bash\nCommand: rm -rf build",
+            "options": ["Allow once", "Allow for session", "Deny"],
+        }));
+        let gate = gate_notice(&SessionModel::new(), &approval, Path::new("/nonexistent"))
+            .inbox
+            .expect("a tool approval is offered in the Inbox");
+        assert_eq!(gate.request_id, "r1");
+        assert_eq!(gate.tool, "bash");
+        assert_eq!(gate.approve, "Allow once");
+        assert_eq!(gate.deny, "Deny");
+        assert!(gate.detail.contains("rm -rf build"));
+        assert!(
+            gate.danger,
+            "a destructive command is never approved with one click"
+        );
+    }
+
+    #[test]
+    fn other_questions_stay_notices_in_the_inbox() {
+        let select = request(json!({
+            "type": "extension_ui_request",
+            "id": "r2",
+            "method": "select",
+            "title": "Pick a colour",
+            "options": ["red", "blue"],
+        }));
+        assert!(
+            gate_notice(&SessionModel::new(), &select, Path::new("/nonexistent"))
+                .inbox
+                .is_none()
+        );
     }
 }

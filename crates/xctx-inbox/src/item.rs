@@ -195,6 +195,28 @@ pub enum ItemBody {
     MissingEnvVar(MissingEnvVar),
     /// See [`Notice`].
     Notice(Notice),
+    /// See [`OmpGate`].
+    OmpGate(OmpGate),
+}
+
+/// A tool approval an omp agent waits on. Approve and Reject in the Inbox send the same answer the pane's card does;
+/// answering either place clears the item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpGate {
+    /// omp's request id; the answer must carry it.
+    pub request_id: String,
+    /// The agent that asks, as its pane names it.
+    pub agent: String,
+    /// The tool asking, such as `bash`.
+    pub tool: String,
+    /// What it will do: the call's command or arguments, as omp shows them.
+    pub detail: String,
+    /// The option that approves this call once.
+    pub approve: String,
+    /// The option that refuses it.
+    pub deny: String,
+    /// Whether the call is high-risk: approving it is offered only from its expanded detail.
+    pub danger: bool,
 }
 
 /// An item's kind, without its content.
@@ -213,6 +235,8 @@ pub enum ItemKind {
     MissingEnvVar,
     /// [`ItemBody::Notice`].
     Notice,
+    /// [`ItemBody::OmpGate`].
+    OmpGate,
 }
 
 impl ItemKind {
@@ -226,6 +250,7 @@ impl ItemKind {
             ItemKind::PluginGate => "plugin_gate",
             ItemKind::MissingEnvVar => "missing_env_var",
             ItemKind::Notice => "notice",
+            ItemKind::OmpGate => "omp_gate",
         }
     }
 
@@ -342,6 +367,7 @@ impl InboxItem {
             ItemBody::PluginGate(_) => ItemKind::PluginGate,
             ItemBody::MissingEnvVar(_) => ItemKind::MissingEnvVar,
             ItemBody::Notice(_) => ItemKind::Notice,
+            ItemBody::OmpGate(_) => ItemKind::OmpGate,
         }
     }
 
@@ -389,6 +415,7 @@ impl InboxItem {
             },
             ItemBody::MissingEnvVar(m) => format!("{} needs {}", m.repo, m.var.name),
             ItemBody::Notice(n) => n.title.clone(),
+            ItemBody::OmpGate(g) => format!("{} asks: Allow {}?", g.agent, g.tool),
         }
     }
 
@@ -488,6 +515,16 @@ impl InboxItem {
                         );
                     }
                 }
+            }
+            ItemBody::OmpGate(g) => {
+                lines.push(format!("Tool: {}", g.tool));
+                if !g.detail.trim().is_empty() {
+                    lines.push(g.detail.clone());
+                }
+                lines.push(format!(
+                    "Options: {} / {}. The agent's pane answers it too.",
+                    g.approve, g.deny
+                ));
             }
             ItemBody::MissingEnvVar(m) => {
                 if let Some(help) = &m.var.help {

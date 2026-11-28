@@ -94,6 +94,21 @@ pub enum DangerClass {
     OutsideWorktree,
 }
 
+/// The tool approval `request` asks, classified for danger against `worktree` the way [`Dialogs`] classifies it.
+/// `None` when the request is not an `Allow tool:` select.
+pub fn permission_of(request: &UiRequest, worktree: &Path) -> Option<Permission> {
+    let a = request.approval()?;
+    let command = command_of(&a.detail);
+    let danger = classify(&a.tool, command.as_deref(), &a.detail, worktree);
+    Some(Permission {
+        tool: a.tool,
+        command,
+        detail: a.detail,
+        options: a.options,
+        danger,
+    })
+}
+
 /// A tool approval parsed from an `Allow tool: ...` select.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Permission {
@@ -427,18 +442,8 @@ impl Dialogs {
 
     fn kind_of(&self, request: &UiRequest) -> Option<Kind> {
         Some(match &request.method {
-            UiMethod::Select { title, options } => match request.approval() {
-                Some(a) => {
-                    let command = command_of(&a.detail);
-                    let danger = classify(&a.tool, command.as_deref(), &a.detail, &self.worktree);
-                    Kind::Permission(Permission {
-                        tool: a.tool,
-                        command,
-                        detail: a.detail,
-                        options: a.options,
-                        danger,
-                    })
-                }
+            UiMethod::Select { title, options } => match permission_of(request, &self.worktree) {
+                Some(permission) => Kind::Permission(permission),
                 None => Kind::Select {
                     title: title.clone(),
                     options: options.clone(),

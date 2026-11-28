@@ -28,6 +28,8 @@ pub enum InboxKind {
     PluginGate,
     /// A required mise variable that is not set.
     MissingEnvVar,
+    /// A tool approval an omp agent waits on.
+    OmpGate,
     /// Something an agent or the app wants the user to see.
     Notice,
 }
@@ -41,6 +43,7 @@ impl InboxKind {
             Self::AttemptProposal => "FORK",
             Self::PluginGate => "TOOL",
             Self::MissingEnvVar => "ENV",
+            Self::OmpGate => "ASK",
             Self::Notice => "NOTE",
         }
     }
@@ -49,7 +52,9 @@ impl InboxKind {
     pub fn tone(self) -> Tone {
         match self {
             Self::PlanGate => Tone::Accent,
-            Self::SpaceWiden | Self::AttemptProposal | Self::PluginGate => Tone::Warning,
+            Self::SpaceWiden | Self::AttemptProposal | Self::PluginGate | Self::OmpGate => {
+                Tone::Warning
+            }
             Self::MissingEnvVar => Tone::Danger,
             Self::Notice => Tone::Neutral,
         }
@@ -59,7 +64,7 @@ impl InboxKind {
     pub fn actions(self) -> &'static [InboxAction] {
         match self {
             Self::PlanGate => &[InboxAction::Review],
-            Self::SpaceWiden | Self::AttemptProposal | Self::PluginGate => {
+            Self::SpaceWiden | Self::AttemptProposal | Self::PluginGate | Self::OmpGate => {
                 &[InboxAction::Reject, InboxAction::Approve]
             }
             Self::MissingEnvVar => &[InboxAction::Dismiss, InboxAction::Resolve],

@@ -102,6 +102,7 @@ pub fn entry_kind(kind: ItemKind) -> InboxKind {
         ItemKind::SpaceWiden => InboxKind::SpaceWiden,
         ItemKind::AttemptProposal => InboxKind::AttemptProposal,
         ItemKind::PluginGate => InboxKind::PluginGate,
+        ItemKind::OmpGate => InboxKind::OmpGate,
         ItemKind::MissingEnvVar => InboxKind::MissingEnvVar,
         ItemKind::Notice => InboxKind::Notice,
     }
@@ -301,7 +302,7 @@ impl Workspace {
     }
 
     /// Run `change` on the Inbox and show its error. Returns its result.
-    fn change_inbox<T>(
+    pub(crate) fn change_inbox<T>(
         &mut self,
         cx: &mut Context<Self>,
         change: impl FnOnce(&mut Inbox) -> xctx_inbox::Result<T>,
@@ -339,6 +340,19 @@ impl Workspace {
             && let Some(why) = settle_refusal(&self.widen_approvals, &id)
         {
             self.info(why, cx);
+            return;
+        }
+        if self
+            .inbox
+            .as_ref()
+            .and_then(|i| i.get(&id))
+            .is_some_and(|i| i.kind() == ItemKind::OmpGate)
+        {
+            match action {
+                InboxAction::Approve => self.answer_omp_gate(id, true, cx),
+                InboxAction::Reject => self.answer_omp_gate(id, false, cx),
+                InboxAction::Review | InboxAction::Dismiss | InboxAction::Resolve => {}
+            }
             return;
         }
         match action {

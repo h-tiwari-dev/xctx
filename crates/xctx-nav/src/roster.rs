@@ -233,6 +233,7 @@ pub fn is_pending_space_gate(item: &InboxItem, space_id: &SpaceId) -> bool {
 pub fn is_danger_inbox_item(item: &InboxItem) -> bool {
     match &item.body {
         ItemBody::SpaceWiden(widen) => widen.production,
+        ItemBody::OmpGate(gate) => gate.danger,
         ItemBody::PluginGate(gate) => matches!(
             gate.kind,
             PluginGateKind::WriteCall { .. }
