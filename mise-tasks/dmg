@@ -1,0 +1,41 @@
+#!/usr/bin/env sh
+#MISE description="Package xctx.app into a signed (and, with XCTX_NOTARY_PROFILE, notarized) xctx.dmg"
+#MISE depends=["bundle"]
+#
+# Environment:
+#   XCTX_SIGN_IDENTITY   "Developer ID Application: ..." identity; unset builds an unsigned, local-only dmg.
+#   XCTX_NOTARY_PROFILE  notarytool keychain profile (see docs/release.md); unset skips notarization.
+set -eu
+
+APP="xctx.app"
+DMG="xctx.dmg"
+VOLUME="xctx"
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+
+cp -R "$APP" "$STAGE/$APP"
+ln -s /Applications "$STAGE/Applications"
+
+rm -f "$DMG"
+hdiutil create -quiet -volname "$VOLUME" -srcfolder "$STAGE" -fs HFS+ -format UDZO "$DMG"
+
+IDENTITY="${XCTX_SIGN_IDENTITY:--}"
+if [ "$IDENTITY" = "-" ]; then
+    echo "built $(pwd)/$DMG (unsigned: set XCTX_SIGN_IDENTITY to sign it)"
+    exit 0
+fi
+
+codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+codesign --verify --verbose=2 "$DMG"
+
+if [ -z "${XCTX_NOTARY_PROFILE:-}" ]; then
+    echo "built $(pwd)/$DMG (signed, not notarized: set XCTX_NOTARY_PROFILE to notarize it)"
+    exit 0
+fi
+
+# Notarize the dmg, then staple the ticket to it and to the app inside so Gatekeeper passes offline.
+xcrun notarytool submit "$DMG" --keychain-profile "$XCTX_NOTARY_PROFILE" --wait
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+echo "built $(pwd)/$DMG (signed and notarized)"
