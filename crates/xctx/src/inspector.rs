@@ -2,7 +2,7 @@
 //! panel is `xctx_ui::inspector`. This file reads the space's graph, attempts, channel and tools into it, and sends
 //! each click to the code that already does that thing (pause, focus, select, fork, review, open a tool).
 
-use gpui::{AnyElement, App, Context, Window};
+use gpui::{AnyElement, Context, Window};
 use xctx_core::{MAX_ATTEMPTS, SpaceId};
 use xctx_graph::{AgentRole, AgentState, LoopStatus};
 use xctx_layout::PaneId;
@@ -46,10 +46,11 @@ impl Workspace {
         }))
     }
 
-    /// What the Inspector's tabs show for the space `id`: its graph's agents, its attempts, its channel and its tools.
-    fn inspector_data(&mut self, id: &SpaceId, cx: &App) -> Option<InspectorData> {
-        // The dock's tools come first: they need `&mut self`, the rest is read below.
+    /// What the Inspector's tabs show for the space `id`: its files, graph's agents, attempts, channel and tools.
+    fn inspector_data(&mut self, id: &SpaceId, cx: &mut Context<Self>) -> Option<InspectorData> {
+        // The dock's tools and files come first: they need `&mut self`, the rest is read below.
         let tools = self.tool_dock_view(id).items;
+        let files = self.inspector_files_data(id, cx);
         let tab = self.tabs.get(id)?;
         let mut data = InspectorData {
             tab: self.inspector_tab,
@@ -62,6 +63,7 @@ impl Workspace {
             open_findings: 0,
             notes: 0,
             tools,
+            files,
         };
         if let Some(state) = self.graphs.get(id) {
             let graph = state.graph();
@@ -119,7 +121,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match action {
-            InspectorAction::SelectTab(tab) => self.inspector_tab = tab,
+            InspectorAction::SelectTab(tab) => {
+                self.inspector_tab = tab;
+                if tab == InspectorTab::Files
+                    && let Some(id) = self.active_space_id()
+                {
+                    self.ensure_sidebar_loaded(&id, cx);
+                }
+            }
             InspectorAction::Close => self.set_inspector_open(false, cx),
             InspectorAction::Focus(pane) => {
                 self.focus_pane(PaneId(pane), window, cx);
@@ -134,10 +143,42 @@ impl Workspace {
             InspectorAction::Fork => self.fork_from_keys(window, cx),
             InspectorAction::Review => self.open_review(window, cx),
             InspectorAction::ToggleTool { name, open } => {
-                if open {
+                if name.as_ref() == "files" {
+                    if let Some(id) = self.active_space_id() {
+                        self.show_files_sidebar(&id, None, cx);
+                    }
+                } else if open {
                     self.dock_close(&name, window, cx);
                 } else {
                     self.dock_open(&name, window, cx);
+                }
+            }
+            InspectorAction::FilesSelectRepo(repo) => {
+                if let Some(id) = self.active_space_id() {
+                    self.sidebar_select_repo(&id, repo.to_string(), cx);
+                }
+            }
+            InspectorAction::FilesToggleFolder(path) => {
+                if let Some(id) = self.active_space_id() {
+                    self.sidebar_toggle_folder(&id, path.as_ref(), cx);
+                }
+            }
+            InspectorAction::FilesOpenFile(path) => {
+                if let Some(id) = self.active_space_id() {
+                    let repo = self.inspector_files_data(&id, cx).active_repo.to_string();
+                    if !repo.is_empty() {
+                        self.open_file_pane(&id, &repo, path.as_ref(), None, window, cx);
+                    }
+                }
+            }
+            InspectorAction::FilesToggleChangedOnly(on) => {
+                if let Some(id) = self.active_space_id() {
+                    self.sidebar_set_changed_only(&id, on, cx);
+                }
+            }
+            InspectorAction::FilesRefresh => {
+                if let Some(id) = self.active_space_id() {
+                    self.sidebar_refresh_active(&id, cx);
                 }
             }
         }

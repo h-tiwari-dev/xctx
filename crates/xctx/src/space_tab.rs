@@ -173,8 +173,16 @@ pub(crate) fn is_current_shape(current: SpaceShape, shape: Shape) -> bool {
 /// for a plugin pane), with the exit code
 /// once it exited.
 pub(crate) fn pane_title(role: &PaneRole, terminal: Option<&PaneTerminal>) -> String {
-    let fallback = match (&role.kind, &role.plugin) {
-        (PaneKind::Plugin, Some(plugin)) => format!("{} · {plugin}", role.repo),
+    let fallback = match (&role.kind, &role.plugin, &role.file) {
+        (PaneKind::Plugin, Some(plugin), _) => format!("{} · {plugin}", role.repo),
+        (PaneKind::File, _, Some(file)) => {
+            let name = file.rsplit('/').next().unwrap_or(file);
+            if role.repo.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{} · {name}", role.repo)
+            }
+        }
         _ => format!("{} · {}", role.repo, pane_kind_label(role.kind)),
     };
     match terminal {
@@ -339,6 +347,10 @@ impl Workspace {
     ) {
         if pane.role.kind == PaneKind::Plugin {
             self.start_plugin_pane(id, pane, window, cx);
+            return;
+        }
+        if pane.role.kind == PaneKind::File {
+            self.sync_file_panes(id, cx);
             return;
         }
         if self.start_rpc_pane(id, pane, start, window, cx) {
@@ -554,6 +566,25 @@ impl Workspace {
                     // Clicking into a terminal focuses it; keep the tree in step.
                     let _ = tab.layout.focus(pane);
                 }
+            }
+            TerminalViewEvent::OpenLink {
+                target,
+                kind,
+                working_dir,
+            } => {
+                let target = target.clone();
+                let kind = kind.clone();
+                let working_dir = working_dir.clone();
+                self.handle_terminal_open_link(
+                    id,
+                    pane,
+                    &target,
+                    &kind,
+                    working_dir.as_deref(),
+                    window,
+                    cx,
+                );
+                return;
             }
             TerminalViewEvent::Bell => return,
         }
@@ -807,9 +838,17 @@ impl Workspace {
             .layout
             .role(pane)
             .is_some_and(|r| r.kind == PaneKind::Plugin);
+        let was_file = tab
+            .layout
+            .role(pane)
+            .is_some_and(|r| r.kind == PaneKind::File);
         tab.layout.close(pane).map_err(|e| layout_error(id, e))?;
         tab.terminals.remove(&pane);
         self.plugin_panes.forget(id, pane);
+        if was_file {
+            self.file_panes.close_pane(&(id.clone(), pane));
+            self.browsers.close_document(id, pane);
+        }
         if was_plugin {
             self.plugin_pane_closed(id, pane, cx);
         }
@@ -1004,6 +1043,8 @@ impl Workspace {
         for pane in &result.removed {
             tab.terminals.remove(&pane.id);
             self.plugin_panes.forget(id, pane.id);
+            self.file_panes.close_pane(&(id.clone(), pane.id));
+            self.browsers.close_document(id, pane.id);
         }
         self.sync_agent_panes(id);
         for pane in &result.added {
@@ -1033,6 +1074,7 @@ impl Workspace {
         }
         self.stop_space_plugins(id);
         self.plugin_panes.forget_space(id);
+        self.file_panes.close_space(id);
         let sessions = self
             .tabs
             .remove(id)
@@ -1132,6 +1174,17 @@ impl Workspace {
                                     "{} tool",
                                     pane.role.plugin.as_deref().unwrap_or("unknown")
                                 ))
+                                .into_any_element()
+                        }),
+                    None if pane.role.kind == PaneKind::File => self
+                        .render_file_pane(&tab.space.id, pane.id, cx)
+                        .unwrap_or_else(|| {
+                            div()
+                                .size_full()
+                                .p(Theme::SPACE_3)
+                                .text_size(Theme::TEXT_SM)
+                                .text_color(theme.text_subtle)
+                                .child("Loading file…")
                                 .into_any_element()
                         }),
                     None => div()
@@ -1298,36 +1351,15 @@ impl Workspace {
         )
     }
 
-    /// Files: show xctx's file explorer of `repo`'s worktree in open space `id`, mounting the `files` plugin there
-    /// unless it is mounted already.
+    /// Files: open the delinked side file tree in the Inspector focused on `repo`'s worktree.
     fn open_repo_files(
         &mut self,
         id: &SpaceId,
         repo: &str,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mounted = self
-            .mounted_plugins(id)
-            .into_iter()
-            .find(|m| m.plugin == "files" && m.repo == repo);
-        let result = match mounted {
-            Some(mount) => self.focus_pane_in(id, mount.pane, window, cx),
-            None => self
-                .mount_plugin(
-                    id,
-                    "files",
-                    Some(repo.to_owned()),
-                    crate::plugin_host::MountSettings::default(),
-                    false,
-                    window,
-                    cx,
-                )
-                .map(|_| ()),
-        };
-        if let Err(e) = result {
-            self.show_op_error(e, cx);
-        }
+        self.show_files_sidebar(id, Some(repo), cx);
     }
 
     /// Git: focus the lazygit pane of `repo` in open space `id`, or split one beside `beside`.

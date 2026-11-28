@@ -33,6 +33,8 @@ pub enum PaneKind {
     /// A mounted plugin's pane; [`PaneRole::plugin`] names the plugin. Reshaping never drops one: only
     /// unmounting the plugin closes it.
     Plugin,
+    /// A standalone file viewer panel; [`PaneRole::file`] names the file path. Reshaping never drops one.
+    File,
 }
 
 /// What a pane is for: its kind and the repo it works in.
@@ -46,15 +48,20 @@ pub struct PaneRole {
     /// from the JSON when `None`, so layouts saved before plugins existed load and save unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
+    /// The file path a [`PaneKind::File`] pane shows (relative to `repo`'s worktree, or an absolute path).
+    /// `None` for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 impl PaneRole {
-    /// A role of `kind` in `repo` that shows no plugin.
+    /// A role of `kind` in `repo` that shows no plugin or file.
     pub fn new(kind: PaneKind, repo: impl Into<String>) -> PaneRole {
         PaneRole {
             kind,
             repo: repo.into(),
             plugin: None,
+            file: None,
         }
     }
 
@@ -64,6 +71,17 @@ impl PaneRole {
             kind: PaneKind::Plugin,
             repo: repo.into(),
             plugin: Some(plugin.into()),
+            file: None,
+        }
+    }
+
+    /// The role of a file viewer panel showing `file` in `repo`.
+    pub fn for_file(file: impl Into<String>, repo: impl Into<String>) -> PaneRole {
+        PaneRole {
+            kind: PaneKind::File,
+            repo: repo.into(),
+            plugin: None,
+            file: Some(file.into()),
         }
     }
 }
@@ -302,7 +320,7 @@ impl<'a, F: FnMut() -> PaneId> PanePool<'a, F> {
     }
 
     fn claim_plugins(&mut self) -> Vec<RolePane> {
-        self.claim_where(|p| p.role.kind == PaneKind::Plugin)
+        self.claim_where(|p| matches!(p.role.kind, PaneKind::Plugin | PaneKind::File))
     }
 
     fn claim_where(&mut self, wanted: impl Fn(&RolePane) -> bool) -> Vec<RolePane> {

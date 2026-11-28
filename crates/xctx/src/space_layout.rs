@@ -233,6 +233,30 @@ impl SpaceLayout {
         Ok(RolePane { id, role })
     }
 
+    /// Add a standalone file viewer pane (`PaneKind::File`) on the right side of the layout (stacking
+    /// with existing file/plugin panes if present, or opening a side split at the right of the workspace),
+    /// and focus it.
+    pub fn add_file_pane(&mut self, role: PaneRole) -> Result<RolePane, LayoutError> {
+        let last_side = self
+            .panes()
+            .into_iter()
+            .rev()
+            .find(|p| matches!(p.role.kind, PaneKind::File | PaneKind::Plugin))
+            .map(|p| p.id);
+        let id = PaneId(self.next_pane_id);
+        match last_side {
+            Some(last) => self
+                .tree
+                .split(last, SplitAxis::Vertical, id, SPLIT_RATIO)?,
+            None => self
+                .tree
+                .split_root(SplitAxis::Horizontal, id, PLUGIN_COLUMN_BASE_SHARE)?,
+        };
+        self.take_pane_id();
+        self.roles.insert(id, role.clone());
+        Ok(RolePane { id, role })
+    }
+
     /// Close `pane`. Returns the focused pane afterwards. Fails with [`LayoutError::LastPane`] for the only pane.
     pub fn close(&mut self, pane: PaneId) -> Result<PaneId, LayoutError> {
         let focused = self.tree.close(pane)?;

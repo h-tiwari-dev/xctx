@@ -12,6 +12,7 @@ mod attempts;
 mod control;
 mod dev_setup;
 mod dialogs;
+mod file_panes;
 mod flow;
 mod home;
 mod inbox_view;

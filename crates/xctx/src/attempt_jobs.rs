@@ -516,6 +516,12 @@ impl Workspace {
                 *title = (!new_title.is_empty()).then(|| new_title.clone());
             }
             TerminalViewEvent::Exited(code) => *exited = Some(*code),
+            TerminalViewEvent::OpenLink { target, .. } => {
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    cx.open_url(target);
+                }
+                return;
+            }
             TerminalViewEvent::Focused | TerminalViewEvent::Bell => return,
         }
         cx.notify();

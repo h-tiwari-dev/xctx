@@ -567,6 +567,12 @@ impl Workspace {
                     ],
                 ),
                 action(
+                    "files",
+                    "Toggle Files explorer",
+                    Some("⌘⇧E"),
+                    &["files", "tree", "sidebar", "explorer"],
+                ),
+                action(
                     "add-agent",
                     "Add agent…",
                     None,
@@ -690,6 +696,7 @@ impl Workspace {
             "inspector-plugins" => {
                 self.show_inspector_tab(xctx_ui::inspector::InspectorTab::Plugins, cx)
             }
+            "files" => self.toggle_files_sidebar(cx),
             "toggle-translucency" => self.toggle_translucency(window, cx),
             "rescan" => self.rescan(cx),
             "split-right" => self.split(SplitAxis::Horizontal, window, cx),

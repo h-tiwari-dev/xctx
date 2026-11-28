@@ -3,12 +3,49 @@
 use gpui::{Rgba, SharedString, px, rgb, rgba};
 use xctx_term::{AnsiColor, Cell, CellFlags, Color, Rgb, TerminalConfig, default_indexed_color};
 
+/// Preferred monospaced fonts with built-in Nerd Font / Powerline icon coverage, tried in order
+/// when resolving the default terminal font against installed system fonts.
+const PREFERRED_FAMILIES: &[&str] = &[
+    "JetBrainsMono Nerd Font Mono",
+    "JetBrainsMono Nerd Font",
+    "MesloLGS Nerd Font Mono",
+    "MesloLGS Nerd Font",
+    "CaskaydiaCove Nerd Font Mono",
+    "CaskaydiaCove Nerd Font",
+    "Hack Nerd Font Mono",
+    "FiraCode Nerd Font Mono",
+    "SF Mono",
+    "JetBrains Mono",
+    "Menlo",
+];
+
+/// Fallback fonts for Nerd Font icons, Powerline glyphs, Unicode symbols, and emoji.
+const DEFAULT_FALLBACKS: &[&str] = &[
+    "JetBrainsMono Nerd Font Mono",
+    "JetBrainsMono Nerd Font",
+    "MesloLGS Nerd Font Mono",
+    "CaskaydiaCove Nerd Font Mono",
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "Menlo",
+    "Apple Symbols",
+    "Apple Color Emoji",
+];
+
+/// Minimum and maximum font sizes (in px) for Cmd+= / Cmd+- zoom.
+pub const MIN_FONT_SIZE: f32 = 9.0;
+pub const MAX_FONT_SIZE: f32 = 28.0;
+pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+
 /// The font a terminal draws its grid with. Every cell is one advance of `'m'` wide and
 /// `size * line_height` tall.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalFont {
     /// Font family. Use a monospaced font; proportional fonts are drawn on the cell grid anyway.
     pub family: SharedString,
+    /// Fallback font families tried when a glyph (such as a Nerd Font icon or symbol) is absent
+    /// from `family`.
+    pub fallbacks: Vec<SharedString>,
     /// Font size in pixels.
     pub size: f32,
     /// Row height as a multiple of `size`.
@@ -19,20 +56,64 @@ impl Default for TerminalFont {
     fn default() -> Self {
         Self {
             family: "Menlo".into(),
-            size: 13.0,
+            fallbacks: DEFAULT_FALLBACKS.iter().map(|&f| f.into()).collect(),
+            size: DEFAULT_FONT_SIZE,
             line_height: 1.3,
         }
     }
 }
 
 impl TerminalFont {
+    /// Picks the best installed Nerd Font / monospace family when still using the default `"Menlo"`,
+    /// and trims fallbacks to fonts available on this system (preserving core macOS symbol fallbacks).
+    pub fn resolve_for_available_fonts(&mut self, available: &[String]) {
+        if available.is_empty() {
+            return;
+        }
+        let has = |name: &str| available.iter().any(|f| f == name);
+        if self.family == "Menlo"
+            && let Some(&best) = PREFERRED_FAMILIES.iter().find(|&&name| has(name))
+        {
+            self.family = best.into();
+        }
+        let mut resolved: Vec<SharedString> = self
+            .fallbacks
+            .iter()
+            .filter(|f| f.as_ref() != self.family.as_ref() && has(f.as_ref()))
+            .cloned()
+            .collect();
+        for &core in &["Menlo", "Apple Symbols", "Apple Color Emoji"] {
+            if self.family.as_ref() != core
+                && !resolved.iter().any(|f| f.as_ref() == core)
+                && has(core)
+            {
+                resolved.push(core.into());
+            }
+        }
+        self.fallbacks = resolved;
+    }
+
+    /// Resolves `family` and `fallbacks` against the window's installed fonts.
+    pub fn resolve_for_window(&mut self, window: &gpui::Window) {
+        let available = window.text_system().all_font_names();
+        self.resolve_for_available_fonts(&available);
+    }
+
     /// The GPUI font for a cell's weight and slant. Ligatures are disabled so every cell
     /// keeps its own glyph.
     pub fn gpui_font(&self, bold: bool, italic: bool) -> gpui::Font {
+        let fallbacks = (!self.fallbacks.is_empty()).then(|| {
+            gpui::FontFallbacks::from_fonts(
+                self.fallbacks
+                    .iter()
+                    .map(|f| f.as_ref().to_owned())
+                    .collect(),
+            )
+        });
         gpui::Font {
             family: self.family.clone(),
             features: gpui::FontFeatures::disable_ligatures(),
-            fallbacks: None,
+            fallbacks,
             weight: if bold {
                 gpui::FontWeight::BOLD
             } else {
@@ -278,5 +359,25 @@ mod tests {
         theme.apply_to_config(&mut config);
         assert_eq!(config.default_background, Rgb::new(0x18, 0x18, 0x1b));
         assert_eq!(config.default_foreground, Rgb::new(0xe4, 0xe4, 0xe7));
+    }
+
+    #[test]
+    fn default_font_prefers_installed_nerd_font_and_populates_fallbacks() {
+        let mut font = TerminalFont::default();
+        let available = vec![
+            "Menlo".to_owned(),
+            "Apple Symbols".to_owned(),
+            "JetBrainsMono Nerd Font Mono".to_owned(),
+            "Apple Color Emoji".to_owned(),
+        ];
+        font.resolve_for_available_fonts(&available);
+        assert_eq!(font.family.as_ref(), "JetBrainsMono Nerd Font Mono");
+        assert!(font.fallbacks.iter().any(|f| f.as_ref() == "Apple Symbols"));
+        assert!(
+            font.fallbacks
+                .iter()
+                .any(|f| f.as_ref() == "Apple Color Emoji")
+        );
+        assert!(font.gpui_font(false, false).fallbacks.is_some());
     }
 }

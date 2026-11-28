@@ -27,9 +27,9 @@ use crate::inspector::{self, InspectorPlacement};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
-    ResizeUp, ReviewAttempts, ShowHome, ShowInspectorPlugins, SplitDown, SplitRight, ToggleDock,
-    ToggleFlow, ToggleInbox, ToggleInspector, TogglePalette, ToggleRoster, ToggleTranslucency,
-    ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
+    ResizeUp, ReviewAttempts, ShowFiles, ShowHome, ShowInspectorPlugins, SplitDown, SplitRight,
+    ToggleDock, ToggleFlow, ToggleInbox, ToggleInspector, TogglePalette, ToggleRoster,
+    ToggleTranslucency, ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
@@ -156,6 +156,8 @@ pub(crate) struct Workspace {
     pub(crate) plugin_ticker: bool,
     /// The drawn plugin panes' own state (inputs, selections, the views last built).
     pub(crate) plugin_panes: crate::plugin_panes::PluginPanes,
+    /// The delinked side file explorer and standalone file viewer panels.
+    pub(crate) file_panes: crate::file_panes::FilePanesState,
     /// The open spaces' live browsers (the browser panes' pages), drawn over the window.
     pub(crate) browsers: crate::plugin_browser::Browsers,
     /// The hint bubbles for local servers seen in the open spaces' terminals.
@@ -349,6 +351,7 @@ impl Workspace {
             runners: load_runners(user_runner_dir().as_deref()),
             plugin_ticker: false,
             plugin_panes: Default::default(),
+            file_panes: Default::default(),
             browsers: Default::default(),
             serve_hints: Default::default(),
             tool_dock: Default::default(),
@@ -794,6 +797,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ShowInspectorPlugins, _, cx| {
                 this.show_inspector_tab(xctx_ui::inspector::InspectorTab::Plugins, cx)
             }))
+            .on_action(cx.listener(|this, _: &ShowFiles, _, cx| this.toggle_files_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleTranslucency, window, cx| {
                 this.toggle_translucency(window, cx)
             }))

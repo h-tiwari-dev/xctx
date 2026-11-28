@@ -558,6 +558,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<xctx_layout::PaneId> {
         let id = self.active_space_id()?;
+        if name == "files" {
+            self.show_files_sidebar(&id, None, cx);
+            return None;
+        }
         let (title, plan) = self.tool_plan(&id, name)?;
         let (repo, settings) = match plan {
             Some(plan) if plan.needs_input => {

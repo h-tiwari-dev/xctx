@@ -16,6 +16,7 @@
 mod common;
 
 pub mod browser;
+pub mod file_panel;
 pub mod files;
 pub mod http;
 pub mod logs;
@@ -26,6 +27,7 @@ pub use browser::{
     CONSOLE_STRIP_HEIGHT, ConsoleRow, NETWORK_ROW_LIMIT, NetworkErrorRow, loading_label,
 };
 pub use common::{Caps, Excerpt, excerpt};
+pub use file_panel::{FilePanelAction, FilePanelData, FilePanelView};
 pub use files::{
     FILES_BINARY, FILES_LINE_CHARS, FILES_LINE_LIMIT, FILES_NO_CHANGES, FILES_NO_SELECTION,
     FILES_ROW_LIMIT, FILES_TREE_WIDTH, FileMark, FileRow, FileRowKind, FilesPaneView, FilesPreview,

@@ -78,7 +78,7 @@ impl Tone {
             PaneKind::Agent => Self::Accent,
             PaneKind::Shell => Self::Success,
             PaneKind::Git => Self::Warning,
-            PaneKind::Plugin => Self::Neutral,
+            PaneKind::Plugin | PaneKind::File => Self::Neutral,
         }
     }
 }

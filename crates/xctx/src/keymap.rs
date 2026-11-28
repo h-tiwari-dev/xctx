@@ -70,6 +70,8 @@ actions!(
         ToggleInspector,
         /// Show the Inspector on its Plugins tab.
         ShowInspectorPlugins,
+        /// Show or hide the delinked side Files explorer.
+        ShowFiles,
     ]
 );
 
@@ -114,6 +116,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-j", ToggleDock, ws),
         KeyBinding::new("cmd-i", ToggleInspector, ws),
         KeyBinding::new("cmd-shift-p", ShowInspectorPlugins, ws),
+        KeyBinding::new("cmd-shift-e", ShowFiles, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
     ];
     for (index, key) in TAB_KEYS.into_iter().enumerate() {

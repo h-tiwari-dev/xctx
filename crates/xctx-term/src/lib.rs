@@ -16,7 +16,9 @@ mod session;
 mod snapshot;
 
 pub use config::TerminalConfig;
-pub use emulator::{Emulator, SelectionMode, Side, TerminalEvent};
+pub use emulator::{
+    Emulator, LinkSpan, SelectionMode, Side, TerminalEvent, TerminalLink, TerminalLinkKind,
+};
 pub use error::TermError;
 pub use session::TerminalSession;
 pub use snapshot::{

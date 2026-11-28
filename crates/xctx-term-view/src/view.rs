@@ -9,17 +9,18 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, Hitbox, HitboxBehavior, Hsla, KeyDownEvent,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, ScrollDelta,
-    ScrollEvent, ShapedLine, StrikethroughStyle, Subscription, Task, TextAlign, TextRun,
-    TouchPhase, UnderlineStyle, WeakEntity, Window, canvas, div, fill, outline, point, prelude::*,
-    px, size,
+    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    Rgba, ScrollDelta, ScrollEvent, ShapedLine, StrikethroughStyle, Subscription, Task, TextAlign,
+    TextRun, TouchPhase, UnderlineStyle, WeakEntity, Window, canvas, div, fill, outline, point,
+    prelude::*, px, size,
 };
 use xctx_term::input::{
     self, MouseButton as TermMouseButton, MouseEvent as TermMouseEvent, MouseEventKind,
 };
 use xctx_term::{
-    CellFlags, CursorShape, GridSnapshot, MouseReporting, SelectionMode, Side, TermError,
-    TerminalConfig, TerminalEvent, TerminalModes, TerminalSession, ViewportPoint,
+    CellFlags, CursorShape, GridSnapshot, LinkSpan, MouseReporting, SelectionMode, Side, TermError,
+    TerminalConfig, TerminalEvent, TerminalLink, TerminalLinkKind, TerminalModes, TerminalSession,
+    ViewportPoint,
 };
 
 use crate::grid::{
@@ -27,7 +28,7 @@ use crate::grid::{
     text_segments,
 };
 use crate::keys::key_event_for_keystroke;
-use crate::theme::{TerminalFont, TerminalTheme};
+use crate::theme::{DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE, TerminalFont, TerminalTheme};
 
 /// What a [`TerminalView`] tells its parent. Subscribe with `cx.subscribe`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,15 @@ pub enum TerminalViewEvent {
     Exited(Option<i32>),
     /// The view gained keyboard focus.
     Focused,
+    /// The user Cmd+clicked a URL, OSC 8 hyperlink, or file path in the terminal.
+    OpenLink {
+        /// The raw matched token or URI.
+        target: String,
+        /// How the link should be interpreted.
+        kind: TerminalLinkKind,
+        /// The terminal's live current working directory when clicked, if known.
+        working_dir: Option<PathBuf>,
+    },
 }
 
 /// A button press reported to the program, whose motion and release are reported too.
@@ -85,6 +95,10 @@ pub struct TerminalView {
     reported_press: Option<ReportedPress>,
     /// The cell of the last hover motion report, so each cell is reported once.
     last_hover_point: Option<ViewportPoint>,
+    /// The cell currently under the pointer (when hovered), for Cmd+hover link underlines.
+    pointer_cell: Option<ViewportPoint>,
+    /// The clickable link currently highlighted while Cmd is held over a path or URL.
+    hovered_link: Option<TerminalLink>,
     /// Fraction of a line scrolled but not applied yet.
     scroll_remainder: f32,
     _event_task: Task<()>,
@@ -107,11 +121,12 @@ impl TerminalView {
     /// are only the size until the view is first laid out.
     pub fn spawn(
         mut config: TerminalConfig,
-        font: TerminalFont,
+        mut font: TerminalFont,
         theme: TerminalTheme,
         window: &mut Window,
         cx: &mut App,
     ) -> Result<Entity<Self>, TermError> {
+        font.resolve_for_window(window);
         theme.apply_to_config(&mut config);
         let metrics = cell_metrics(&font, window);
         let (cell_width, cell_height) = metrics.cell_size_pixels();
@@ -204,10 +219,34 @@ impl TerminalView {
             selection_dragging: false,
             reported_press: None,
             last_hover_point: None,
+            pointer_cell: None,
+            hovered_link: None,
             scroll_remainder: 0.0,
             _event_task: event_task,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Adjusts the font size by `delta` px (clamped to [`MIN_FONT_SIZE`]..=[`MAX_FONT_SIZE`]).
+    pub fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let next = (self.font.size + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if (next - self.font.size).abs() > f32::EPSILON {
+            self.font.size = next;
+            cx.notify();
+        }
+    }
+
+    /// Resets the terminal font size to [`DEFAULT_FONT_SIZE`].
+    pub fn reset_font_size(&mut self, cx: &mut Context<Self>) {
+        if (self.font.size - DEFAULT_FONT_SIZE).abs() > f32::EPSILON {
+            self.font.size = DEFAULT_FONT_SIZE;
+            cx.notify();
+        }
+    }
+
+    /// Current terminal font size in pixels.
+    pub fn font_size(&self) -> f32 {
+        self.font.size
     }
 
     /// The session this view draws, for its pid, title, exit status or to write to it.
@@ -319,9 +358,111 @@ impl TerminalView {
                         self.paste_clipboard(cx);
                         cx.stop_propagation();
                     }
+                    "a" => {
+                        self.session.select_all();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    // macOS line editing: Cmd+Backspace kills to line start (Ctrl+U),
+                    // Cmd+Delete kills to line end (Ctrl+K), Cmd+Left/Right jump to line start/end.
+                    key if macos_cmd_edit_bytes(key).is_some() => {
+                        if let Some(bytes) = macos_cmd_edit_bytes(key) {
+                            self.write_input(bytes, cx);
+                            cx.stop_propagation();
+                        }
+                    }
+                    "up" => {
+                        self.session.scroll_to_top();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "down" => {
+                        self.session.scroll_to_bottom();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "=" | "+" => {
+                        self.adjust_font_size(1.0, cx);
+                        cx.stop_propagation();
+                    }
+                    "-" => {
+                        self.adjust_font_size(-1.0, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            } else if !modifiers.control && !modifiers.alt && modifiers.shift {
+                match keystroke.key.as_str() {
+                    // Cmd+Shift+K clears scrollback history and redraws the screen (Cmd+K opens the palette).
+                    "k" => {
+                        self.session.clear_history();
+                        self.write_input(&[0x0c], cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    // Cmd+Shift+0 (or Cmd++) resets / zooms font size without colliding with Cmd+0 (Home).
+                    "0" | ")" => {
+                        self.reset_font_size(cx);
+                        cx.stop_propagation();
+                    }
+                    "=" | "+" => {
+                        self.adjust_font_size(1.0, cx);
+                        cx.stop_propagation();
+                    }
                     _ => {}
                 }
             }
+            return;
+        }
+
+        let modes = self.session.modes();
+
+        // Standard terminal scrollback navigation (Shift+PageUp/PageDown/Home/End).
+        if modifiers.shift
+            && !modifiers.control
+            && !modifiers.alt
+            && modes.mouse_reporting == MouseReporting::Off
+            && !modes.alternate_scroll
+        {
+            match keystroke.key.as_str() {
+                "pageup" => {
+                    self.session.scroll_page(1);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "pagedown" => {
+                    self.session.scroll_page(-1);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "home" => {
+                    self.session.scroll_to_top();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "end" => {
+                    self.session.scroll_to_bottom();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // macOS Option+Left / Option+Right / Option+Delete word navigation & editing in legacy mode:
+        // send standard Meta-b / Meta-f / Meta-d so zsh/bash/fish/readline work out of the box.
+        if modifiers.alt
+            && !modifiers.control
+            && !modifiers.shift
+            && modes.kitty_keyboard.is_empty()
+            && let Some(bytes) = macos_alt_word_bytes(keystroke.key.as_str())
+        {
+            cx.stop_propagation();
+            self.write_input(bytes, cx);
             return;
         }
 
@@ -330,11 +471,36 @@ impl TerminalView {
         else {
             return;
         };
-        let Some(bytes) = input::encode_key(&key_event, &self.session.modes()) else {
+        let Some(bytes) = input::encode_key(&key_event, &modes) else {
             return;
         };
         cx.stop_propagation();
         self.write_input(&bytes, cx);
+    }
+
+    fn update_hovered_link(&mut self, modifiers: gpui::Modifiers, cx: &mut Context<Self>) {
+        let next = if modifiers.platform
+            && !modifiers.control
+            && !modifiers.alt
+            && !self.selection_dragging
+        {
+            self.pointer_cell.and_then(|pt| self.session.link_at(pt))
+        } else {
+            None
+        };
+        if next != self.hovered_link {
+            self.hovered_link = next;
+            cx.notify();
+        }
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_hovered_link(event.modifiers, cx);
     }
 
     fn point_for(&self, position: Point<Pixels>) -> Option<(ViewportPoint, Side)> {
@@ -359,6 +525,21 @@ impl TerminalView {
         let Some((point, side)) = self.point_for(event.position) else {
             return;
         };
+        // Cmd+Click opens a file path, URL, or OSC 8 hyperlink even if mouse reporting is on.
+        if event.button == gpui::MouseButton::Left
+            && event.modifiers.platform
+            && !event.modifiers.control
+            && !event.modifiers.alt
+            && let Some(link) = self.session.link_at(point)
+        {
+            let working_dir = self.session.working_directory();
+            cx.emit(TerminalViewEvent::OpenLink {
+                target: link.target,
+                kind: link.kind,
+                working_dir,
+            });
+            return;
+        }
         let modes = self.session.modes();
         if reports_mouse(&modes, event.modifiers) {
             let Some(button) = term_mouse_button(event.button) else {
@@ -401,9 +582,21 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            if self.pointer_cell.take().is_some() || self.hovered_link.take().is_some() {
+                cx.notify();
+            }
+            if !self.selection_dragging && self.reported_press.is_none() {
+                return;
+            }
+        }
         let Some((point, side)) = self.point_for(event.position) else {
             return;
         };
+        if hovered {
+            self.pointer_cell = Some(point);
+            self.update_hovered_link(event.modifiers, cx);
+        }
         if let Some(press) = self.reported_press.as_mut() {
             if press.last_point != point {
                 press.last_point = point;
@@ -552,11 +745,17 @@ impl TerminalView {
         }
 
         let snapshot = self.session.snapshot();
+        let hovered_spans = self
+            .hovered_link
+            .as_ref()
+            .map(|l| l.spans.as_slice())
+            .unwrap_or(&[]);
         let frame = FrameLayout {
             bounds,
             metrics,
             font: &self.font,
             theme: &self.theme,
+            hovered_spans,
         };
         frame.prepare(&snapshot, focused, window)
     }
@@ -624,6 +823,7 @@ struct PreparedFrame {
     selection: Vec<Bounds<Pixels>>,
     selection_color: Hsla,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
+    hover_underlines: Vec<(Bounds<Pixels>, Hsla)>,
     cursor: Option<PreparedCursor>,
     thumb: Option<(Bounds<Pixels>, Hsla)>,
     line_height: Pixels,
@@ -635,6 +835,7 @@ struct FrameLayout<'a> {
     metrics: CellMetrics,
     font: &'a TerminalFont,
     theme: &'a TerminalTheme,
+    hovered_spans: &'a [LinkSpan],
 }
 
 impl FrameLayout<'_> {
@@ -746,6 +947,23 @@ impl FrameLayout<'_> {
             )
         });
 
+        let underline_color: Hsla = theme.ansi[4].into();
+        let hover_underlines = self
+            .hovered_spans
+            .iter()
+            .filter(|span| span.row < snapshot.rows && span.start_col <= span.end_col)
+            .map(|span| {
+                let end = span.end_col.min(snapshot.cols.saturating_sub(1));
+                let len = end.saturating_sub(span.start_col) + 1;
+                let cell_rect = self.cells_bounds(span.row, span.start_col, len);
+                let line_rect = Bounds::new(
+                    point(cell_rect.origin.x, cell_rect.bottom() - px(1.5)),
+                    size(cell_rect.size.width, px(1.5)),
+                );
+                (line_rect, underline_color)
+            })
+            .collect();
+
         PreparedFrame {
             bounds: self.bounds,
             background: theme.background.into(),
@@ -753,6 +971,7 @@ impl FrameLayout<'_> {
             selection,
             selection_color: theme.selection.into(),
             lines,
+            hover_underlines,
             cursor,
             thumb,
             line_height: self.metrics.line_height,
@@ -833,6 +1052,9 @@ impl PreparedFrame {
             // A glyph that cannot be rasterized is skipped; the rest of the frame still draws.
             let _ = line.paint(*origin, self.line_height, TextAlign::Left, None, window, cx);
         }
+        for (bounds, color) in self.hover_underlines {
+            window.paint_quad(fill(bounds, color));
+        }
         if let Some(cursor) = &self.cursor {
             match cursor.paint {
                 CursorPaint::Fill(bounds) => window.paint_quad(fill(bounds, cursor.color)),
@@ -851,8 +1073,18 @@ impl PreparedFrame {
 }
 
 /// Registers the frame's mouse handlers, which forward to the view.
-fn register_mouse_handlers(view: WeakEntity<TerminalView>, hitbox: Hitbox, window: &mut Window) {
-    window.set_cursor_style(CursorStyle::IBeam, &hitbox);
+fn register_mouse_handlers(
+    view: WeakEntity<TerminalView>,
+    hitbox: Hitbox,
+    pointer_link: bool,
+    window: &mut Window,
+) {
+    let cursor = if pointer_link {
+        CursorStyle::PointingHand
+    } else {
+        CursorStyle::IBeam
+    };
+    window.set_cursor_style(cursor, &hitbox);
 
     window.on_mouse_event({
         let view = view.clone();
@@ -896,12 +1128,24 @@ impl Render for TerminalView {
         let weak_view = cx.weak_entity();
 
         let highlight = self.theme.drop_highlight;
+        let pointer_link = self.hovered_link.is_some();
+        let scrolled_up = self.session.display_offset() > 0;
+        let pill_bg = Rgba {
+            a: 0.92,
+            ..self.theme.background
+        };
+        let pill_border = Rgba {
+            a: 0.4,
+            ..self.theme.foreground
+        };
+        let pill_fg = self.theme.foreground;
         div()
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .size_full()
             .relative()
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(
                 canvas(
                     move |bounds, window, cx| {
@@ -913,11 +1157,35 @@ impl Render for TerminalView {
                     },
                     move |_bounds, (frame, hitbox), window, cx| {
                         frame.paint(window, cx);
-                        register_mouse_handlers(weak_view, hitbox, window);
+                        register_mouse_handlers(weak_view, hitbox, pointer_link, window);
                     },
                 )
                 .size_full(),
             )
+            .when(scrolled_up, |el| {
+                el.child(
+                    div()
+                        .id("terminal-jump-bottom")
+                        .absolute()
+                        .right(px(12.0))
+                        .bottom(px(10.0))
+                        .px(px(9.0))
+                        .py(px(3.0))
+                        .rounded(px(999.0))
+                        .bg(pill_bg)
+                        .border_1()
+                        .border_color(pill_border)
+                        .text_size(px(11.0))
+                        .text_color(pill_fg)
+                        .cursor_pointer()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.session.scroll_to_bottom();
+                            cx.notify();
+                        }))
+                        .child("↓ Bottom"),
+                )
+            })
             .child(
                 div()
                     .absolute()
@@ -956,6 +1224,27 @@ pub fn shell_quote_paths(paths: &[PathBuf]) -> String {
     out
 }
 
+/// Bytes sent to the PTY for macOS Cmd-modified line editing shortcuts.
+pub(crate) fn macos_cmd_edit_bytes(key: &str) -> Option<&'static [u8]> {
+    match key {
+        "backspace" => Some(&[0x15]),
+        "delete" => Some(&[0x0b]),
+        "left" => Some(&[0x01]),
+        "right" => Some(&[0x05]),
+        _ => None,
+    }
+}
+
+/// Bytes sent to the PTY for macOS Option+arrow / Option+delete word shortcuts in legacy mode.
+pub(crate) fn macos_alt_word_bytes(key: &str) -> Option<&'static [u8]> {
+    match key {
+        "left" => Some(b"\x1bb"),
+        "right" => Some(b"\x1bf"),
+        "delete" => Some(b"\x1bd"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,5 +1279,16 @@ mod tests {
     #[test]
     fn no_paths_give_nothing() {
         assert_eq!(quote(&[]), "");
+    }
+
+    #[test]
+    fn macos_terminal_shortcuts_map_to_expected_control_sequences() {
+        assert_eq!(macos_cmd_edit_bytes("backspace"), Some(&[0x15][..]));
+        assert_eq!(macos_cmd_edit_bytes("delete"), Some(&[0x0b][..]));
+        assert_eq!(macos_cmd_edit_bytes("left"), Some(&[0x01][..]));
+        assert_eq!(macos_cmd_edit_bytes("right"), Some(&[0x05][..]));
+        assert_eq!(macos_alt_word_bytes("left"), Some(&b"\x1bb"[..]));
+        assert_eq!(macos_alt_word_bytes("right"), Some(&b"\x1bf"[..]));
+        assert_eq!(macos_alt_word_bytes("delete"), Some(&b"\x1bd"[..]));
     }
 }

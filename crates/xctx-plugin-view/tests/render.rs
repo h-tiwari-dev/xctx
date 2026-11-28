@@ -761,3 +761,75 @@ fn the_files_pane_caps_its_rows_and_says_when_nothing_changed(cx: &mut TestAppCo
     });
     assert!(drawn(cx, "files-no-changes"));
 }
+
+#[gpui::test]
+fn standalone_file_panel_draws_code_markdown_diff_and_emits_toolbar_actions(
+    cx: &mut TestAppContext,
+) {
+    use xctx_plugin_view::{FilePanelAction, FilePanelData, FilePanelView, markdown_blocks};
+
+    let data = FilePanelData {
+        path: "src/main.rs".into(),
+        size: Some(128),
+        mark: Some(FileMark::Modified),
+        cut: None,
+        can_diff: true,
+        diff: false,
+        is_markdown: false,
+        raw_markdown: false,
+        target_line: Some(2),
+        body: PreviewBody::Lines(vec!["fn main() {".into(), "    println!(\"hi\");".into()]),
+    };
+
+    let (events, host, cx) = host(cx, data, |data, log| {
+        FilePanelView::new(data)
+            .on_action(move |action, _, _| push(&log, format!("{action:?}")))
+            .into_any_element()
+    });
+
+    for selector in [
+        "file-panel",
+        "file-panel-toolbar",
+        "file-panel-path",
+        "file-panel-code",
+        "file-panel-diff",
+        "file-panel-reveal",
+        "file-panel-copy-path",
+        "file-panel-copy",
+        "file-panel-reload",
+    ] {
+        assert!(drawn(cx, selector), "{selector} is drawn");
+    }
+
+    for selector in [
+        "file-panel-diff",
+        "file-panel-reveal",
+        "file-panel-copy-path",
+        "file-panel-copy",
+        "file-panel-reload",
+    ] {
+        assert!(click(cx, selector), "clicked {selector}");
+    }
+    assert_eq!(
+        *events.borrow(),
+        [
+            format!("{:?}", FilePanelAction::ToggleDiff(true)),
+            format!("{:?}", FilePanelAction::RevealInSidebar),
+            format!("{:?}", FilePanelAction::CopyPath),
+            format!("{:?}", FilePanelAction::CopyContent),
+            format!("{:?}", FilePanelAction::Reload),
+        ]
+    );
+
+    update(cx, &host, |d| {
+        d.path = "README.md".into();
+        d.is_markdown = true;
+        d.body = PreviewBody::Markdown(markdown_blocks("# Title\n\nBody text"));
+    });
+    assert!(drawn(cx, "file-panel-markdown"));
+    assert!(click(cx, "file-panel-md-toggle"));
+    assert_eq!(
+        events.borrow().last().map(String::as_str),
+        Some(format!("{:?}", FilePanelAction::ToggleRawMarkdown(true)).as_str())
+    );
+}

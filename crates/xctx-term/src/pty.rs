@@ -246,6 +246,53 @@ pub(crate) fn process_group_exists(group: libc::pid_t) -> bool {
     group > 0 && unsafe { libc::kill(-group, 0) } == 0
 }
 
+/// The live working directory of the foreground process (or `fallback_pid`), on macOS.
+pub(crate) fn working_directory(master: &File, fallback_pid: u32) -> Option<std::path::PathBuf> {
+    if let Some(group) = foreground_group(master)
+        && let Some(dir) = pid_working_directory(group)
+    {
+        return Some(dir);
+    }
+    let pid = libc::pid_t::try_from(fallback_pid).ok()?;
+    pid_working_directory(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn pid_working_directory(pid: libc::pid_t) -> Option<std::path::PathBuf> {
+    if pid <= 0 {
+        return None;
+    }
+    // SAFETY: `proc_vnodepathinfo` is plain C data zero-initialized before passing to `proc_pidinfo`.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    // SAFETY: `vip_path` is a NUL-terminated fixed-size C buffer (`[[c_char; 32]; 32]`, 1024 bytes) filled by the kernel.
+    let bytes = unsafe {
+        CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast::<libc::c_char>()).to_bytes()
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pid_working_directory(_pid: libc::pid_t) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Blocks until `pid` has exited, without reaping it. Returns false if it cannot be waited on
 /// (for example it was already reaped elsewhere).
 pub(crate) fn wait_for_exit_without_reaping(pid: u32) -> bool {

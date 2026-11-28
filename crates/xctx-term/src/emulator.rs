@@ -63,6 +63,46 @@ pub enum Side {
     Right,
 }
 
+/// One visible horizontal run of cells covered by a clickable link or path in the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LinkSpan {
+    /// Viewport row (`0..rows`).
+    pub row: usize,
+    /// First column, inclusive.
+    pub start_col: usize,
+    /// Last column, inclusive.
+    pub end_col: usize,
+}
+
+/// What a Cmd+clicked token in the terminal points to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TerminalLinkKind {
+    /// An `http://` or `https://` URL.
+    Url,
+    /// An explicit OSC 8 hyperlink with an arbitrary URI.
+    Osc8,
+    /// A file or directory path (possibly a bare `ls` filename), with optional 1-based line and column.
+    Path {
+        /// The cleaned path string (without `:line:col`).
+        path: String,
+        /// Optional 1-based line number (e.g. from `src/main.rs:42:10`).
+        line: Option<usize>,
+        /// Optional 1-based column number.
+        col: Option<usize>,
+    },
+}
+
+/// A clickable URL, OSC 8 hyperlink, or file path detected under a viewport cell.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TerminalLink {
+    /// The raw target string (URL, OSC 8 URI, or matched path token).
+    pub target: String,
+    /// How the target should be opened.
+    pub kind: TerminalLinkKind,
+    /// Visible cell spans to underline when hovered with Cmd.
+    pub spans: Vec<LinkSpan>,
+}
+
 /// Grid dimensions passed to alacritty_terminal.
 #[derive(Debug, Clone, Copy)]
 struct GridSize {
@@ -295,6 +335,181 @@ impl Emulator {
         if self.display_offset() != before {
             self.generation += 1;
         }
+    }
+
+    /// Scrolls the viewport to the top of the scrollback history.
+    pub fn scroll_to_top(&mut self) {
+        let before = self.display_offset();
+        self.term.scroll_display(Scroll::Top);
+        if self.display_offset() != before {
+            self.generation += 1;
+        }
+    }
+
+    /// Scrolls the viewport by `pages` screens (positive moves up into history, negative down).
+    pub fn scroll_page(&mut self, pages: i32) {
+        if pages == 0 {
+            return;
+        }
+        let before = self.display_offset();
+        let scroll = if pages > 0 {
+            Scroll::PageUp
+        } else {
+            Scroll::PageDown
+        };
+        for _ in 0..pages.unsigned_abs() {
+            self.term.scroll_display(scroll);
+        }
+        if self.display_offset() != before {
+            self.generation += 1;
+        }
+    }
+
+    /// Clears the scrollback history above the visible screen and returns to the live screen.
+    pub fn clear_history(&mut self) {
+        self.term.grid_mut().clear_history();
+        self.term.scroll_display(Scroll::Bottom);
+        self.term.selection = None;
+        self.generation += 1;
+    }
+
+    /// Selects every cell from the top of scrollback through the bottom of the screen.
+    pub fn select_all(&mut self) {
+        let rows = self.rows();
+        let cols = self.cols();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let top_line = Line(-(self.history_size() as i32));
+        let bottom_line = Line(rows as i32 - 1);
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            Point::new(top_line, Column(0)),
+            AlacrittySide::Left,
+        );
+        selection.update(
+            Point::new(bottom_line, Column(cols - 1)),
+            AlacrittySide::Right,
+        );
+        self.term.selection = Some(selection);
+        self.generation += 1;
+    }
+
+    /// Detects an OSC 8 hyperlink, URL, or clickable file path (including bare `ls` filenames and
+    /// `path:line:col` locations) at viewport `point`.
+    pub fn link_at(&self, point: ViewportPoint) -> Option<TerminalLink> {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let rows = grid.screen_lines();
+        if point.row >= rows || point.col >= cols {
+            return None;
+        }
+        let display_offset = grid.display_offset();
+        let line_idx = viewport_line(point.row, display_offset);
+        let clicked_cell = &grid[line_idx][Column(point.col)];
+
+        // 1. Prefer explicit OSC 8 hyperlinks attached to the cell.
+        if let Some(link) = clicked_cell.hyperlink() {
+            let uri = link.uri().to_owned();
+            let mut spans = Vec::new();
+            for row in 0..rows {
+                let row_line = &grid[viewport_line(row, display_offset)];
+                let mut start: Option<usize> = None;
+                for col in 0..cols {
+                    let matches = row_line[Column(col)]
+                        .hyperlink()
+                        .is_some_and(|h| h.uri() == uri);
+                    match (start, matches) {
+                        (None, true) => start = Some(col),
+                        (Some(s), false) => {
+                            spans.push(LinkSpan {
+                                row,
+                                start_col: s,
+                                end_col: col - 1,
+                            });
+                            start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(s) = start {
+                    spans.push(LinkSpan {
+                        row,
+                        start_col: s,
+                        end_col: cols - 1,
+                    });
+                }
+            }
+            let kind = classify_uri(&uri);
+            return Some(TerminalLink {
+                target: uri,
+                kind,
+                spans,
+            });
+        }
+
+        // 2. Collect the logical soft-wrapped line spanning visible rows around `point.row`.
+        let mut first_row = point.row;
+        while first_row > 0 {
+            let prev = &grid[viewport_line(first_row - 1, display_offset)];
+            if prev[Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+                first_row -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut last_row = point.row;
+        while last_row + 1 < rows {
+            let curr = &grid[viewport_line(last_row, display_offset)];
+            if curr[Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+                last_row += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Build the logical text along with a per-char mapping back to `(row, col)`.
+        let mut text = String::new();
+        let mut char_cells: Vec<(usize, usize)> = Vec::new();
+        let mut target_char_idx: Option<usize> = None;
+
+        for row in first_row..=last_row {
+            let row_line = &grid[viewport_line(row, display_offset)];
+            for col in 0..cols {
+                let cell = &row_line[Column(col)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    if row == point.row && col == point.col && !char_cells.is_empty() {
+                        target_char_idx = Some(char_cells.len() - 1);
+                    }
+                    continue;
+                }
+                let idx = char_cells.len();
+                if row == point.row && col == point.col {
+                    target_char_idx = Some(idx);
+                }
+                text.push(cell.c);
+                char_cells.push((row, col));
+            }
+        }
+
+        let target_idx = target_char_idx?;
+        let chars: Vec<char> = text.chars().collect();
+        if chars.get(target_idx).is_none_or(|c| c.is_whitespace()) {
+            return None;
+        }
+
+        // Extract token bounds around `target_idx` (supporting quoted paths or whitespace-delimited tokens).
+        let (raw_start, raw_end) = token_bounds(&chars, target_idx)?;
+        let (clean_start, clean_end) = trim_token_delimiters(&chars, raw_start, raw_end)?;
+        let token: String = chars[clean_start..=clean_end].iter().collect();
+        let kind = parse_link_token(&token)?;
+
+        let spans = spans_for_cells(&char_cells[clean_start..=clean_end]);
+        Some(TerminalLink {
+            target: token,
+            kind,
+            spans,
+        })
     }
 
     /// How many lines the viewport is scrolled back; 0 when following output.
@@ -679,6 +894,193 @@ fn modes_from(mode: TermMode) -> TerminalModes {
     }
 }
 
+fn classify_uri(uri: &str) -> TerminalLinkKind {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        TerminalLinkKind::Url
+    } else if let Some(rest) = uri.strip_prefix("file://") {
+        // file://host/path or file:///path
+        let path = if let Some(stripped) = rest.strip_prefix('/') {
+            format!("/{stripped}")
+        } else if let Some(slash) = rest.find('/') {
+            rest[slash..].to_owned()
+        } else {
+            rest.to_owned()
+        };
+        let path = percent_decode_path(&path);
+        TerminalLinkKind::Path {
+            path,
+            line: None,
+            col: None,
+        }
+    } else {
+        TerminalLinkKind::Osc8
+    }
+}
+
+fn percent_decode_path(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn token_bounds(chars: &[char], target: usize) -> Option<(usize, usize)> {
+    if target >= chars.len() || chars[target].is_whitespace() {
+        return None;
+    }
+    // Check if the cursor is inside a quoted string on the same line (e.g. "my file.txt").
+    for quote in ['"', '\''] {
+        if let Some(open) = chars[..target].iter().rposition(|&c| c == quote)
+            && let Some(rel_close) = chars[target + 1..].iter().position(|&c| c == quote)
+        {
+            let close = target + 1 + rel_close;
+            // Only treat as a quoted path if there isn't an earlier closing quote before target
+            // and the content isn't unreasonably long.
+            if open + 1 < close && close - open <= 260 {
+                return Some((open + 1, close - 1));
+            }
+        }
+    }
+    let mut start = target;
+    while start > 0 && !is_token_break(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = target;
+    while end + 1 < chars.len() && !is_token_break(chars[end + 1]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+fn is_token_break(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\0' | '|' | ';')
+}
+
+fn trim_token_delimiters(
+    chars: &[char],
+    mut start: usize,
+    mut end: usize,
+) -> Option<(usize, usize)> {
+    while start <= end && matches!(chars[start], '(' | '[' | '{' | '<' | '"' | '\'' | '`') {
+        start += 1;
+    }
+    while start <= end
+        && matches!(
+            chars[end],
+            ')' | ']' | '}' | '>' | '"' | '\'' | '`' | ',' | ';' | '!' | '?'
+        )
+    {
+        end = end.checked_sub(1)?;
+    }
+    // Strip trailing `:` or `.` when it looks like prose punctuation rather than `path:line` or `./`.
+    while start <= end && chars[end] == ':' {
+        end = end.checked_sub(1)?;
+    }
+    if start > end {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn parse_link_token(token: &str) -> Option<TerminalLinkKind> {
+    if token.is_empty() {
+        return None;
+    }
+    if token.starts_with("http://") || token.starts_with("https://") {
+        let trimmed = token.trim_end_matches('.');
+        return (!trimmed.is_empty()).then_some(TerminalLinkKind::Url);
+    }
+    if token.starts_with("file://") {
+        return Some(classify_uri(token));
+    }
+    // Strip common `ls -F` indicators (`*`, `@`, `=`, `%`) from bare filenames, keeping trailing `/` for dirs.
+    let stripped = token.trim_end_matches(['*', '@']);
+    if stripped.is_empty() {
+        return None;
+    }
+    // Ignore pure punctuation, shell prompt symbols, or CLI flags (`--foo`, `-la`) that have no path separator.
+    if stripped.starts_with('-') && !stripped.contains('/') {
+        return None;
+    }
+    if !stripped.chars().any(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    // Parse optional `:line` or `:line:col` suffix (e.g., `src/main.rs:42:10` or `Cargo.toml:12`).
+    let (path, line, col) = split_path_location(stripped);
+    if path.is_empty() {
+        return None;
+    }
+    Some(TerminalLinkKind::Path {
+        path: path.to_owned(),
+        line,
+        col,
+    })
+}
+
+fn split_path_location(token: &str) -> (&str, Option<usize>, Option<usize>) {
+    let parts: Vec<&str> = token.rsplitn(3, ':').collect();
+    match parts.as_slice() {
+        [col_s, line_s, path]
+            if !path.is_empty()
+                && line_s.parse::<usize>().is_ok()
+                && col_s.parse::<usize>().is_ok() =>
+        {
+            (
+                path,
+                line_s.parse::<usize>().ok().filter(|&n| n > 0),
+                col_s.parse::<usize>().ok().filter(|&n| n > 0),
+            )
+        }
+        [line_s, path, ..] if !path.is_empty() && line_s.parse::<usize>().is_ok() => {
+            let prefix_len = token.len() - line_s.len() - 1;
+            (
+                &token[..prefix_len],
+                line_s.parse::<usize>().ok().filter(|&n| n > 0),
+                None,
+            )
+        }
+        _ => (token, None, None),
+    }
+}
+
+fn spans_for_cells(cells: &[(usize, usize)]) -> Vec<LinkSpan> {
+    let mut spans: Vec<LinkSpan> = Vec::new();
+    for &(row, col) in cells {
+        match spans.last_mut() {
+            Some(last) if last.row == row && col <= last.end_col + 1 => {
+                last.end_col = last.end_col.max(col);
+            }
+            _ => spans.push(LinkSpan {
+                row,
+                start_col: col,
+                end_col: col,
+            }),
+        }
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1396,88 @@ mod tests {
         assert!(!emulator.flush_expired_sync(deadline - std::time::Duration::from_millis(1)));
         assert!(emulator.flush_expired_sync(deadline));
         assert_eq!(emulator.snapshot().row_text(0), "stuck");
+    }
+
+    #[test]
+    fn scroll_to_top_clear_history_and_select_all() {
+        let mut emulator = emulator(20, 2);
+        emulator.advance(b"line1\r\nline2\r\nline3\r\nline4");
+        assert!(emulator.history_size() >= 2);
+        emulator.scroll_to_top();
+        assert_eq!(emulator.display_offset(), emulator.history_size());
+        emulator.select_all();
+        let selected = emulator.selected_text().unwrap_or_default();
+        assert!(selected.contains("line1"));
+        assert!(selected.contains("line4"));
+        emulator.clear_history();
+        assert_eq!(emulator.history_size(), 0);
+        assert_eq!(emulator.display_offset(), 0);
+        assert!(emulator.selected_text().is_none());
+    }
+
+    #[test]
+    fn link_at_detects_ls_files_path_line_col_urls_and_osc8() {
+        let mut emulator = emulator(60, 5);
+        emulator.advance(b"Cargo.toml  README.md  src/main.rs:42:10\r\n");
+        emulator.advance(b"see https://example.com/docs, done\r\n");
+        emulator.advance(b"\x1b]8;;file:///tmp/demo.txt\x1b\\demo\x1b]8;;\x1b\\\r\n");
+
+        let cargo = emulator
+            .link_at(ViewportPoint::new(0, 3))
+            .expect("Cargo.toml link");
+        assert_eq!(
+            cargo.kind,
+            TerminalLinkKind::Path {
+                path: "Cargo.toml".into(),
+                line: None,
+                col: None,
+            }
+        );
+        assert_eq!(
+            cargo.spans,
+            vec![LinkSpan {
+                row: 0,
+                start_col: 0,
+                end_col: 9,
+            }]
+        );
+
+        let loc = emulator
+            .link_at(ViewportPoint::new(0, 26))
+            .expect("path:line:col link");
+        assert_eq!(
+            loc.kind,
+            TerminalLinkKind::Path {
+                path: "src/main.rs".into(),
+                line: Some(42),
+                col: Some(10),
+            }
+        );
+
+        let url = emulator
+            .link_at(ViewportPoint::new(1, 10))
+            .expect("url link");
+        assert_eq!(url.kind, TerminalLinkKind::Url);
+        assert_eq!(url.target, "https://example.com/docs");
+
+        let osc8 = emulator
+            .link_at(ViewportPoint::new(2, 1))
+            .expect("osc8 link");
+        assert_eq!(
+            osc8.kind,
+            TerminalLinkKind::Path {
+                path: "/tmp/demo.txt".into(),
+                line: None,
+                col: None,
+            }
+        );
+        assert_eq!(
+            osc8.spans,
+            vec![LinkSpan {
+                row: 2,
+                start_col: 0,
+                end_col: 3,
+            }]
+        );
     }
 }

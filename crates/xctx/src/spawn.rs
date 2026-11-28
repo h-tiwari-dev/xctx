@@ -684,7 +684,7 @@ pub fn pane_launch_for_runner(
         PaneKind::Shell => (None, Vec::new(), None),
         // A plugin pane's own command is chosen by the plugin (see `plugin_pane_launch`); without one it opens a
         // shell in its repo.
-        PaneKind::Plugin => (None, Vec::new(), None),
+        PaneKind::Plugin | PaneKind::File => (None, Vec::new(), None),
         PaneKind::Agent => match runner.or(default_runner()) {
             Some(runner) => match find_runner_program(search, &runner.program) {
                 Some(path) => match runner_args(runner, agent, session).and_then(|(args, named)| {

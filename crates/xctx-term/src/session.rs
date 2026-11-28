@@ -316,6 +316,36 @@ impl TerminalSession {
         self.shared.emulator.lock().scroll_to_bottom();
     }
 
+    /// Scrolls the viewport to the top of scrollback history.
+    pub fn scroll_to_top(&self) {
+        self.shared.emulator.lock().scroll_to_top();
+    }
+
+    /// Scrolls the viewport by `pages` screens (positive moves up into history).
+    pub fn scroll_page(&self, pages: i32) {
+        self.shared.emulator.lock().scroll_page(pages);
+    }
+
+    /// Clears scrollback history and returns to the live screen.
+    pub fn clear_history(&self) {
+        self.shared.emulator.lock().clear_history();
+    }
+
+    /// Selects every cell from the top of scrollback through the bottom of the screen.
+    pub fn select_all(&self) {
+        self.shared.emulator.lock().select_all();
+    }
+
+    /// Detects an OSC 8 hyperlink, URL, or file path under viewport `point`.
+    pub fn link_at(&self, point: ViewportPoint) -> Option<crate::TerminalLink> {
+        self.shared.emulator.lock().link_at(point)
+    }
+
+    /// The live current working directory of the terminal's foreground process (or shell), if known.
+    pub fn working_directory(&self) -> Option<std::path::PathBuf> {
+        pty::working_directory(&self.master, self.shared.pid)
+    }
+
     /// How many lines the viewport is scrolled back; 0 when following output.
     pub fn display_offset(&self) -> usize {
         self.shared.emulator.lock().display_offset()

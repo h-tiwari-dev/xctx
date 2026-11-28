@@ -2453,6 +2453,19 @@ impl FileTree {
         true
     }
 
+    /// Ensure folder `rel` is open (without toggling it closed if already open). Returns true if it must be read.
+    pub fn open_folder(&mut self, rel: &str) -> bool {
+        if rel.is_empty() {
+            return false;
+        }
+        self.open.insert(rel.to_owned());
+        if self.folders.contains_key(rel) || self.reading.contains(rel) {
+            return false;
+        }
+        self.reading.insert(rel.to_owned());
+        true
+    }
+
     /// The open folders whose parents are open too, to read again; each is marked as being read, and what it
     /// showed stays until its new listing comes. Listings of the other folders are dropped, so they are read
     /// again when opened.

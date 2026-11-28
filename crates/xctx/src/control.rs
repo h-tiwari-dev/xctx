@@ -604,6 +604,9 @@ impl Workspace {
                     "pane.split: a plugin pane is started with plugin.mount, not pane.split",
                 ))
             }
+            Call::PaneSplit(p) if p.kind == Some(PaneKind::File) => Err(RpcError::invalid_params(
+                "pane.split: a file pane needs a file path; open it from the Files sidebar or terminal",
+            )),
             Call::PaneSplit(p) => {
                 to_json(
                     self.in_open_space(&p.space, window, cx, |this, id, window, cx| {

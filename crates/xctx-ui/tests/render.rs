@@ -303,3 +303,98 @@ fn the_title_bar_mode_switch_flips_only_from_the_other_side(cx: &mut TestAppCont
     // Activity sits beside the panes, so their shape control remains available.
     assert!(cx.debug_bounds("title-shape-0").is_some());
 }
+
+#[gpui::test]
+fn inspector_files_tab_draws_delinked_tree_and_emits_open_file_actions(cx: &mut TestAppContext) {
+    use xctx_ui::inspector::{
+        FileGitMark, Inspector, InspectorAction, InspectorData, InspectorFiles, InspectorTab,
+        SidebarFileRow, SidebarFileRowKind,
+    };
+
+    struct InspectorHost {
+        actions: Rc<RefCell<Vec<InspectorAction>>>,
+    }
+    impl Render for InspectorHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let actions = self.actions.clone();
+            let data = InspectorData {
+                tab: InspectorTab::Files,
+                agents: Vec::new(),
+                work_loop: None,
+                attempts: Vec::new(),
+                can_fork: false,
+                can_review: false,
+                contract: None,
+                open_findings: 0,
+                notes: 0,
+                tools: Vec::new(),
+                files: InspectorFiles {
+                    repos: vec!["api".into()],
+                    active_repo: "api".into(),
+                    root_label: "/work/api".into(),
+                    rows: vec![
+                        SidebarFileRow {
+                            path: "src".into(),
+                            name: "src".into(),
+                            depth: 0,
+                            kind: SidebarFileRowKind::Folder {
+                                open: true,
+                                changed: true,
+                                heavy: false,
+                            },
+                        },
+                        SidebarFileRow {
+                            path: "src/lib.rs".into(),
+                            name: "lib.rs".into(),
+                            depth: 1,
+                            kind: SidebarFileRowKind::File {
+                                mark: Some(FileGitMark::Modified),
+                                open_in_pane: true,
+                            },
+                        },
+                    ],
+                    changed_only: false,
+                    busy: false,
+                    status_error: None,
+                    active_file: Some("src/lib.rs".into()),
+                },
+            };
+            div()
+                .size_full()
+                .child(Inspector::new(data).on_action(move |action, _, _| {
+                    actions.borrow_mut().push(action);
+                }))
+        }
+    }
+
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let host_actions = actions.clone();
+    let (_host, cx) = cx.add_window_view(move |_, _| InspectorHost {
+        actions: host_actions,
+    });
+    cx.run_until_parked();
+
+    for selector in [
+        "inspector-tab-files",
+        "sidebar-files",
+        "sidebar-files-row-0",
+        "sidebar-files-row-1",
+        "sidebar-files-changed",
+        "sidebar-files-refresh",
+    ] {
+        let center = cx.debug_bounds(selector).map(|b| b.center());
+        assert!(center.is_some(), "{selector} not drawn");
+        if selector != "inspector-tab-files" && selector != "sidebar-files" {
+            cx.simulate_click(center.unwrap(), Modifiers::default());
+        }
+    }
+    assert_eq!(
+        *actions.borrow(),
+        vec![
+            InspectorAction::FilesToggleFolder("src".into()),
+            InspectorAction::FilesOpenFile("src/lib.rs".into()),
+            InspectorAction::FilesToggleChangedOnly(true),
+            InspectorAction::FilesRefresh,
+        ]
+    );
+}

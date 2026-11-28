@@ -29,6 +29,7 @@ pub fn pane_kind_label(kind: PaneKind) -> &'static str {
         PaneKind::Git => "git",
         // A tool pane (Terminal, Browser, ...) opened from the tool dock; its title names the tool.
         PaneKind::Plugin => "tool",
+        PaneKind::File => "file",
     }
 }
 
@@ -39,6 +40,7 @@ pub fn pane_kind_icon(kind: PaneKind) -> IconName {
         PaneKind::Shell => IconName::Terminal,
         PaneKind::Git => IconName::Git,
         PaneKind::Plugin => IconName::Plugin,
+        PaneKind::File => IconName::FileText,
     }
 }
 

@@ -776,7 +776,7 @@ fn preview(
         .into_any_element()
 }
 
-fn markdown_block(block: &MarkdownBlock, theme: &Theme) -> AnyElement {
+pub(crate) fn markdown_block(block: &MarkdownBlock, theme: &Theme) -> AnyElement {
     match block {
         MarkdownBlock::Heading(level, text) => {
             let size = match level {
@@ -879,7 +879,7 @@ fn markdown_block(block: &MarkdownBlock, theme: &Theme) -> AnyElement {
 }
 
 /// The colour of a diff line: additions in success, removals in danger, hunk headers in the accent.
-fn diff_color(line: &str, theme: &Theme) -> gpui::Hsla {
+pub(crate) fn diff_color(line: &str, theme: &Theme) -> gpui::Hsla {
     if line.starts_with("+++") || line.starts_with("---") {
         theme.text_muted
     } else if line.starts_with('+') {
