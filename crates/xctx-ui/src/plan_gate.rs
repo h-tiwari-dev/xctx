@@ -3,10 +3,11 @@
 
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, FontWeight, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, FontWeight, SharedString, Styled, Window, div, prelude::*, px};
 use xctx_layout::Shape;
 
 use crate::components::{Badge, Button, ButtonSize, ButtonVariant, Pill};
+use crate::icon::{Icon, IconName, IconSize};
 use crate::theme::{Theme, Tone};
 use crate::title_bar::{SHAPES, shape_label};
 
@@ -56,7 +57,9 @@ type RepoHandler = Rc<dyn Fn(&SharedString, &mut Window, &mut App)>;
 pub struct PlanGateCard {
     plan: PlanGateView,
     busy: bool,
+    add_open: bool,
     add_repo: Option<AnyElement>,
+    on_toggle_add: Option<Handler>,
     on_shape: Option<ShapeHandler>,
     on_drop_repo: Option<RepoHandler>,
     on_approve: Option<Handler>,
@@ -70,7 +73,9 @@ impl PlanGateCard {
         Self {
             plan,
             busy: false,
+            add_open: false,
             add_repo: None,
+            on_toggle_add: None,
             on_shape: None,
             on_drop_repo: None,
             on_approve: None,
@@ -82,6 +87,19 @@ impl PlanGateCard {
     /// Show the plan as launching: every control is disabled.
     pub fn busy(mut self, busy: bool) -> Self {
         self.busy = busy;
+        self
+    }
+
+    /// Whether the repo picker (the element given to [`PlanGateCard::add_repo`]) is shown. It is always shown while
+    /// the plan has no repo.
+    pub fn add_open(mut self, open: bool) -> Self {
+        self.add_open = open;
+        self
+    }
+
+    /// Call `handler` when Add repo (or Done) is clicked.
+    pub fn on_toggle_add(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_toggle_add = Some(Rc::new(handler));
         self
     }
 
@@ -132,8 +150,9 @@ impl PlanGateCard {
 
 fn label(text: &'static str, theme: &Theme) -> gpui::Div {
     div()
-        .w(px(64.0))
+        .w(px(48.0))
         .flex_none()
+        .pt(px(2.0))
         .text_size(Theme::TEXT_XS)
         .text_color(theme.text_subtle)
         .child(text)
@@ -145,6 +164,7 @@ impl RenderOnce for PlanGateCard {
         let can_approve = self.can_approve();
         let busy = self.busy;
         let plan = self.plan;
+        let no_repos = plan.repos.is_empty();
 
         let shapes = SHAPES.iter().map(|&shape| {
             let mut pill = Pill::new(
@@ -159,14 +179,18 @@ impl RenderOnce for PlanGateCard {
             pill
         });
 
-        let repos: Vec<_> = plan
+        // One chip per repo: its name, where it is, and a button that drops it.
+        let chips: Vec<_> = plan
             .repos
             .iter()
             .enumerate()
             .map(|(i, repo)| {
-                let mut drop = Button::new(SharedString::from(format!("plan-drop-{i}")), "Drop")
+                let mut drop = Button::new(SharedString::from(format!("plan-drop-{i}")), "")
+                    .icon(IconName::Close)
+                    .tooltip("Drop this repo")
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
+                    .rounded_full()
                     .disabled(busy)
                     .selector(format!("plan-drop-{i}"));
                 if let Some(handler) = self.on_drop_repo.clone() {
@@ -176,45 +200,62 @@ impl RenderOnce for PlanGateCard {
                 div()
                     .flex()
                     .items_center()
-                    .gap(Theme::SPACE_2)
-                    .py(Theme::SPACE_1)
+                    .gap(Theme::SPACE_1)
+                    .max_w_full()
+                    .h(px(26.0))
+                    .pl(Theme::SPACE_2)
+                    .rounded(Theme::RADIUS_FULL)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.raised)
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Xs)
+                            .color(theme.text_muted),
+                    )
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(Theme::TEXT_SM)
+                            .text_color(theme.text)
+                            .child(repo.name.clone()),
+                    )
+                    .child(
+                        div()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(Theme::SPACE_2)
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.text)
-                                            .child(repo.name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(Theme::TEXT_XS)
-                                            .text_color(theme.text_subtle)
-                                            .child(repo.path.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(Theme::TEXT_SM)
-                                    .text_color(theme.text_muted)
-                                    .child(repo.reason.clone()),
-                            ),
+                            .max_w(px(260.0))
+                            .truncate()
+                            .text_size(Theme::TEXT_XS)
+                            .text_color(theme.text_subtle)
+                            .child(repo.path.clone()),
                     )
                     .child(drop)
             })
             .collect();
-        let no_repos = repos.is_empty().then(|| {
+
+        let add_label = if self.add_open || no_repos {
+            "Done"
+        } else {
+            "Add repo"
+        };
+        let mut add_toggle = Button::new("plan-add-toggle", add_label)
+            .icon(if self.add_open || no_repos {
+                IconName::Close
+            } else {
+                IconName::Plus
+            })
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Compact)
+            .disabled(busy || no_repos)
+            .selector("plan-add-toggle");
+        if let Some(handler) = self.on_toggle_add.clone() {
+            add_toggle = add_toggle.on_click(move |_, window, cx| handler(window, cx));
+        }
+        let picker = (self.add_open || no_repos)
+            .then_some(self.add_repo)
+            .flatten();
+        let needs_repo = no_repos.then(|| {
             div()
                 .text_size(Theme::TEXT_SM)
                 .text_color(theme.warning)
@@ -225,10 +266,12 @@ impl RenderOnce for PlanGateCard {
             div()
                 .flex()
                 .gap(Theme::SPACE_2)
+                .min_w_0()
                 .child(label("Why", &theme))
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .text_size(Theme::TEXT_SM)
                         .text_color(theme.text_muted)
                         .child(text),
@@ -259,52 +302,50 @@ impl RenderOnce for PlanGateCard {
                 .on_click(move |_, window, cx| handler(window, cx))
         });
 
-        div()
+        let header = div()
             .flex()
-            .flex_col()
-            .gap(Theme::SPACE_3)
-            .w_full()
-            .p(Theme::SPACE_4)
-            .rounded(Theme::RADIUS_LG)
-            .border_1()
-            .border_color(theme.accent.alpha(0.55))
-            .bg(theme.overlay)
+            .flex_none()
+            .items_center()
+            .gap(Theme::SPACE_2)
+            .min_w_0()
+            .px(Theme::SPACE_4)
+            .py(Theme::SPACE_3)
+            .border_b_1()
+            .border_color(theme.border_subtle)
+            .child(Badge::new("PLAN GATE").tone(Tone::Accent))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(Theme::SPACE_2)
-                    .child(Badge::new("PLAN GATE").tone(Tone::Accent))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(Theme::TEXT_XL)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(plan.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(Theme::TEXT_XS)
-                            .text_color(theme.text_subtle)
-                            .child(format!("proposed by {}", plan.proposed_by)),
-                    ),
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(Theme::TEXT_LG)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(plan.title.clone()),
             )
             .child(
                 div()
-                    .flex()
-                    .gap(Theme::SPACE_2)
-                    .child(label("Task", &theme))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(Theme::TEXT_MD)
-                            .text_color(theme.text)
-                            .child(plan.task.clone()),
-                    ),
+                    .flex_none()
+                    .text_size(Theme::TEXT_XS)
+                    .text_color(theme.text_subtle)
+                    .child(format!("proposed by {}", plan.proposed_by)),
+            );
+        let body = div()
+            .id("plan-gate-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_y_scroll()
+            .gap(Theme::SPACE_3)
+            .p(Theme::SPACE_4)
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(Theme::TEXT_MD)
+                    .text_color(theme.text)
+                    .child(plan.task.clone()),
             )
             .child(
                 div()
@@ -318,6 +359,7 @@ impl RenderOnce for PlanGateCard {
                 div()
                     .flex()
                     .gap(Theme::SPACE_2)
+                    .min_w_0()
                     .child(label("Repos", &theme))
                     .child(
                         div()
@@ -325,32 +367,60 @@ impl RenderOnce for PlanGateCard {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .children(repos)
-                            .children(no_repos)
-                            .children(self.add_repo),
+                            .gap(Theme::SPACE_2)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(Theme::SPACE_1)
+                                    .children(chips)
+                                    .child(add_toggle),
+                            )
+                            .children(needs_repo)
+                            .children(picker),
                     ),
             )
-            .children(rationale)
+            .children(rationale);
+        let footer = div()
+            .debug_selector(|| "plan-gate-footer".to_owned())
+            .flex()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap(Theme::SPACE_2)
+            .px(Theme::SPACE_4)
+            .py(Theme::SPACE_3)
+            .border_t_1()
+            .border_color(theme.border_subtle)
+            .bg(theme.raised)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(Theme::SPACE_2)
-                    .pt(Theme::SPACE_2)
-                    .border_t_1()
-                    .border_color(theme.border_subtle)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(Theme::TEXT_XS)
-                            .text_color(theme.text_subtle)
-                            .child(PLAN_GATE_HINT),
-                    )
-                    .children(later)
-                    .child(reject)
-                    .child(approve),
+                    .flex_1()
+                    .min_w(px(200.0))
+                    .text_size(Theme::TEXT_XS)
+                    .text_color(theme.text_subtle)
+                    .child(PLAN_GATE_HINT),
             )
+            .children(later)
+            .child(reject)
+            .child(approve);
+
+        div()
+            .debug_selector(|| "plan-gate".to_owned())
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .max_h(px(620.0))
+            .overflow_hidden()
+            .rounded(Theme::RADIUS_LG)
+            .border_1()
+            .border_color(theme.accent.alpha(0.55))
+            .bg(theme.overlay)
+            .child(header)
+            .child(body)
+            .child(footer)
     }
 }
 

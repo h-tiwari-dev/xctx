@@ -67,6 +67,7 @@ pub struct ParentAgentDrawer {
     status: AgentStatus,
     height: Pixels,
     focused: bool,
+    embedded: bool,
     body: Option<AnyElement>,
     on_restart: Option<Handler>,
 }
@@ -78,6 +79,7 @@ impl ParentAgentDrawer {
             status,
             height: DRAWER_HEIGHT,
             focused: false,
+            embedded: false,
             body: None,
             on_restart: None,
         }
@@ -92,6 +94,12 @@ impl ParentAgentDrawer {
     /// Whether the agent's terminal has keyboard focus: the card's border turns `accent`.
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    /// Draw inside another card, without a second outline or shadow.
+    pub fn embedded(mut self, embedded: bool) -> Self {
+        self.embedded = embedded;
         self
     }
 
@@ -111,6 +119,7 @@ impl ParentAgentDrawer {
 impl RenderOnce for ParentAgentDrawer {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx);
+        let show_header = !self.embedded || self.status.can_restart();
         let restart = self
             .on_restart
             .filter(|_| self.status.can_restart())
@@ -174,17 +183,20 @@ impl RenderOnce for ParentAgentDrawer {
             .flex()
             .flex_col()
             .w_full()
-            .rounded(Theme::RADIUS_LG)
-            .border_1()
-            .border_color(if self.focused {
-                theme.accent
-            } else {
-                theme.border
-            })
             .bg(theme.surface)
-            .shadow_md()
             .overflow_hidden()
-            .child(header)
+            .when(!self.embedded, |panel| {
+                panel
+                    .rounded(Theme::RADIUS_LG)
+                    .border_1()
+                    .border_color(if self.focused {
+                        theme.accent
+                    } else {
+                        theme.border
+                    })
+                    .shadow_md()
+            })
+            .children(show_header.then_some(header))
             .child(body)
     }
 }

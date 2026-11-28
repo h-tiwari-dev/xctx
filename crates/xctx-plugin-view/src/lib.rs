@@ -29,7 +29,7 @@ pub use common::{Caps, Excerpt, excerpt};
 pub use files::{
     FILES_BINARY, FILES_LINE_CHARS, FILES_LINE_LIMIT, FILES_NO_CHANGES, FILES_NO_SELECTION,
     FILES_ROW_LIMIT, FILES_TREE_WIDTH, FileMark, FileRow, FileRowKind, FilesPaneView, FilesPreview,
-    FilesView, PreviewBody, size_label,
+    FilesView, MarkdownBlock, PreviewBody, markdown_blocks, size_label,
 };
 pub use http::{
     BODY_CAPS, HEADER_LIMIT, HISTORY_ROW_LIMIT, HTTP_DIFF_SAME, HTTP_METHODS, HTTP_NO_SELECTION,

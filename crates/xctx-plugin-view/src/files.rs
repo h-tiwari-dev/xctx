@@ -5,8 +5,10 @@
 //! The pane reads nothing itself: the app lists folders, reads files and runs git, and fills a [`FilesView`].
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{AnyElement, App, FontWeight, SharedString, Window, div, prelude::*, px};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, Pill, Theme, Tone, cut_line};
 
 use crate::common::{error_line, note, pane_frame, tone_text};
@@ -120,10 +122,150 @@ pub enum PreviewBody {
     Loading,
     /// Text lines (a file's, or a diff's when [`FilesPreview::diff`]). Already masked by the caller.
     Lines(Vec<SharedString>),
+    /// Markdown parsed once when the file preview changes and drawn as native themed blocks.
+    Markdown(Arc<[MarkdownBlock]>),
     /// The file is binary.
     Binary,
+    /// A native document surface supplied by the app (currently a PDF in a local-only WebKit view).
+    Document,
     /// The file cannot be shown: why. Already masked by the caller.
     Message(SharedString),
+}
+
+/// One native block of a rendered Markdown document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownBlock {
+    /// A heading, level 1 through 6.
+    Heading(u8, SharedString),
+    /// A paragraph.
+    Paragraph(SharedString),
+    /// A list item, with its zero-based nesting depth.
+    ListItem(usize, SharedString),
+    /// A quote.
+    Quote(SharedString),
+    /// A fenced or indented code block, with its optional language.
+    Code(Option<SharedString>, SharedString),
+    /// A horizontal rule.
+    Rule,
+}
+
+#[derive(Clone)]
+enum MarkdownCurrent {
+    Heading(u8),
+    Paragraph,
+    ListItem(usize),
+    Quote,
+    Code(Option<SharedString>),
+}
+
+/// Parse `text` into the native blocks the Files pane draws. Inline emphasis and links retain their readable
+/// text; document structure, lists, quotes and code blocks retain their own layout.
+pub fn markdown_blocks(text: &str) -> Arc<[MarkdownBlock]> {
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+    let mut blocks = Vec::new();
+    let mut current: Option<MarkdownCurrent> = None;
+    let mut content = String::new();
+    let mut list_depth = 0usize;
+    let mut quote_depth = 0usize;
+
+    let flush = |current: &mut Option<MarkdownCurrent>,
+                 content: &mut String,
+                 blocks: &mut Vec<MarkdownBlock>| {
+        let Some(kind) = current.take() else {
+            content.clear();
+            return;
+        };
+        let text = content.trim().to_owned();
+        content.clear();
+        if text.is_empty() {
+            return;
+        }
+        let text: SharedString = text.into();
+        blocks.push(match kind {
+            MarkdownCurrent::Heading(level) => MarkdownBlock::Heading(level, text),
+            MarkdownCurrent::Paragraph => MarkdownBlock::Paragraph(text),
+            MarkdownCurrent::ListItem(depth) => MarkdownBlock::ListItem(depth, text),
+            MarkdownCurrent::Quote => MarkdownBlock::Quote(text),
+            MarkdownCurrent::Code(language) => MarkdownBlock::Code(language, text),
+        });
+    };
+
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                flush(&mut current, &mut content, &mut blocks);
+                current = Some(MarkdownCurrent::Heading(heading_level(level)));
+            }
+            Event::End(TagEnd::Heading(_)) => flush(&mut current, &mut content, &mut blocks),
+            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
+            Event::Start(Tag::Item) => {
+                flush(&mut current, &mut content, &mut blocks);
+                current = Some(MarkdownCurrent::ListItem(list_depth.saturating_sub(1)));
+            }
+            Event::End(TagEnd::Item) => flush(&mut current, &mut content, &mut blocks),
+            Event::Start(Tag::BlockQuote(_)) => {
+                quote_depth += 1;
+                flush(&mut current, &mut content, &mut blocks);
+                current = Some(MarkdownCurrent::Quote);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                flush(&mut current, &mut content, &mut blocks);
+                quote_depth = quote_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                flush(&mut current, &mut content, &mut blocks);
+                let language = match kind {
+                    CodeBlockKind::Indented => None,
+                    CodeBlockKind::Fenced(language) if language.is_empty() => None,
+                    CodeBlockKind::Fenced(language) => Some(language.to_string().into()),
+                };
+                current = Some(MarkdownCurrent::Code(language));
+            }
+            Event::End(TagEnd::CodeBlock) => flush(&mut current, &mut content, &mut blocks),
+            Event::Start(Tag::Paragraph) => {
+                if current.is_none() {
+                    current = Some(if quote_depth > 0 {
+                        MarkdownCurrent::Quote
+                    } else {
+                        MarkdownCurrent::Paragraph
+                    });
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if !matches!(current, Some(MarkdownCurrent::ListItem(_))) {
+                    flush(&mut current, &mut content, &mut blocks);
+                }
+            }
+            Event::Rule => {
+                flush(&mut current, &mut content, &mut blocks);
+                blocks.push(MarkdownBlock::Rule);
+            }
+            Event::Text(text) | Event::Code(text) => content.push_str(&text),
+            Event::SoftBreak => content.push(' '),
+            Event::HardBreak => content.push('\n'),
+            Event::TaskListMarker(done) => {
+                content.push_str(if done { "☑ " } else { "☐ " });
+            }
+            _ => {}
+        }
+    }
+    flush(&mut current, &mut content, &mut blocks);
+    blocks.into()
+}
+
+fn heading_level(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
 }
 
 /// The selected file as the preview shows it.
@@ -187,6 +329,7 @@ type BoolHandler = Rc<dyn Fn(bool, &mut Window, &mut App)>;
 #[derive(IntoElement)]
 pub struct FilesPaneView {
     view: FilesView,
+    document: Option<AnyElement>,
     on_folder: Option<PathHandler>,
     on_file: Option<PathHandler>,
     on_refresh: Option<Handler>,
@@ -199,12 +342,19 @@ impl FilesPaneView {
     pub fn new(view: FilesView) -> Self {
         Self {
             view,
+            document: None,
             on_folder: None,
             on_file: None,
             on_refresh: None,
             on_changed_only: None,
             on_diff: None,
         }
+    }
+
+    /// Put a native document surface in the preview when its body is [`PreviewBody::Document`].
+    pub fn document(mut self, document: impl IntoElement) -> Self {
+        self.document = Some(document.into_any_element());
+        self
     }
 
     /// Call `handler` with a folder's path when its row is clicked (to open or close it).
@@ -347,7 +497,7 @@ impl RenderOnce for FilesPaneView {
             .children(rows_more)
             .children(no_changes);
 
-        let preview = preview(view.preview, self.on_diff, &theme);
+        let preview = preview(view.preview, self.document, self.on_diff, &theme);
 
         pane_frame(&theme)
             .child(header)
@@ -467,7 +617,12 @@ fn tree_row(
     }
 }
 
-fn preview(preview: FilesPreview, on_diff: Option<BoolHandler>, theme: &Theme) -> AnyElement {
+fn preview(
+    preview: FilesPreview,
+    document: Option<AnyElement>,
+    on_diff: Option<BoolHandler>,
+    theme: &Theme,
+) -> AnyElement {
     let diff_on = preview.diff;
     let diff = preview.can_diff.then(|| {
         let mut button = Button::new("files-diff", "Diff")
@@ -517,6 +672,14 @@ fn preview(preview: FilesPreview, on_diff: Option<BoolHandler>, theme: &Theme) -
         }
         PreviewBody::Loading => vec![note("files-loading", "Reading…", theme).into_any_element()],
         PreviewBody::Binary => vec![note("files-binary", FILES_BINARY, theme).into_any_element()],
+        PreviewBody::Document => vec![document.unwrap_or_else(|| {
+            note(
+                "files-document-unavailable",
+                "The document preview is unavailable.",
+                theme,
+            )
+            .into_any_element()
+        })],
         PreviewBody::Message(why) => vec![
             div()
                 .debug_selector(|| "files-message".to_owned())
@@ -526,6 +689,10 @@ fn preview(preview: FilesPreview, on_diff: Option<BoolHandler>, theme: &Theme) -
                 .child(why)
                 .into_any_element(),
         ],
+        PreviewBody::Markdown(blocks) => blocks
+            .iter()
+            .map(|block| markdown_block(block, theme))
+            .collect(),
         PreviewBody::Lines(lines) => {
             let width = lines.len().min(FILES_LINE_LIMIT).to_string().len();
             let mut drawn: Vec<AnyElement> = lines
@@ -609,6 +776,108 @@ fn preview(preview: FilesPreview, on_diff: Option<BoolHandler>, theme: &Theme) -
         .into_any_element()
 }
 
+fn markdown_block(block: &MarkdownBlock, theme: &Theme) -> AnyElement {
+    match block {
+        MarkdownBlock::Heading(level, text) => {
+            let size = match level {
+                1 => Theme::TEXT_XL,
+                2 => Theme::TEXT_LG,
+                _ => Theme::TEXT_MD,
+            };
+            div()
+                .flex_none()
+                .min_w_0()
+                .mt(if *level <= 2 {
+                    Theme::SPACE_3
+                } else {
+                    Theme::SPACE_2
+                })
+                .px(Theme::SPACE_4)
+                .pb(Theme::SPACE_1)
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(size)
+                .text_color(theme.text)
+                .child(text.clone())
+                .into_any_element()
+        }
+        MarkdownBlock::Paragraph(text) => div()
+            .flex_none()
+            .min_w_0()
+            .px(Theme::SPACE_4)
+            .py(Theme::SPACE_1)
+            .text_size(Theme::TEXT_SM)
+            .text_color(theme.text)
+            .child(text.clone())
+            .into_any_element(),
+        MarkdownBlock::ListItem(depth, text) => div()
+            .flex()
+            .flex_none()
+            .min_w_0()
+            .gap(Theme::SPACE_2)
+            .pl(px(16.0 + 16.0 * *depth as f32))
+            .pr(Theme::SPACE_4)
+            .py(px(2.0))
+            .text_size(Theme::TEXT_SM)
+            .text_color(theme.text)
+            .child(div().flex_none().text_color(theme.accent).child("•"))
+            .child(div().min_w_0().child(text.clone()))
+            .into_any_element(),
+        MarkdownBlock::Quote(text) => div()
+            .flex_none()
+            .min_w_0()
+            .mx(Theme::SPACE_4)
+            .my(Theme::SPACE_1)
+            .pl(Theme::SPACE_3)
+            .py(Theme::SPACE_2)
+            .border_l_2()
+            .border_color(theme.accent)
+            .text_size(Theme::TEXT_SM)
+            .text_color(theme.text_muted)
+            .child(text.clone())
+            .into_any_element(),
+        MarkdownBlock::Code(language, text) => div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .min_w_0()
+            .mx(Theme::SPACE_4)
+            .my(Theme::SPACE_2)
+            .rounded(Theme::RADIUS_MD)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.raised)
+            .children(language.clone().map(|language| {
+                div()
+                    .px(Theme::SPACE_3)
+                    .py(Theme::SPACE_1)
+                    .border_b_1()
+                    .border_color(theme.border_subtle)
+                    .text_size(Theme::TEXT_XS)
+                    .text_color(theme.text_subtle)
+                    .child(language)
+            }))
+            .child(
+                div()
+                    .p(Theme::SPACE_3)
+                    .whitespace_nowrap()
+                    .font_family("Menlo")
+                    .text_size(Theme::TEXT_XS)
+                    .text_color(theme.text)
+                    .child(text.clone()),
+            )
+            .into_any_element(),
+        MarkdownBlock::Rule => div()
+            .flex_none()
+            .h(px(1.0))
+            .mx(Theme::SPACE_4)
+            .my(Theme::SPACE_3)
+            .bg(theme.border)
+            .into_any_element(),
+    }
+}
+
 /// The colour of a diff line: additions in success, removals in danger, hunk headers in the accent.
 fn diff_color(line: &str, theme: &Theme) -> gpui::Hsla {
     if line.starts_with("+++") || line.starts_with("---") {
@@ -642,5 +911,26 @@ mod tests {
         assert_eq!(size_label(512).as_ref(), "512 B");
         assert_eq!(size_label(4300).as_ref(), "4.2 KiB");
         assert_eq!(size_label(3 * 1024 * 1024).as_ref(), "3.0 MiB");
+    }
+
+    #[test]
+    fn markdown_keeps_document_structure() {
+        let blocks = markdown_blocks(
+            "# Read me\n\nA useful paragraph.\n\n- first\n- second\n\n```rust\nfn main() {}\n```\n",
+        );
+        assert!(matches!(
+            &blocks[0],
+            MarkdownBlock::Heading(1, text) if text.as_ref() == "Read me"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            MarkdownBlock::Paragraph(text) if text.as_ref() == "A useful paragraph."
+        ));
+        assert!(matches!(&blocks[2], MarkdownBlock::ListItem(0, _)));
+        assert!(matches!(
+            &blocks[4],
+            MarkdownBlock::Code(Some(language), text)
+                if language.as_ref() == "rust" && text.contains("fn main")
+        ));
     }
 }

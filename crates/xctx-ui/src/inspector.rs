@@ -76,6 +76,17 @@ pub struct InspectorAgent {
     pub paused: bool,
 }
 
+/// The space's work loop, shown above its agents.
+#[derive(Clone)]
+pub struct InspectorLoop {
+    /// The current stage.
+    pub stage: SharedString,
+    /// Its current state.
+    pub status: SharedString,
+    /// The primary action that applies now: Start, Advance, Approve next, Resume, or Reset.
+    pub action: SharedString,
+}
+
 /// The shared contract, as the Shared tab shows it.
 #[derive(Clone)]
 pub struct InspectorContract {
@@ -95,6 +106,8 @@ pub struct InspectorData {
     pub tab: InspectorTab,
     /// The agents of the space's graph, in graph order.
     pub agents: Vec<InspectorAgent>,
+    /// The space's work loop, once its graph is loaded.
+    pub work_loop: Option<InspectorLoop>,
     /// The space's attempts, as the attempt strip shows them.
     pub attempts: Vec<AttemptChip>,
     /// Whether Fork can start another attempt.
@@ -127,6 +140,8 @@ pub enum InspectorAction {
         /// Whether to pause (true) or resume (false).
         paused: bool,
     },
+    /// Run the work loop's primary action for its current state.
+    LoopPrimary,
     /// Show this attempt's agent in the pane area.
     SelectAttempt(u32),
     /// Start another attempt.
@@ -218,7 +233,7 @@ impl RenderOnce for Inspector {
             });
 
         let body = match data.tab {
-            InspectorTab::Graph => graph_rows(&data.agents, &emit, &theme),
+            InspectorTab::Graph => graph_rows(&data, &emit, &theme),
             InspectorTab::Shared => shared_rows(&data, &theme),
             InspectorTab::Attempts => attempt_rows(&data, &emit, &theme),
             InspectorTab::Plugins => tool_rows(&data.tools, &emit, &theme),
@@ -271,94 +286,142 @@ fn empty(theme: &Theme, text: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-fn graph_rows(agents: &[InspectorAgent], emit: &ActionHandler, theme: &Theme) -> Vec<AnyElement> {
-    if agents.is_empty() {
-        return vec![empty(theme, "This space has no agents yet.")];
-    }
-    agents
-        .iter()
-        .enumerate()
-        .map(|(index, agent)| {
-            let dot = match agent.pane {
-                Some(PaneLive::Running) => theme.success,
-                Some(PaneLive::Exited(_)) => theme.text_subtle,
-                Some(PaneLive::NoPane) | None => theme.border,
-            };
-            let pane_text: SharedString = match agent.pane {
-                Some(PaneLive::Running) => "pane running".into(),
-                Some(PaneLive::Exited(Some(code))) => format!("pane exited {code}").into(),
-                Some(PaneLive::Exited(None)) => "pane exited".into(),
-                Some(PaneLive::NoPane) => "no pane".into(),
-                None => "runs over RPC".into(),
-            };
-            let mut actions = div().flex().flex_none().gap(Theme::SPACE_1);
-            if let Some(pane) = agent.pane_id {
-                let emit = emit.clone();
-                actions = actions.child(
-                    Button::new(("inspector-focus", index), "Focus")
-                        .variant(ButtonVariant::Ghost)
-                        .size(ButtonSize::Compact)
-                        .selector(format!("inspector-focus-{index}"))
-                        .on_click(move |_, window, cx| {
-                            emit(InspectorAction::Focus(pane), window, cx)
-                        }),
-                );
-            }
-            let (label, paused) = if agent.paused {
-                ("Resume", false)
-            } else {
-                ("Pause", true)
-            };
-            let emit = emit.clone();
-            let id = agent.id.clone();
-            actions = actions.child(
-                Button::new(("inspector-pause", index), label)
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Compact)
-                    .selector(format!("inspector-pause-{index}"))
-                    .on_click(move |_, window, cx| {
-                        emit(
-                            InspectorAction::SetPaused {
-                                agent: id.clone(),
-                                paused,
-                            },
-                            window,
-                            cx,
-                        )
-                    }),
-            );
+fn graph_rows(data: &InspectorData, emit: &ActionHandler, theme: &Theme) -> Vec<AnyElement> {
+    let mut rows = Vec::new();
+    if let Some(work_loop) = &data.work_loop {
+        let action = work_loop.action.clone();
+        let emit = emit.clone();
+        rows.push(
             div()
                 .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .py(px(4.0))
+                .items_center()
+                .gap(Theme::SPACE_2)
+                .p(Theme::SPACE_2)
+                .rounded(Theme::RADIUS_MD)
+                .border_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.raised)
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .gap(Theme::SPACE_2)
-                        .child(div().size(px(6.0)).rounded_full().flex_none().bg(dot))
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
                                 .text_size(Theme::TEXT_SM)
-                                .child(agent.label.clone()),
+                                .child(work_loop.stage.clone()),
                         )
-                        .child(actions),
+                        .child(
+                            div()
+                                .text_size(Theme::TEXT_XS)
+                                .text_color(theme.text_muted)
+                                .child(work_loop.status.clone()),
+                        ),
                 )
                 .child(
-                    div()
-                        .pl(px(14.0))
-                        .text_size(Theme::TEXT_XS)
-                        .text_color(theme.text_muted)
-                        .truncate()
-                        .child(format!("{} · {} · {}", agent.role, agent.state, pane_text)),
+                    Button::new("inspector-loop-primary", action)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .selector("inspector-loop-primary")
+                        .on_click(move |_, window, cx| {
+                            emit(InspectorAction::LoopPrimary, window, cx)
+                        }),
                 )
-                .into_any_element()
-        })
-        .collect()
+                .into_any_element(),
+        );
+    }
+    if data.agents.is_empty() {
+        rows.push(empty(theme, "This space has no agents yet."));
+        return rows;
+    }
+    rows.extend(
+        data.agents
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| {
+                let dot = match agent.pane {
+                    Some(PaneLive::Running) => theme.success,
+                    Some(PaneLive::Exited(_)) => theme.text_subtle,
+                    Some(PaneLive::NoPane) | None => theme.border,
+                };
+                let pane_text: SharedString = match agent.pane {
+                    Some(PaneLive::Running) => "pane running".into(),
+                    Some(PaneLive::Exited(Some(code))) => format!("pane exited {code}").into(),
+                    Some(PaneLive::Exited(None)) => "pane exited".into(),
+                    Some(PaneLive::NoPane) => "no pane".into(),
+                    None => "runs over RPC".into(),
+                };
+                let mut actions = div().flex().flex_none().gap(Theme::SPACE_1);
+                if let Some(pane) = agent.pane_id {
+                    let emit = emit.clone();
+                    actions = actions.child(
+                        Button::new(("inspector-focus", index), "Focus")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Compact)
+                            .selector(format!("inspector-focus-{index}"))
+                            .on_click(move |_, window, cx| {
+                                emit(InspectorAction::Focus(pane), window, cx)
+                            }),
+                    );
+                }
+                let (label, paused) = if agent.paused {
+                    ("Resume", false)
+                } else {
+                    ("Pause", true)
+                };
+                let emit = emit.clone();
+                let id = agent.id.clone();
+                actions = actions.child(
+                    Button::new(("inspector-pause", index), label)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .selector(format!("inspector-pause-{index}"))
+                        .on_click(move |_, window, cx| {
+                            emit(
+                                InspectorAction::SetPaused {
+                                    agent: id.clone(),
+                                    paused,
+                                },
+                                window,
+                                cx,
+                            )
+                        }),
+                );
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .py(px(4.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(Theme::SPACE_2)
+                            .child(div().size(px(6.0)).rounded_full().flex_none().bg(dot))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(Theme::TEXT_SM)
+                                    .child(agent.label.clone()),
+                            )
+                            .child(actions),
+                    )
+                    .child(
+                        div()
+                            .pl(px(14.0))
+                            .text_size(Theme::TEXT_XS)
+                            .text_color(theme.text_muted)
+                            .truncate()
+                            .child(format!("{} · {} · {}", agent.role, agent.state, pane_text)),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>(),
+    );
+    rows
 }
 
 fn shared_rows(data: &InspectorData, theme: &Theme) -> Vec<AnyElement> {

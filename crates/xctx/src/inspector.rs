@@ -4,15 +4,18 @@
 
 use gpui::{AnyElement, App, Context, Window};
 use xctx_core::{MAX_ATTEMPTS, SpaceId};
-use xctx_graph::{AgentRole, AgentState};
+use xctx_graph::{AgentRole, AgentState, LoopStatus};
 use xctx_layout::PaneId;
 use xctx_ui::inspector::{
-    Inspector, InspectorAction, InspectorAgent, InspectorContract, InspectorData, InspectorTab,
+    Inspector, InspectorAction, InspectorAgent, InspectorContract, InspectorData, InspectorLoop,
+    InspectorTab,
 };
 
 use crate::attempt_ui::{can_review, strip_chips};
 use crate::flow::pane_lives;
-use crate::space_graph::set_agent_paused_and_tell;
+use crate::space_graph::{
+    loop_advance, loop_error, pending_loop_approvals, set_agent_paused_and_tell,
+};
 use crate::workspace::Workspace;
 
 /// Below this window width, in pixels, the Inspector overlays the panes instead of sitting beside them.
@@ -51,6 +54,7 @@ impl Workspace {
         let mut data = InspectorData {
             tab: self.inspector_tab,
             agents: Vec::new(),
+            work_loop: None,
             attempts: Vec::new(),
             can_fork: false,
             can_review: false,
@@ -61,6 +65,19 @@ impl Workspace {
         };
         if let Some(state) = self.graphs.get(id) {
             let graph = state.graph();
+            let run = state.loop_run();
+            let action = match run.status() {
+                LoopStatus::Idle => "Start",
+                LoopStatus::Running => "Advance",
+                LoopStatus::AwaitingApproval { .. } => "Approve next",
+                LoopStatus::BudgetExhausted | LoopStatus::Blocked { .. } => "Resume",
+                LoopStatus::Passed => "Reset",
+            };
+            data.work_loop = Some(InspectorLoop {
+                stage: xctx_ui::loop_stage_label(run.stage()).into(),
+                status: loop_status_label(run.status()).into(),
+                action: action.into(),
+            });
             // Agents over RPC have no terminal, so they are missing from `lives`: they show as such.
             let lives = pane_lives(graph, tab, cx);
             data.agents = graph
@@ -105,12 +122,6 @@ impl Workspace {
             InspectorAction::SelectTab(tab) => self.inspector_tab = tab,
             InspectorAction::Close => self.set_inspector_open(false, cx),
             InspectorAction::Focus(pane) => {
-                // The pane is in the split view, so the Flow view gives way to it.
-                if let Some(id) = self.active_space_id()
-                    && let Some(tab) = self.tabs.get_mut(&id)
-                {
-                    tab.flow_open = false;
-                }
                 self.focus_pane(PaneId(pane), window, cx);
             }
             InspectorAction::SetPaused { agent, paused } => {
@@ -118,6 +129,7 @@ impl Workspace {
                     set_agent_paused_and_tell(state, &space.id, agent.as_ref(), paused)
                 });
             }
+            InspectorAction::LoopPrimary => self.run_loop_primary(cx),
             InspectorAction::SelectAttempt(number) => self.select_attempt(Some(number), window, cx),
             InspectorAction::Fork => self.fork_from_keys(window, cx),
             InspectorAction::Review => self.open_review(window, cx),
@@ -130,6 +142,55 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn run_loop_primary(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active_space_id() else {
+            return;
+        };
+        let status = self
+            .graphs
+            .get(&id)
+            .map(|state| state.loop_run().status().clone());
+        match status {
+            Some(LoopStatus::Idle | LoopStatus::Blocked { .. } | LoopStatus::BudgetExhausted) => {
+                self.panel_change(cx, |state, space| {
+                    state.change(|doc| doc.loop_run.start().map_err(|e| loop_error(&space.id, e)))
+                });
+            }
+            Some(LoopStatus::Running) => {
+                self.panel_change(cx, |state, space| {
+                    loop_advance(state, &space.id, Some(true))
+                });
+            }
+            Some(LoopStatus::AwaitingApproval { .. }) => {
+                let approved = self.panel_change(cx, |state, space| {
+                    state.change(|doc| {
+                        doc.loop_run
+                            .approve_next_stage()
+                            .map_err(|e| loop_error(&space.id, e))
+                    })?;
+                    Ok(space.id.clone())
+                });
+                if let (Some(id), Some(inbox)) = (approved, self.inbox.as_mut()) {
+                    for item in pending_loop_approvals(inbox, &id) {
+                        if let Err(error) = inbox.dismiss(&item) {
+                            self.error(format!("could not update the Inbox: {error}"), cx);
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(LoopStatus::Passed) => {
+                self.panel_change(cx, |state, _| {
+                    state.change(|doc| {
+                        doc.loop_run.reset();
+                        Ok(())
+                    })
+                });
+            }
+            None => {}
+        }
     }
 
     /// Open or close the Inspector, and keep the choice for the next run.
@@ -168,6 +229,17 @@ fn state_label(state: &AgentState) -> &'static str {
         AgentState::Blocked { .. } => "blocked",
         AgentState::Done => "done",
         AgentState::Failed { .. } => "failed",
+    }
+}
+
+fn loop_status_label(status: &LoopStatus) -> &'static str {
+    match status {
+        LoopStatus::Idle => "Not started",
+        LoopStatus::Running => "Agents are working",
+        LoopStatus::AwaitingApproval { .. } => "Needs your approval",
+        LoopStatus::BudgetExhausted => "Budget exhausted",
+        LoopStatus::Passed => "Review passed",
+        LoopStatus::Blocked { .. } => "Blocked",
     }
 }
 

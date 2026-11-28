@@ -303,6 +303,29 @@ fn a_launching_plan_ignores_everything_but_later(cx: &mut TestAppContext) {
     assert_eq!(*events.borrow(), ["later"]);
 }
 
+#[gpui::test]
+fn a_long_plan_keeps_its_actions_inside_a_bounded_card(cx: &mut TestAppContext) {
+    let repos: Vec<PlanRepo> = (0..100)
+        .map(|index| PlanRepo {
+            name: format!("repo-{index}").into(),
+            path: format!("/code/repo-{index}").into(),
+            reason: "name matches".into(),
+        })
+        .collect();
+    let mut long = plan(&[]);
+    long.repos = repos;
+    long.rationale = Some("why ".repeat(500).into());
+    let (events, cx) = plan_host(cx, long, false);
+    let card = cx.debug_bounds("plan-gate").expect("the card is drawn");
+    let footer = cx
+        .debug_bounds("plan-gate-footer")
+        .expect("the pinned actions are drawn");
+    assert!(card.size.height <= gpui::px(620.0));
+    assert!(footer.bottom() <= card.bottom());
+    assert!(click(cx, "plan-approve"));
+    assert_eq!(*events.borrow(), ["approve"]);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 
 struct DrawerHost {

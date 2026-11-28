@@ -1,24 +1,18 @@
-//! The Flow view of a space (⌘G flips a space between its panes and its Flow): the loop's stage track, the live
-//! agent graph, the selected agent's detail, and the timeline of what happened, and what their buttons do. Every
-//! change is saved before the view redraws. Also what keeps the graph's pane bindings in step with the panes.
+//! Agent graph integration for the workspace shell: live pane states, pane bindings, and adding or opening an
+//! agent. Activity is shown by the Inspector beside the panes; there is no separate graph screen.
 
 use std::collections::HashMap;
 
-use gpui::{AnyElement, App, Context, ParentElement, Styled, Window, div, prelude::*};
+use gpui::{App, Context, Window};
 use xctx_control::RpcError;
 use xctx_core::{Space, SpaceId};
-use xctx_graph::{AgentGraph, AgentNodeId, AgentRole, AutonomyLevel, HelperKind, LoopStatus};
+use xctx_graph::{AgentGraph, AgentNodeId, AgentRole, HelperKind};
 use xctx_layout::{PaneId, PaneKind, RolePane, SplitAxis};
-use xctx_nav::flow::{FlowFocus, TimelineInput, pair_traffic, timeline};
-use xctx_ui::flow_timeline::{FlowTimeline, sync_list_state};
-use xctx_ui::flow_view::{AgentDetail, FlowCanvas, FlowView};
-use xctx_ui::stage_track::StageTrack;
-use xctx_ui::{PaneLive, Theme, agent_identity_color, helper_kind_label};
+use xctx_ui::{PaneLive, helper_kind_label};
 
 use crate::plugin_host::MountSettings;
 use crate::space_graph::{
-    SpaceGraphState, add_role, channel_error, graph_error, loop_advance, loop_error, pane_agent,
-    pending_loop_approvals, remove_lane, set_agent_paused_and_tell, sync_pane_bindings,
+    SpaceGraphState, add_role, graph_error, pane_agent, remove_lane, sync_pane_bindings,
 };
 use crate::space_tab::{PaneTerminal, SpaceTab};
 use crate::spawn::PaneAgent;
@@ -58,38 +52,18 @@ pub(crate) fn pane_lives(
 }
 
 impl Workspace {
-    /// ⌘G or the title bar's Panes | Flow switch: show the Flow view of the space being shown, or its panes
-    /// again. Going back to the panes gives the focused pane its keyboard back.
-    pub(crate) fn toggle_flow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.active_space_id() else {
+    /// ⌘G or the title bar's Panes | Activity switch: show the Inspector on Graph without replacing the panes,
+    /// or close it when that exact view is already open.
+    pub(crate) fn toggle_flow(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_space_id().is_none() {
             return;
-        };
-        let Some(tab) = self.tabs.get_mut(&id) else {
-            return;
-        };
-        tab.flow_open = !tab.flow_open;
-        if tab.flow_open {
-            let space = tab.space.clone();
-            if let Err(e) = self.graphs.load(&space) {
-                self.error(e, cx);
-            }
-            self.sync_agent_panes(&id);
-            // The Flow view takes the keys from the terminals (nothing in it types).
-            self.focus_handle.focus(window, cx);
-        } else {
-            self.focus_active_pane(window, cx);
         }
-        cx.notify();
-    }
-
-    /// Narrow the Flow view of the space being shown to `focus` (an agent or a pair), or show everything.
-    fn set_flow_focus(&mut self, focus: Option<FlowFocus>, cx: &mut Context<Self>) {
-        if let Some(id) = self.active_space_id()
-            && let Some(tab) = self.tabs.get_mut(&id)
-            && tab.flow_focus != focus
-        {
-            tab.flow_focus = focus;
-            cx.notify();
+        let activity_open = self.prefs.inspector_open
+            && self.inspector_tab == xctx_ui::inspector::InspectorTab::Graph;
+        if activity_open {
+            self.set_inspector_open(false, cx);
+        } else {
+            self.show_inspector_tab(xctx_ui::inspector::InspectorTab::Graph, cx);
         }
     }
 
@@ -174,21 +148,7 @@ impl Workspace {
         }
     }
 
-    /// Open: show the panes with the pane of `agent` focused.
-    fn talk_to_agent(&mut self, agent: &AgentNodeId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dialog.is_some() {
-            return;
-        }
-        let Some(id) = self.active_space_id() else {
-            return;
-        };
-        if let Err(e) = self.open_agent_pane(&id, agent, window, cx) {
-            self.show_op_error(e, cx);
-        }
-    }
-
-    /// Focus the pane `agent` of open space `id` runs in, leaving the Flow view so the pane has the keyboard.
-    /// Fails when the agent has no pane.
+    /// Focus the pane `agent` of open space `id` runs in. Fails when the agent has no pane.
     pub(crate) fn open_agent_pane(
         &mut self,
         id: &SpaceId,
@@ -202,9 +162,6 @@ impl Workspace {
             .and_then(|state| state.graph().node(agent))
             .and_then(|node| node.pane_id)
             .ok_or_else(|| RpcError::conflict(format!("{agent} has no pane; Start it first")))?;
-        if let Some(tab) = self.tabs.get_mut(id) {
-            tab.flow_open = false;
-        }
         self.focus_pane_in(id, PaneId(pane), window, cx)
     }
 
@@ -319,312 +276,5 @@ impl Workspace {
                 }
             }
         }
-    }
-
-    /// Approve next: approve the stage change the loop of the space being shown waits for, and dismiss its
-    /// pending loop approval notices in the Inbox so they do not pile up.
-    fn approve_next_stage(&mut self, cx: &mut Context<Self>) {
-        let approved = self.panel_change(cx, |state, space| {
-            state.change(|doc| {
-                doc.loop_run
-                    .approve_next_stage()
-                    .map_err(|e| loop_error(&space.id, e))
-            })?;
-            Ok(space.id.clone())
-        });
-        let Some(id) = approved else {
-            return;
-        };
-        let Some(inbox) = self.inbox.as_mut() else {
-            return;
-        };
-        for item in pending_loop_approvals(inbox, &id) {
-            if let Err(e) = inbox.dismiss(&item) {
-                self.error(format!("could not update the Inbox: {e}"), cx);
-                return;
-            }
-        }
-    }
-
-    /// Remove a helper from the graph (the panel offers Remove only on helpers). Its pane keeps running.
-    fn remove_agent_lane(&mut self, agent: &AgentNodeId, cx: &mut Context<Self>) {
-        if let Some(node) = self.panel_change(cx, |state, space| {
-            remove_lane(state, &space.id, agent.as_str())
-        }) {
-            let message = if node.pane_id.is_some() {
-                format!(
-                    "Removed {} from the graph; its pane keeps running",
-                    node.label
-                )
-            } else {
-                format!("Removed {} from the graph", node.label)
-            };
-            self.info(message, cx);
-        }
-    }
-
-    /// The Flow view of `tab`.
-    pub(crate) fn render_flow(&self, tab: &SpaceTab, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx);
-        let Some(state) = self.graphs.get(&tab.space.id) else {
-            let message = self
-                .graphs
-                .error(&tab.space.id)
-                .map(|e| format!("The agent graph could not be opened: {e}"))
-                .unwrap_or_else(|| "The agent graph is not loaded.".to_owned());
-            return div()
-                .size_full()
-                .p(Theme::SPACE_4)
-                .text_size(Theme::TEXT_SM)
-                .text_color(theme.danger)
-                .child(message)
-                .into_any_element();
-        };
-        let graph = state.graph().clone();
-        let run = state.loop_run().clone();
-        let live = pane_lives(&graph, tab, cx);
-        let entity = cx.entity().downgrade();
-        let selected_agent = match &tab.flow_focus {
-            Some(FlowFocus::Agent(id)) => Some(id.clone()),
-            _ => None,
-        };
-
-        let (start, advance, approve, reset, autonomy, pick, add) = (
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-        );
-        let track = StageTrack::new(run.clone(), graph.clone())
-            .live(live.clone())
-            .selected(selected_agent)
-            .on_start(move |_, cx| {
-                let _ = start.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, space| {
-                        state.change(|doc| {
-                            doc.loop_run.start().map_err(|e| loop_error(&space.id, e))
-                        })
-                    });
-                });
-            })
-            .on_advance(move |_, cx| {
-                let _ = advance.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, space| {
-                        loop_advance(state, &space.id, Some(true))
-                    });
-                });
-            })
-            .on_approve_next(move |_, cx| {
-                let _ = approve.update(cx, |this, cx| this.approve_next_stage(cx));
-            })
-            .on_reset(move |_, cx| {
-                let _ = reset.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, _| {
-                        state.change(|doc| {
-                            doc.loop_run.reset();
-                            Ok(())
-                        })
-                    });
-                });
-            })
-            .on_autonomy(move |level: AutonomyLevel, _, cx| {
-                let _ = autonomy.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, _| {
-                        state.change(|doc| {
-                            doc.loop_run.set_autonomy(level);
-                            Ok(())
-                        })
-                    });
-                });
-            })
-            .on_select_agent(move |agent, _, cx| {
-                let agent = agent.clone();
-                let _ = pick.update(cx, |this, cx| {
-                    this.set_flow_focus(Some(FlowFocus::Agent(agent)), cx)
-                });
-            })
-            .on_add_helper(move |kind, window, cx| {
-                let _ = add.update(cx, |this, cx| this.add_helper_lane(kind, window, cx));
-            });
-
-        let refusals = self.fork_refusals_in(state);
-        let mut notes = self.attempt_notes(&tab.space.id);
-        for (agent, why) in &refusals {
-            let note = match notes.get(agent) {
-                Some(lineage) => format!("{lineage} · no attempts: {why}"),
-                None => format!("no attempts: {why}"),
-            };
-            notes.insert(agent.clone(), note.into());
-        }
-        let shared = state.shared();
-        let messages = shared.list_messages(None, None, None, None, &self.redactor);
-        let running_stage = matches!(run.status(), LoopStatus::Running).then(|| run.stage());
-        let (select, open) = (entity.clone(), entity.clone());
-        let canvas = FlowCanvas::new(format!("flow-canvas-{}", tab.space.id), graph.clone())
-            .live(live.clone())
-            .traffic(pair_traffic(&messages))
-            .running_stage(running_stage)
-            .focus(tab.flow_focus.clone())
-            .notes(notes.clone())
-            .on_select(move |focus, _, cx| {
-                let _ = select.update(cx, |this, cx| this.set_flow_focus(focus, cx));
-            })
-            .on_open(move |agent, window, cx| {
-                let agent = agent.clone();
-                let _ = open.update(cx, |this, cx| this.talk_to_agent(&agent, window, cx));
-            });
-
-        let findings = shared.findings(false, &self.redactor);
-        let shared_notes = shared.notes(&self.redactor);
-        let contract = shared.contract(&self.redactor);
-        let items = timeline(
-            &TimelineInput {
-                messages: &messages,
-                findings: &findings,
-                notes: &shared_notes,
-                contract: contract.as_ref(),
-                stages: run.history(),
-                graph: &graph,
-            },
-            tab.flow_focus.as_ref(),
-        );
-        sync_list_state(&tab.timeline, items.len());
-        let label_of = |id: &AgentNodeId| {
-            graph
-                .node(id)
-                .map_or_else(|| id.as_str().to_owned(), |node| node.label.clone())
-        };
-        let focus_label = tab.flow_focus.as_ref().map(|focus| match focus {
-            FlowFocus::Agent(id) => label_of(id).into(),
-            FlowFocus::Pair(a, b) => format!("{} ↔ {}", label_of(a), label_of(b)).into(),
-        });
-        let (clear, chosen, resolve) = (entity.clone(), entity.clone(), entity.clone());
-        let timeline = FlowTimeline::new(items, tab.timeline.clone())
-            .graph(graph.clone())
-            // A pair's conversation is shown on its own, without the contract pinned over it.
-            .contract(contract.filter(|_| !matches!(tab.flow_focus, Some(FlowFocus::Pair(..)))))
-            .focus_label(focus_label)
-            .now(crate::attempts::now())
-            .on_clear_focus(move |_, cx| {
-                let _ = clear.update(cx, |this, cx| this.set_flow_focus(None, cx));
-            })
-            .on_select_agent(move |agent, _, cx| {
-                let agent = agent.clone();
-                let _ = chosen.update(cx, |this, cx| {
-                    this.set_flow_focus(Some(FlowFocus::Agent(agent)), cx)
-                });
-            })
-            .on_resolve_finding(move |finding, _, cx| {
-                let _ = resolve.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, space| {
-                        state
-                            .shared_mut()
-                            .resolve_finding(finding)
-                            .map_err(|e| channel_error(&space.id, e))
-                    });
-                });
-            });
-
-        let detail = match &tab.flow_focus {
-            Some(FlowFocus::Agent(id)) => graph.node(id).map(|node| {
-                self.render_agent_detail(node, &graph, &live, &notes, &refusals, state, cx)
-            }),
-            _ => None,
-        };
-        let (add_helper, add_repo) = (entity.clone(), entity);
-        FlowView::new(track, canvas, timeline)
-            .detail(detail)
-            .on_add_helper(move |kind, window, cx| {
-                let _ = add_helper.update(cx, |this, cx| this.add_helper_lane(kind, window, cx));
-            })
-            .on_add_repo(move |window, cx| {
-                let _ = add_repo.update(cx, |this, cx| this.open_add_repo_dialog(window, cx));
-            })
-            .into_any_element()
-    }
-
-    /// The detail drawer of `node`, the agent selected in the Flow view, wired to what its buttons do.
-    #[allow(clippy::too_many_arguments)]
-    fn render_agent_detail(
-        &self,
-        node: &xctx_graph::AgentNode,
-        graph: &AgentGraph,
-        live: &HashMap<AgentNodeId, PaneLive>,
-        notes: &HashMap<AgentNodeId, gpui::SharedString>,
-        refusals: &HashMap<AgentNodeId, String>,
-        state: &SpaceGraphState,
-        cx: &mut Context<Self>,
-    ) -> AgentDetail {
-        let theme = Theme::of(cx);
-        let color = agent_identity_color(graph, node.id.as_str(), &theme).unwrap_or(theme.accent);
-        let runner = node
-            .runner
-            .clone()
-            .or_else(|| state.doc().runner.clone())
-            .unwrap_or_else(|| xctx_plugin::DEFAULT_RUNNER.to_owned());
-        let entity = cx.entity().downgrade();
-        let (open, start, pause, resume, fork, remove, close) = (
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity.clone(),
-            entity,
-        );
-        AgentDetail::new(node.clone(), color)
-            .live(live.get(&node.id).copied())
-            .note(notes.get(&node.id).cloned())
-            .runner(runner.into())
-            .fork_allowed(node.role.is_writer() && !refusals.contains_key(&node.id))
-            .on_open(move |agent, window, cx| {
-                let agent = agent.clone();
-                let _ = open.update(cx, |this, cx| this.talk_to_agent(&agent, window, cx));
-            })
-            .on_start(move |agent, window, cx| {
-                let agent = agent.clone();
-                let _ = start.update(cx, |this, cx| {
-                    if this.dialog.is_some() {
-                        return;
-                    }
-                    let Some(id) = this.active_space_id() else {
-                        return;
-                    };
-                    match this.start_agent_pane(&id, &agent, window, cx) {
-                        Ok(_) => this.info(format!("Started {agent} in {id}"), cx),
-                        Err(e) => this.show_op_error(e, cx),
-                    }
-                });
-            })
-            .on_pause(move |agent, _, cx| {
-                let agent = agent.clone();
-                let _ = pause.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, space| {
-                        set_agent_paused_and_tell(state, &space.id, agent.as_str(), true)
-                    });
-                });
-            })
-            .on_resume(move |agent, _, cx| {
-                let agent = agent.clone();
-                let _ = resume.update(cx, |this, cx| {
-                    this.panel_change(cx, |state, space| {
-                        set_agent_paused_and_tell(state, &space.id, agent.as_str(), false)
-                    });
-                });
-            })
-            .on_fork(move |agent, window, cx| {
-                let agent = agent.clone();
-                let _ = fork.update(cx, |this, cx| this.open_fork_dialog(agent, window, cx));
-            })
-            .on_remove(move |agent, _, cx| {
-                let agent = agent.clone();
-                let _ = remove.update(cx, |this, cx| this.remove_agent_lane(&agent, cx));
-            })
-            .on_close(move |_, cx| {
-                let _ = close.update(cx, |this, cx| this.set_flow_focus(None, cx));
-            })
     }
 }

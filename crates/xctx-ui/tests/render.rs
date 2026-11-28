@@ -291,7 +291,7 @@ fn the_title_bar_mode_switch_flips_only_from_the_other_side(cx: &mut TestAppCont
         toggles: host_toggles,
     });
     cx.run_until_parked();
-    // Flow is shown: clicking Flow again does nothing, Panes flips back.
+    // Activity is shown: clicking Activity again does nothing, Panes flips back.
     for selector in ["title-mode-flow", "title-mode-panes"] {
         let center = cx.debug_bounds(selector).map(|b| b.center());
         assert!(center.is_some(), "{selector} not drawn");
@@ -300,6 +300,6 @@ fn the_title_bar_mode_switch_flips_only_from_the_other_side(cx: &mut TestAppCont
         }
     }
     assert_eq!(*toggles.borrow(), 1);
-    // Shapes arrange panes, so the shape control is hidden while Flow is shown.
-    assert!(cx.debug_bounds("title-shape-0").is_none());
+    // Activity sits beside the panes, so their shape control remains available.
+    assert!(cx.debug_bounds("title-shape-0").is_some());
 }

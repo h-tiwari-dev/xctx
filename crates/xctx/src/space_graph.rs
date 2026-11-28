@@ -119,7 +119,6 @@ impl SpaceGraphState {
 pub struct SpaceGraphs {
     data_dir: Option<PathBuf>,
     states: HashMap<SpaceId, SpaceGraphState>,
-    errors: HashMap<SpaceId, String>,
 }
 
 impl SpaceGraphs {
@@ -128,7 +127,6 @@ impl SpaceGraphs {
         SpaceGraphs {
             data_dir,
             states: HashMap::new(),
-            errors: HashMap::new(),
         }
     }
 
@@ -137,31 +135,15 @@ impl SpaceGraphs {
         self.states.get(id)
     }
 
-    /// Why the state of `id` could not be loaded the last time it was tried, if it could not.
-    pub fn error(&self, id: &SpaceId) -> Option<&str> {
-        self.errors.get(id).map(String::as_str)
-    }
-
-    /// The state of `space`, loading it on first use. A failed load is remembered for [`SpaceGraphs::error`] and
-    /// tried again next time.
+    /// The state of `space`, loading it on first use. A failed load is tried again next time.
     pub fn load(&mut self, space: &Space) -> Result<&mut SpaceGraphState, String> {
         let id = space.id.clone();
         if !self.states.contains_key(&id) {
             let Some(data_dir) = &self.data_dir else {
-                let message = "there is no data directory for agent graphs".to_owned();
-                self.errors.insert(id, message.clone());
-                return Err(message);
+                return Err("there is no data directory for agent graphs".to_owned());
             };
-            match SpaceGraphState::open(data_dir, space) {
-                Ok(state) => {
-                    self.errors.remove(&id);
-                    self.states.insert(id.clone(), state);
-                }
-                Err(e) => {
-                    self.errors.insert(id, e.clone());
-                    return Err(e);
-                }
-            }
+            let state = SpaceGraphState::open(data_dir, space)?;
+            self.states.insert(id.clone(), state);
         }
         self.states
             .get_mut(&id)
@@ -171,7 +153,6 @@ impl SpaceGraphs {
     /// Drop what is held for `id`, once it is shipped or discarded. Its files stay in the data directory.
     pub fn forget(&mut self, id: &SpaceId) {
         self.states.remove(id);
-        self.errors.remove(id);
     }
 }
 
@@ -616,7 +597,7 @@ pub fn loop_approval_notice(id: &SpaceId, stage: LoopStage) -> Notice {
             loop_stage_label(stage)
         ),
         body: Some(
-            "Open the space's agent graph (⌘G) and choose Approve next to run the stage."
+            "Open the space's Activity panel (⌘G) and choose Approve next to run the stage."
                 .to_owned(),
         ),
         level: Level::Warning,
@@ -872,7 +853,6 @@ mod tests {
         std::fs::write(&path, "not json")?;
         let mut graphs = SpaceGraphs::new(Some(data.path().to_path_buf()));
         assert!(graphs.load(&space()).is_err());
-        assert!(graphs.error(&space().id).is_some());
         assert_eq!(std::fs::read_to_string(&path)?, "not json");
         assert!(SpaceGraphs::new(None).load(&space()).is_err());
         Ok(())

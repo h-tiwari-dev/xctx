@@ -44,7 +44,7 @@ actions!(
         ResizeDown,
         /// Zoom the focused pane, or end the zoom.
         ToggleZoom,
-        /// Show the Flow view of the space being shown (its loop, agent graph and timeline), or its panes again.
+        /// Show or hide Activity for the space being shown, without replacing its panes.
         ToggleFlow,
         /// Show Home.
         ShowHome,

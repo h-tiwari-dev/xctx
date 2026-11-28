@@ -26,6 +26,7 @@ use xctx_plugin_view::{
     FilesPreview, FilesView, HttpDiffView, HttpPaneView, HttpResponseView, HttpRow, HttpView,
     LOG_LINE_CHARS, LOG_LINE_LIMIT, LogLevel, LogLine, LogsPaneView, LogsView, NetworkErrorRow,
     PreviewBody, SQL_ROW_LIMIT, SqlPaneView, SqlResultView, SqlView, detect_level, level_passes,
+    markdown_blocks,
 };
 use xctx_ui::{PromptEvent, PromptInput, Theme, cut_line};
 use xctx_web_view::{PageStatus, WebView};
@@ -419,19 +420,24 @@ pub(crate) fn file_row(row: TreeRow) -> FileRow {
 }
 
 /// The preview of a file's (or a diff's) text, and the note saying why it is cut when it is.
-fn text_body(text: &PreviewText) -> (PreviewBody, Option<SharedString>) {
+fn text_body(text: &PreviewText, markdown: bool) -> (PreviewBody, Option<SharedString>) {
     match text {
         PreviewText::Binary => (PreviewBody::Binary, None),
         PreviewText::Text { text, cut } => {
-            let lines: Vec<SharedString> = text.lines().map(|l| l.to_owned().into()).collect();
+            let body = if markdown {
+                PreviewBody::Markdown(markdown_blocks(text))
+            } else {
+                PreviewBody::Lines(text.lines().map(|line| line.to_owned().into()).collect())
+            };
+            let lines = text.lines().count();
             let note = cut.then(|| {
-                if lines.len() >= FILES_PREVIEW_LINES {
+                if lines >= FILES_PREVIEW_LINES {
                     format!("Cut: showing the first {FILES_PREVIEW_LINES} lines").into()
                 } else {
                     format!("Cut: showing the first {} KiB", FILES_PREVIEW_BYTES / 1024).into()
                 }
             });
-            (PreviewBody::Lines(lines), note)
+            (body, note)
         }
     }
 }
@@ -444,11 +450,23 @@ pub(crate) fn files_view(ui: &FilesUi) -> FilesView {
         None => FilesPreview::default(),
         Some(path) => {
             let diff = ui.diff && change.is_some();
-            let (body, cut) = if diff {
+            let markdown = std::path::Path::new(path).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("md")
+                    || ext.eq_ignore_ascii_case("markdown")
+                    || ext.eq_ignore_ascii_case("mdx")
+            });
+            let document = !diff
+                && std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+                && matches!(ui.preview, Some(Ok(_)));
+            let (body, cut) = if document {
+                (PreviewBody::Document, None)
+            } else if diff {
                 match &ui.diff_text {
                     None => (PreviewBody::Loading, None),
                     Some(Err(why)) => (PreviewBody::Message(why.clone().into()), None),
-                    Some(Ok(text)) => text_body(text),
+                    Some(Ok(text)) => text_body(text, false),
                 }
             } else {
                 match &ui.preview {
@@ -457,7 +475,7 @@ pub(crate) fn files_view(ui: &FilesUi) -> FilesView {
                         (PreviewBody::Message(FILES_DELETED.into()), None)
                     }
                     Some(Err(why)) => (PreviewBody::Message(why.clone().into()), None),
-                    Some(Ok(file)) => text_body(&file.body),
+                    Some(Ok(file)) => text_body(&file.body, markdown),
                 }
             };
             FilesPreview {
@@ -697,6 +715,7 @@ impl Workspace {
         let (create, drop) = pane_state_changes(self.plugin_panes.panes.keys(), &live);
         for key in drop {
             self.plugin_panes.panes.remove(&key);
+            self.browsers.close_document(&key.0, key.1);
         }
         for key in create {
             let ui = self.new_pane_ui(&key, window, cx);
@@ -1253,7 +1272,20 @@ impl Workspace {
                 };
                 render_web(ui, page, &ws, &key).into_any_element()
             }
-            PaneState::Files(ui) => render_files(ui, &ws, &key).into_any_element(),
+            PaneState::Files(ui) => {
+                let document = matches!(ui.view.preview.body, PreviewBody::Document)
+                    .then(|| {
+                        let relative = ui.selected.as_deref()?;
+                        let root = ui.tree.root();
+                        let path = root.join(relative);
+                        self.browsers
+                            .document(id, pane, &path, root)
+                            .ok()
+                            .map(|view| page_area(view, self.pages_may_show()))
+                    })
+                    .flatten();
+                render_files(ui, document, &ws, &key).into_any_element()
+            }
             PaneState::Missing(why) => {
                 let theme = Theme::of(cx);
                 div()
@@ -1443,7 +1475,12 @@ fn render_web(
     pane
 }
 
-fn render_files(ui: &FilesUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> FilesPaneView {
+fn render_files(
+    ui: &FilesUi,
+    document: Option<AnyElement>,
+    ws: &WeakEntity<Workspace>,
+    key: &PaneKey,
+) -> FilesPaneView {
     let (w, k) = (ws.clone(), key.clone());
     let folder = move |path: SharedString, _: &mut Window, cx: &mut App| {
         let _ = w.update(cx, |this, cx| this.files_toggle(&k, &path, cx));
@@ -1462,7 +1499,7 @@ fn render_files(ui: &FilesUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> File
     let diff = move |on: bool, _: &mut Window, cx: &mut App| {
         let _ = w.update(cx, |this, cx| this.files_set(&k, cx, |ui| ui.diff = on));
     };
-    FilesPaneView::new(ui.view.clone())
+    let mut pane = FilesPaneView::new(ui.view.clone())
         .on_folder(folder)
         .on_file(file)
         .on_refresh(on_ws(ws, key, |this, key, _, cx| {
@@ -1470,7 +1507,11 @@ fn render_files(ui: &FilesUi, ws: &WeakEntity<Workspace>, key: &PaneKey) -> File
             cx.notify();
         }))
         .on_changed_only(changed_only)
-        .on_diff(diff)
+        .on_diff(diff);
+    if let Some(document) = document {
+        pane = pane.document(document);
+    }
+    pane
 }
 
 #[cfg(test)]
@@ -1879,5 +1920,25 @@ mod tests {
             files_view(&ui).preview.body,
             PreviewBody::Message(FILES_DELETED.into())
         );
+
+        ui.selected = Some("guide.md".into());
+        ui.preview = Some(Ok(FilePreview {
+            size: 9,
+            body: PreviewText::Text {
+                text: "# Guide\n".into(),
+                cut: false,
+            },
+        }));
+        assert!(matches!(
+            files_view(&ui).preview.body,
+            PreviewBody::Markdown(_)
+        ));
+
+        ui.selected = Some("design.pdf".into());
+        ui.preview = Some(Ok(FilePreview {
+            size: 1024,
+            body: PreviewText::Binary,
+        }));
+        assert_eq!(files_view(&ui).preview.body, PreviewBody::Document);
     }
 }

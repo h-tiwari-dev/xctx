@@ -5,7 +5,7 @@
 //! What they show is worked out by the plain functions at the top, tested without a window; the jobs they start
 //! are in `attempt_jobs.rs`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
@@ -184,18 +184,6 @@ pub fn fork_target(graph: &AgentGraph, focused: Option<u64>) -> Result<AgentNode
                 .join(", ")
         )),
     }
-}
-
-/// The attempt lineage of writer `agent`, for its card in the graph panel: "attempts: #1 adopted, #2 discarded".
-/// `None` when it has no attempts.
-pub fn attempt_lineage(set: &AttemptSet, agent: &str) -> Option<String> {
-    let parts: Vec<String> = set
-        .attempts
-        .iter()
-        .filter(|a| a.agent == agent)
-        .map(|a| format!("#{} {}", a.number(), a.state.name()))
-        .collect();
-    (!parts.is_empty()).then(|| format!("attempts: {}", parts.join(", ")))
 }
 
 /// One instruction per attempt from the fork dialog's input texts: the first `count`, trimmed, blank ones none.
@@ -1010,25 +998,6 @@ impl Workspace {
                     }),
             )
     }
-
-    // ---------------------------------------------------------------------------------------------------------
-    // Graph panel
-
-    /// Each writer's attempt lineage in space `id`, for the graph panel's cards (see [`attempt_lineage`]).
-    pub(crate) fn attempt_notes(&self, id: &SpaceId) -> HashMap<AgentNodeId, SharedString> {
-        let Some(set) = self.attempts.get(id) else {
-            return HashMap::new();
-        };
-        let mut agents: Vec<&str> = set.attempts.iter().map(|a| a.agent.as_str()).collect();
-        agents.sort_unstable();
-        agents.dedup();
-        agents
-            .into_iter()
-            .filter_map(|agent| {
-                attempt_lineage(set, agent).map(|line| (AgentNodeId::new(agent), line.into()))
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -1238,21 +1207,6 @@ mod tests {
         )?;
         helped.bind_pane(&helper, Some(3))?;
         assert!(fork_target(&helped, Some(3)).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn lineage_names_each_attempt_and_its_state() -> TestResult {
-        let mut set = AttemptSet::new(SpaceId::new("s"));
-        assert_eq!(attempt_lineage(&set, "writer-api"), None);
-        fork(&mut set, vec![None, None])?;
-        set.mark_adopted(1, 11)?;
-        set.mark_discarded(2, 12)?;
-        assert_eq!(
-            attempt_lineage(&set, "writer-api").as_deref(),
-            Some("attempts: #1 adopted, #2 discarded")
-        );
-        assert_eq!(attempt_lineage(&set, "writer-web"), None);
         Ok(())
     }
 

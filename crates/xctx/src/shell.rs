@@ -379,7 +379,8 @@ impl Workspace {
                     space.title.clone(),
                     Some(SpaceHeaderInfo {
                         shape: layout_shape(space.shape),
-                        flow_open: tab.flow_open,
+                        flow_open: self.prefs.inspector_open
+                            && self.inspector_tab == xctx_ui::inspector::InspectorTab::Graph,
                         production: space.production,
                         // The status line shows the branch and env; the title bar only warns about production,
                         // so the title and actions keep their room.
@@ -553,10 +554,12 @@ impl Workspace {
                 action("focus-prev", "Focus previous pane", Some("⌘["), &[]),
                 action(
                     "flow",
-                    if tab.flow_open {
-                        "Show panes"
+                    if self.prefs.inspector_open
+                        && self.inspector_tab == xctx_ui::inspector::InspectorTab::Graph
+                    {
+                        "Hide Activity"
                     } else {
-                        "Show Flow (loop, agent graph, activity)"
+                        "Show Activity"
                     },
                     Some("⌘G"),
                     &[

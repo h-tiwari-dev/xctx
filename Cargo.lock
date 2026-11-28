@@ -6638,6 +6638,7 @@ name = "xctx-plugin-view"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "pulldown-cmark",
  "xctx-ui",
 ]
 

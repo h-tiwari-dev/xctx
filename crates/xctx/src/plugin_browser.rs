@@ -18,7 +18,9 @@
 //! pane is zoomed away, an attempt is shown instead, or a dialog is open. A view is closed when its last web
 //! pane is unmounted, its space's tab closes, or xctx quits.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -33,6 +35,7 @@ use xctx_browser::{
     type_script, typed_value,
 };
 use xctx_core::{Redactor, SpaceId};
+use xctx_layout::PaneId;
 use xctx_plugin::Invocation;
 use xctx_web_view::{WebView, WindowHost};
 
@@ -64,11 +67,17 @@ struct SpaceBrowser {
     turn: Rc<AsyncMutex<()>>,
 }
 
+struct DocumentPreview {
+    view: WebView,
+    path: PathBuf,
+}
+
 /// The live browsers of the open spaces, and the window they are drawn in.
 #[derive(Default)]
 pub(crate) struct Browsers {
     host: Option<WindowHost>,
     views: HashMap<SpaceId, SpaceBrowser>,
+    documents: RefCell<HashMap<(SpaceId, PaneId), DocumentPreview>>,
 }
 
 impl Browsers {
@@ -85,10 +94,59 @@ impl Browsers {
         self.views.get(space).map(|b| b.view.clone())
     }
 
+    /// The local-only document view for `pane`, loading `path` when it is new or changed.
+    pub(crate) fn document(
+        &self,
+        space: &SpaceId,
+        pane: PaneId,
+        path: &Path,
+        root: &Path,
+    ) -> Result<WebView, String> {
+        let key = (space.clone(), pane);
+        let mut documents = self.documents.borrow_mut();
+        if let Some(document) = documents.get(&key)
+            && document.path == path
+            && !document.view.is_closed()
+        {
+            return Ok(document.view.clone());
+        }
+        if let Some(old) = documents.remove(&key) {
+            old.view.close();
+        }
+        let host = self
+            .host
+            .as_ref()
+            .ok_or("the window cannot show a document yet; try again")?;
+        let (view, _changes) = WebView::new(host).map_err(|e| e.to_string())?;
+        view.load_local_file(path, root)
+            .map_err(|e| e.to_string())?;
+        documents.insert(
+            key,
+            DocumentPreview {
+                view: view.clone(),
+                path: path.to_path_buf(),
+            },
+        );
+        Ok(view)
+    }
+
+    /// Close a document view whose Files pane went away.
+    pub(crate) fn close_document(&self, space: &SpaceId, pane: PaneId) {
+        if let Some(document) = self.documents.borrow_mut().remove(&(space.clone(), pane)) {
+            document.view.close();
+        }
+    }
+
     /// An element drawn after everything else in the window: its paint hides every browser that no pane
     /// placed this frame.
     pub(crate) fn frame_end(&self) -> AnyElement {
-        let views: Vec<WebView> = self.views.values().map(|b| b.view.clone()).collect();
+        let mut views: Vec<WebView> = self.views.values().map(|b| b.view.clone()).collect();
+        views.extend(
+            self.documents
+                .borrow()
+                .values()
+                .map(|document| document.view.clone()),
+        );
         canvas(
             |_, _, _| {},
             move |_, _, _, _| {

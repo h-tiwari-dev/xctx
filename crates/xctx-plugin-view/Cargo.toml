@@ -6,6 +6,7 @@ description = "GPUI panes for xctx's first-party plugins: the API client, logs, 
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3" }
+pulldown-cmark = { version = "0.13", default-features = false }
 xctx-ui = { path = "../xctx-ui" }
 
 [dev-dependencies]

@@ -137,6 +137,8 @@ pub(crate) struct Workspace {
     pub(crate) inbox_expanded: Option<SharedString>,
     /// The Plan Gate open for review on Home.
     pub(crate) plan_review: Option<ItemId>,
+    /// The plan review card shows its repo picker (it always does while the plan has no repo).
+    pub(crate) plan_add_open: bool,
     /// The Plan Gates launching or launched from this window.
     pub(crate) plan_launches: PlanLaunches,
     /// Where a repo is typed to add it to the reviewed plan.
@@ -333,6 +335,7 @@ impl Workspace {
             redactor: Redactor::default(),
             inbox_expanded: None,
             plan_review: None,
+            plan_add_open: false,
             plan_launches: PlanLaunches::default(),
             plan_repo_input,
             env_prompt: None,

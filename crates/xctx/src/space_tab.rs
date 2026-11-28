@@ -99,12 +99,6 @@ pub(crate) struct SpaceTab {
     pub(crate) space: Space,
     pub(crate) layout: SpaceLayout,
     pub(crate) terminals: HashMap<PaneId, PaneTerminal>,
-    /// Whether the space shows its Flow view (loop, agent graph, timeline) instead of its panes.
-    pub(crate) flow_open: bool,
-    /// What the Flow view is narrowed to: one agent or one pair, or `None` for everything.
-    pub(crate) flow_focus: Option<xctx_nav::flow::FlowFocus>,
-    /// The scroll and measurements of the Flow view's timeline, kept across frames.
-    pub(crate) timeline: gpui::ListState,
     /// The agent terminal of each live attempt, by attempt number. They are not in the layout; the attempt strip
     /// switches to them (see [`Workspace::attempt_terminal`]).
     pub(crate) attempt_terminals: HashMap<u32, PaneTerminal>,
@@ -124,9 +118,6 @@ impl SpaceTab {
             space,
             layout,
             terminals: HashMap::new(),
-            flow_open: false,
-            flow_focus: None,
-            timeline: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(600.0)),
             attempt_terminals: HashMap::new(),
             shown_attempt: None,
             repo_links,
@@ -1069,9 +1060,8 @@ impl Workspace {
         sessions
     }
 
-    /// The pane area of the space being shown: its split view (under the attempt strip when it has attempts)
-    /// with the tool dock (drawn from `dock`) on the right edge, or its Flow view when that is shown. The
-    /// Inspector, when open, takes the dock's place beside the panes, or covers them in a narrow window.
+    /// The pane area of the space being shown: its split view (under the attempt strip when it has attempts).
+    /// The Inspector, when open, takes the tool dock's place beside the panes, or covers them in a narrow window.
     pub(crate) fn render_space(
         &self,
         tab: &SpaceTab,
@@ -1079,12 +1069,7 @@ impl Workspace {
         inspector: Option<InspectorPlacement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The Flow view replaces the panes (and their tool dock); the panes keep running behind it.
-        let main = if tab.flow_open {
-            self.render_flow(tab, cx)
-        } else {
-            self.render_space_body(tab, cx)
-        };
+        let main = self.render_space_body(tab, cx);
         match inspector {
             Some(InspectorPlacement::Beside(panel)) => div()
                 .flex()
@@ -1098,7 +1083,6 @@ impl Workspace {
                 .child(div().size_full().child(main))
                 .child(div().absolute().top_0().right_0().bottom_0().child(panel))
                 .into_any_element(),
-            None if tab.flow_open => div().size_full().child(main).into_any_element(),
             None => div()
                 .flex()
                 .size_full()

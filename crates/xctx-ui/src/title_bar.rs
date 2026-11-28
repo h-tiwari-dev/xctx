@@ -39,8 +39,7 @@ pub fn shape_label(shape: Shape) -> &'static str {
 pub struct SpaceHeaderInfo {
     /// The space's current shape, selected in the shape control.
     pub shape: Shape,
-    /// Whether the space shows its Flow view instead of its panes; selects Flow in the mode switch and hides
-    /// the shape control (shapes arrange panes).
+    /// Whether the Activity panel is open on its Graph tab.
     pub flow_open: bool,
     /// Whether the space runs with a `production` env; draws the env chip as a danger badge.
     pub production: bool,
@@ -124,7 +123,7 @@ impl TitleBar {
         self
     }
 
-    /// Call `handler` when the mode switch's other side (Panes or Flow) is clicked, to flip between them.
+    /// Call `handler` when the mode switch's other side (Panes or Activity) is clicked.
     pub fn on_toggle_flow(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_toggle_flow = Some(Rc::new(handler));
         self
@@ -319,11 +318,16 @@ impl TitleBar {
             .children(segments)
     }
 
-    /// The Panes | Flow switch: the selected side is drawn raised; a click on the other side flips the view.
+    /// The Panes | Activity switch: the selected side is drawn raised; Activity opens beside the panes.
     fn render_mode(&self, flow_open: bool, theme: &Theme) -> gpui::Div {
         let sides = [
             ("title-mode-panes", IconName::SplitH, "Panes", !flow_open),
-            ("title-mode-flow", IconName::Orchestrator, "Flow", flow_open),
+            (
+                "title-mode-flow",
+                IconName::Orchestrator,
+                "Activity",
+                flow_open,
+            ),
         ];
         let segments = sides.into_iter().map(|(selector, icon, label, selected)| {
             let (hover, text) = (theme.hover, theme.text);
@@ -343,7 +347,7 @@ impl TitleBar {
                     theme.text_muted
                 }))
                 .child(label)
-                .tooltip(|_, cx| Tooltip::view("Switch between panes and Flow ⌘G", cx));
+                .tooltip(|_, cx| Tooltip::view("Show or hide Activity ⌘G", cx));
             segment = if selected {
                 segment
                     .bg(theme.raised)
@@ -486,9 +490,7 @@ impl TitleBar {
             .items_center()
             .gap(Theme::SPACE_1)
             .child(control(self.render_mode(info.flow_open, theme)).mr(Theme::SPACE_2))
-            .when(!info.flow_open, |row| {
-                row.child(control(self.render_shapes(info.shape, theme)).mr(Theme::SPACE_2))
-            })
+            .child(control(self.render_shapes(info.shape, theme)).mr(Theme::SPACE_2))
             .child(control(tool_button(
                 "title-add-agent",
                 IconName::Plus,

@@ -23,6 +23,7 @@
 mod geometry;
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -124,6 +125,8 @@ struct State {
     /// The main document's failed status, recorded once its document commits.
     document_error: Option<NetworkError>,
     error: Option<String>,
+    /// A local directory this view may read. Only document previews set it; browser views leave it unset.
+    local_root: Option<String>,
     settle_waiters: Vec<oneshot::Sender<LoadOutcome>>,
     changes: mpsc::Sender<()>,
 }
@@ -173,7 +176,16 @@ define_class!(
                 decision.call((WKNavigationActionPolicy::Allow,));
                 return;
             }
-            if let Err(why) = user_may_open(&url) {
+            let local_allowed = self
+                .ivars()
+                .state
+                .borrow()
+                .local_root
+                .as_ref()
+                .is_some_and(|root| url == root.trim_end_matches('/') || url.starts_with(root));
+            if let Err(why) = user_may_open(&url)
+                && !local_allowed
+            {
                 let mut state = self.ivars().state.borrow_mut();
                 state.error = Some(format!("{url} was not opened: {why}"));
                 state.changed();
@@ -434,6 +446,7 @@ impl WebView {
             log: PageLog::default(),
             document_error: None,
             error: None,
+            local_root: None,
             settle_waiters: Vec::new(),
             changes,
         }));
@@ -569,6 +582,43 @@ impl WebView {
         let request = NSURLRequest::requestWithURL(&ns_url);
         // SAFETY: a WebKit call on the main thread.
         let _ = unsafe { self.inner.view.loadRequest(&request) };
+        Ok(())
+    }
+
+    /// Load local `file`, allowing WebKit to read only `root` and its descendants. This is for document previews,
+    /// not browsing: both paths are canonicalized and a file outside `root` is refused.
+    pub fn load_local_file(&self, file: &Path, root: &Path) -> Result<()> {
+        self.check_open()?;
+        let invalid = |path: &Path, reason: &str| BrowserError::InvalidUrl {
+            url: path.display().to_string(),
+            reason: reason.to_owned(),
+        };
+        let root = root
+            .canonicalize()
+            .map_err(|e| invalid(root, &format!("cannot resolve the preview root: {e}")))?;
+        let file = file
+            .canonicalize()
+            .map_err(|e| invalid(file, &format!("cannot resolve the document: {e}")))?;
+        if !file.starts_with(&root) || !file.is_file() {
+            return Err(invalid(
+                &file,
+                "the document is not a regular file inside the preview root",
+            ));
+        }
+        let file_url = NSURL::fileURLWithPath(&NSString::from_str(&file.to_string_lossy()));
+        let root_url =
+            NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&root.to_string_lossy()), true);
+        let mut allowed = url_string(&root_url);
+        if !allowed.ends_with('/') {
+            allowed.push('/');
+        }
+        self.inner.state.borrow_mut().local_root = Some(allowed);
+        // SAFETY: a WebKit call on the main thread; both URLs were made above and stay alive for the call.
+        let _ = unsafe {
+            self.inner
+                .view
+                .loadFileURL_allowingReadAccessToURL(&file_url, &root_url)
+        };
         Ok(())
     }
 

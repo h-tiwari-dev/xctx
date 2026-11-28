@@ -189,7 +189,9 @@ impl Workspace {
     /// terminal drawers, the plan review card, the Inbox and the active spaces.
     pub(crate) fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
-        let terminal_height = (window.viewport_size().height * 0.38).max(DRAWER_HEIGHT);
+        let terminal_height = (window.viewport_size().height * 0.32)
+            .max(DRAWER_HEIGHT)
+            .min(px(360.0));
         let compact = self.home_agent_open || self.plan_review.is_some();
         let top_pad = if compact {
             Theme::SPACE_6
@@ -244,6 +246,11 @@ impl Workspace {
             folders_chip = folders_chip.tone(Tone::Warning);
         }
         let pending = self.inbox_pending();
+        let show_agent = self.home_agent_open
+            || !matches!(
+                self.parent.status,
+                AgentStatus::Running | AgentStatus::Starting
+            );
         let mut card = ComposerCard::new(self.task_input.clone())
             .focused(
                 self.task_input
@@ -269,16 +276,22 @@ impl Workspace {
                     })),
             );
         }
+        if show_agent {
+            card = card.expanded(
+                self.render_parent_agent(terminal_height, window, cx)
+                    .embedded(true),
+            );
+        }
         let dragging = cx.has_active_drag();
         let composer = div()
             .id("home-composer")
             .flex()
             .flex_col()
-            .gap(Theme::SPACE_3)
             .p(Theme::SPACE_1)
             .rounded(Theme::RADIUS_LG)
             .border_2()
             .border_color(gpui::transparent_black())
+            .overflow_hidden()
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style
                     .border_color(theme.accent.alpha(0.8))
@@ -305,11 +318,6 @@ impl Workspace {
                         .child("Drop folders to index them"),
                 )
             });
-        let show_agent = self.home_agent_open
-            || !matches!(
-                self.parent.status,
-                AgentStatus::Running | AgentStatus::Starting
-            );
         let mut column = div()
             .flex()
             .flex_col()
@@ -345,9 +353,6 @@ impl Workspace {
                     .bg(theme.surface)
                     .child(self.render_roots(cx)),
             );
-        }
-        if show_agent {
-            column = column.child(self.render_parent_agent(terminal_height, window, cx));
         }
         if let Some(plan) = self.render_plan_review(cx) {
             column = column.child(plan);

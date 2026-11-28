@@ -219,6 +219,7 @@ pub struct ComposerCard {
     left_readout: Option<SharedString>,
     right_readout: Option<SharedString>,
     chips: Vec<ComposerChip>,
+    expanded: Option<AnyElement>,
     on_submit: Option<ClickHandler>,
 }
 
@@ -232,6 +233,7 @@ impl ComposerCard {
             left_readout: None,
             right_readout: None,
             chips: Vec::new(),
+            expanded: None,
             on_submit: None,
         }
     }
@@ -266,6 +268,12 @@ impl ComposerCard {
         self
     }
 
+    /// Put expanded content below the composer footer, inside the same outline.
+    pub fn expanded(mut self, content: impl IntoElement) -> Self {
+        self.expanded = Some(content.into_any_element());
+        self
+    }
+
     /// Register the click handler for the submit button (invoked only when [`Self::can_submit`] is `true`).
     pub fn on_submit(
         mut self,
@@ -279,6 +287,7 @@ impl ComposerCard {
 impl RenderOnce for ComposerCard {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx);
+        let expanded = self.expanded;
 
         let horizon = div()
             .absolute()
@@ -393,14 +402,19 @@ impl RenderOnce for ComposerCard {
             .child(div().flex_1())
             .child(submit);
 
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap(Theme::SPACE_2)
+            .px(px(18.0))
+            .py(px(14.0))
+            .child(div().min_h(px(72.0)).w_full().child(self.input))
+            .child(footer);
         let card = div()
             .relative()
             .flex()
             .flex_col()
-            .gap(Theme::SPACE_2)
             .w_full()
-            .px(px(18.0))
-            .py(px(14.0))
             .rounded(px(COMPOSER_RADIUS))
             .border_1()
             .border_color(if self.focused {
@@ -414,8 +428,9 @@ impl RenderOnce for ComposerCard {
                     .blur_radius(px(32.0))
                     .spread_radius(px(0.0)),
             ])
-            .child(div().min_h(px(72.0)).w_full().child(self.input))
-            .child(footer);
+            .overflow_hidden()
+            .child(content)
+            .children(expanded);
 
         let left_text = self.left_readout.unwrap_or_default();
         let right_text = self.right_readout.unwrap_or_default();

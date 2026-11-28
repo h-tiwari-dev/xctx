@@ -774,7 +774,8 @@ impl Workspace {
     pub(crate) fn render_plan_review(&self, cx: &mut Context<Self>) -> Option<PlanGateCard> {
         let view = plan_view(self.reviewed_plan()?, &self.redactor)?;
         let entity = cx.entity().downgrade();
-        let (shape, drop, approve, reject, later, pick, browse) = (
+        let (shape, drop, approve, reject, later, pick, browse, toggle) = (
+            entity.clone(),
             entity.clone(),
             entity.clone(),
             entity.clone(),
@@ -806,6 +807,13 @@ impl Workspace {
         Some(
             PlanGateCard::new(view)
                 .busy(busy)
+                .add_open(self.plan_add_open)
+                .on_toggle_add(move |_, cx| {
+                    let _ = toggle.update(cx, |this, cx| {
+                        this.plan_add_open = !this.plan_add_open;
+                        cx.notify();
+                    });
+                })
                 .add_repo(
                     div()
                         .flex()
