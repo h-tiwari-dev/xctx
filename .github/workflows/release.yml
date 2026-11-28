@@ -1,0 +1,132 @@
+# Builds a Developer ID signed, notarized and stapled xctx.dmg and attaches it to a GitHub release.
+#
+# Runs when a `v*` tag is pushed, or by hand (Actions -> Release -> Run workflow). A manual run with an empty `tag`
+# builds and uploads the dmg as a workflow artifact without publishing anything.
+#
+# Secrets (Settings -> Secrets and variables -> Actions): DEVELOPER_ID_P12_BASE64 and P12_PASSWORD (the Developer ID
+# Application certificate and key, exported as .p12), NOTARY_APPLE_ID, NOTARY_TEAM_ID and NOTARY_PASSWORD (an
+# app-specific password). docs/release.md says how to make and rotate them.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish at the selected commit. Leave empty to only build the dmg.
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+
+jobs:
+  dmg:
+    name: signed, notarized xctx.dmg
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: release
+
+      - name: Import the Developer ID certificate
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/xctx-release.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "::add-mask::$keychain_password"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/devid.p12"
+          security import "$RUNNER_TEMP/devid.p12" -P "$P12_PASSWORD" -f pkcs12 -k "$keychain" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/devid.p12"
+
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security default-keychain -d user -s "$keychain"
+
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            echo "::error::no valid Developer ID Application identity in the imported p12"
+            security find-identity -p codesigning "$keychain"
+            exit 1
+          fi
+          echo "Signing as: $identity"
+          {
+            echo "XCTX_KEYCHAIN=$keychain"
+            echo "XCTX_SIGN_IDENTITY=$identity"
+          } >> "$GITHUB_ENV"
+
+      - name: Store the notary credentials
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials xctx-notary \
+            --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" --password "$NOTARY_PASSWORD" \
+            --keychain "$XCTX_KEYCHAIN"
+
+      - name: Build, sign and notarize xctx.dmg
+        env:
+          XCTX_NOTARY_PROFILE: xctx-notary
+        run: mise run dmg
+
+      - name: Name the dmg
+        run: cp xctx.dmg xctx-macos-arm64.dmg
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xctx-macos-arm64-dmg
+          path: xctx-macos-arm64.dmg
+          if-no-files-found: error
+
+      - name: Remove the temporary keychain
+        if: always()
+        run: |
+          if [ -n "${XCTX_KEYCHAIN:-}" ]; then
+            security delete-keychain "$XCTX_KEYCHAIN" || true
+          fi
+
+  publish:
+    name: publish release
+    needs: dmg
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: xctx-macos-arm64-dmg
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" xctx-macos-arm64.dmg \
+            --target "$GITHUB_SHA" \
+            --title "xctx $TAG" \
+            --generate-notes \
+            $prerelease

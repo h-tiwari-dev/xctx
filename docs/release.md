@@ -18,6 +18,27 @@
 
    The app-specific password is made at appleid.apple.com under Sign-In and Security.
 
+## Releases from GitHub Actions
+
+`.github/workflows/release.yml` builds the same signed, notarized dmg on a `macos-15` runner when a `v*` tag is
+pushed (`git tag v0.1.0 && git push origin v0.1.0`) and attaches it to a GitHub release. A manual run
+(`gh workflow run release.yml`) with no `tag` input builds the dmg and keeps it as a workflow artifact only.
+
+It reads five repository secrets:
+
+| Secret | Contents |
+|---|---|
+| `DEVELOPER_ID_P12_BASE64` | the Developer ID Application certificate and its private key, as a base64-encoded `.p12` |
+| `P12_PASSWORD` | the `.p12` export password |
+| `NOTARY_APPLE_ID` | the Apple ID that owns the app-specific password |
+| `NOTARY_TEAM_ID` | the Developer team id |
+| `NOTARY_PASSWORD` | an app-specific password for that Apple ID |
+
+The job imports the certificate into a temporary keychain, stores the notary profile there, runs `mise run dmg`, and
+deletes the keychain afterwards. Secrets never reach pull requests, because the workflow does not run on them.
+
+To rotate the notary password, see "Rotating the notary password" in the README.
+
 ## Each release
 
 ```sh
