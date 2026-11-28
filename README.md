@@ -67,12 +67,51 @@ All development runs through mise tasks:
 | `mise run ctl <method> [key=value]...` | Run `xctx-ctl` against the running window (see below) |
 | `mise run build` | Build the `xctx` app and `xctx-ctl` in release mode |
 | `mise run bundle` | Assemble the release build, with `xctx-ctl`, into `xctx.app` at the repo root |
+| `mise run dmg` | Build `xctx.dmg`; signed and notarized when `XCTX_SIGN_IDENTITY` and `XCTX_NOTARY_PROFILE` are set (see Releasing) |
 | `mise run test` | Run tests across the workspace |
 | `mise run fmt` | Format Rust code across the workspace |
 | `mise run fmt:check` | Check Rust formatting across the workspace |
 | `mise run lint` | Run Clippy across the workspace and all targets (`-D warnings`) |
 | `mise run ci` | Run `fmt:check`, `lint`, and `test` together |
 | `mise run clean` | Remove Cargo build artifacts and `xctx.app` |
+
+## Releasing
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it builds `xctx.dmg`, signs it with the Developer ID
+Application certificate, notarizes and staples it, and attaches it to a GitHub release.
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+To build the same dmg locally, see [`docs/release.md`](docs/release.md).
+
+### Rotating the notary password
+
+The app-specific password lives in two places: your keychain (the `xctx-notary` profile, used by `mise run dmg`) and
+the `NOTARY_PASSWORD` GitHub secret (used by the workflow). To replace it, for example after it leaked:
+
+1. At account.apple.com, under Sign-In and Security, open App-Specific Passwords, revoke the old one, and generate a
+   new one.
+2. Update the local profile:
+
+   ```sh
+   xcrun notarytool store-credentials xctx-notary \
+     --apple-id <apple id> --team-id Y84ZTKZF4B --password <new app-specific password>
+   ```
+
+3. Update the GitHub secret (the command prompts for the value, so it stays out of your shell history):
+
+   ```sh
+   gh secret set NOTARY_PASSWORD -R trailer-park-oss/xctx
+   ```
+
+4. Check that both work:
+
+   ```sh
+   xcrun notarytool history --keychain-profile xctx-notary
+   gh workflow run release.yml -R trailer-park-oss/xctx
+   ```
 
 ## Driving xctx with `xctx-ctl`
 
