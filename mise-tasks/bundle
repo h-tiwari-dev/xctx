@@ -32,5 +32,16 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </plist>
 EOF
 
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# XCTX_SIGN_IDENTITY names the signing identity (a "Developer ID Application: ..." name or SHA-1 from
+# `security find-identity -v -p codesigning`). Unset, the app is signed ad hoc, which only runs on this Mac.
+IDENTITY="${XCTX_SIGN_IDENTITY:--}"
+if [ "$IDENTITY" = "-" ]; then
+    codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+else
+    # Hardened runtime and a secure timestamp are what notarization requires. Sign the helper first, then the
+    # bundle, so the bundle's seal covers an already-signed binary.
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP/Contents/MacOS/xctx-ctl"
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+    codesign --verify --strict --verbose=2 "$APP"
+fi
 echo "built $(pwd)/$APP"

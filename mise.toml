@@ -39,8 +39,8 @@ description = "Run formatting check, linter, and workspace tests"
 depends = ["fmt:check", "lint", "test"]
 
 [tasks.clean]
-description = "Remove build artifacts and the bundled xctx.app"
+description = "Remove build artifacts, the bundled xctx.app and xctx.dmg"
 run = """
 cargo clean
-rm -rf xctx.app
+rm -rf xctx.app xctx.dmg
 """
