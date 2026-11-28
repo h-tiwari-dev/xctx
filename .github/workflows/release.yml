@@ -58,10 +58,6 @@ jobs:
             -T /usr/bin/codesign -T /usr/bin/security
           rm -f "$RUNNER_TEMP/devid.p12"
 
-          # The p12 holds the leaf only; the identity is valid once Apple's Developer ID intermediate is present.
-          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/devid-g2.cer"
-          security import "$RUNNER_TEMP/devid-g2.cer" -k "$keychain"
-
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" login.keychain-db
           security default-keychain -d user -s "$keychain"
