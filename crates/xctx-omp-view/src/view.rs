@@ -5,14 +5,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    App, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
-    Hsla, SharedString, Window, div, prelude::*, px, relative,
+    AnyElement, App, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, Hsla, SharedString, Window, div, prelude::*, px, relative,
 };
 use xctx_omp::{Phase, SessionModel};
 use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, IconSize, Pill, Spinner, Theme, Tone};
 
 use crate::banner::{self, Banner, Exit, banners_for};
 use crate::composer::{Composer, ComposerOutput, FileCompleter, PaneEscape, mode_border};
+use crate::draft::WhileRunning;
 use crate::gate::GateState;
 use crate::hud::{
     ModelChoice, TurnMeter, WorkingClock, compact_tokens, context_is_high, cost_label, rate_label,
@@ -99,6 +100,9 @@ impl OmpView {
                 cx,
             )
         });
+        // The footer's Send depends on the draft text, which the composer's input holds.
+        let input = composer.read(cx).input().clone();
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
         let mut this = OmpView {
             session: Arc::new(SessionModel::new()),
             gate: None,
@@ -139,6 +143,12 @@ impl OmpView {
         };
         self.session = session;
         cx.notify();
+    }
+
+    /// Send the draft from the footer's Send button, as the composer's own submit would.
+    fn submit_draft(&mut self, queue: WhileRunning, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.submit(queue, cx));
     }
 
     /// Show where the pane runs: the folder (its last component is shown) and the git branch checked out there.
@@ -337,6 +347,59 @@ impl OmpView {
         )
     }
 
+    /// The Send buttons: Steer and Follow up while the agent runs, Send when it is idle.
+    fn render_send(&self, cx: &mut Context<Self>) -> AnyElement {
+        let sendable = self.composer.read(cx).can_send(cx);
+        if self.session.is_running() {
+            div()
+                .flex()
+                .flex_none()
+                .gap(Theme::SPACE_1)
+                .child(
+                    Button::new("omp-send-follow-up", "Follow up")
+                        .size(ButtonSize::Compact)
+                        .tooltip("Queue for when the turn ends (Alt+Enter)")
+                        .disabled(!sendable)
+                        .selector("omp-send-follow-up")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.submit_draft(WhileRunning::FollowUp, cx)
+                        })),
+                )
+                .child(
+                    Button::new("omp-send-steer", "Steer")
+                        .variant(ButtonVariant::Primary)
+                        .size(ButtonSize::Compact)
+                        .tooltip("Interrupt at the next step (Enter)")
+                        .disabled(!sendable)
+                        .selector("omp-send-steer")
+                        .on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.submit_draft(WhileRunning::Steer, cx)
+                            }),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_none()
+                .child(
+                    Button::new("omp-send", "Send")
+                        .variant(ButtonVariant::Primary)
+                        .size(ButtonSize::Compact)
+                        .tooltip("Send (Enter)")
+                        .disabled(!sendable)
+                        .selector("omp-send")
+                        .on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.submit_draft(WhileRunning::Steer, cx)
+                            }),
+                        ),
+                )
+                .into_any_element()
+        }
+    }
+
     /// The dock's footer: the model and thinking level to change, the folder and branch the pane runs in, and the
     /// turn's cost and speed.
     fn render_footer(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -396,6 +459,7 @@ impl OmpView {
             )
             .child(div().flex_1().min_w_0().children(location))
             .child(readout("omp-hud-cost", cost_label(session), theme.meta))
+            .child(self.render_send(cx))
             .children(
                 self.meter
                     .rate()

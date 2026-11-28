@@ -358,7 +358,21 @@ impl Composer {
         self.menu_index = 0;
     }
 
-    fn submit(&mut self, queue: WhileRunning, cx: &mut Context<Self>) {
+    /// The draft's input, for observers that redraw when the text changes.
+    pub(crate) fn input(&self) -> &Entity<PromptInput> {
+        &self.input
+    }
+
+    /// Whether Send would send the draft: it is not blank (text or images), and omp takes its mode here.
+    pub(crate) fn can_send(&self, cx: &App) -> bool {
+        let text = self.text(cx);
+        let blank = text.trim().is_empty() && self.images.is_empty();
+        let python = matches!(DraftMode::of(text), DraftMode::Python { .. });
+        !(blank || python)
+    }
+
+    /// Send the draft as `queue` says while the agent runs (Steer or Follow up), or as a new prompt when idle.
+    pub(crate) fn submit(&mut self, queue: WhileRunning, cx: &mut Context<Self>) {
         if self.current_menu(cx).is_some() {
             self.accept(self.menu_index, cx);
             return;
@@ -626,9 +640,7 @@ impl Render for Composer {
         let theme = Theme::of(cx);
         let text = self.text(cx);
         let mode = DraftMode::of(text);
-        let blank = text.trim().is_empty() && self.images.is_empty();
         let python = matches!(mode, DraftMode::Python { .. });
-        let running = self.session.is_running();
         let menu = self.current_menu(cx);
 
         let attachments = (!self.previews.is_empty()).then(|| {
@@ -659,42 +671,6 @@ impl Render for Composer {
                         )
                 }))
         });
-
-        let unsendable = blank || python;
-        let buttons = if running {
-            div()
-                .flex()
-                .gap(Theme::SPACE_1)
-                .child(
-                    Button::new("omp-send-follow-up", "Follow up")
-                        .size(ButtonSize::Regular)
-                        .tooltip("Queue for when the turn ends (Alt+Enter)")
-                        .disabled(unsendable)
-                        .selector("omp-send-follow-up")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.submit(WhileRunning::FollowUp, cx)),
-                        ),
-                )
-                .child(
-                    Button::new("omp-send-steer", "Steer")
-                        .variant(ButtonVariant::Primary)
-                        .tooltip("Interrupt at the next step (Enter)")
-                        .disabled(unsendable)
-                        .selector("omp-send-steer")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.submit(WhileRunning::Steer, cx)),
-                        ),
-                )
-        } else {
-            div().flex().child(
-                Button::new("omp-send", "Send")
-                    .variant(ButtonVariant::Primary)
-                    .tooltip("Send (Enter)")
-                    .disabled(unsendable)
-                    .selector("omp-send")
-                    .on_click(cx.listener(|this, _, _, cx| this.submit(WhileRunning::Steer, cx))),
-            )
-        };
 
         let note = self.note.clone().or_else(|| {
             python
@@ -731,16 +707,7 @@ impl Render for Composer {
                             .child(Badge::new(label).tone(mode_tone(mode)))
                     }))
                     .child(self.input.clone())
-                    .child(
-                        div()
-                            .flex()
-                            .items_end()
-                            .justify_between()
-                            .gap(Theme::SPACE_2)
-                            .w_full()
-                            .child(div().flex().children(attachments))
-                            .child(buttons),
-                    ),
+                    .children(attachments),
             )
             .children(note.map(|note| {
                 div()
