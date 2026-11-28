@@ -9,7 +9,7 @@
 
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, Entity, FontWeight, Hsla, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, App, Entity, FontWeight, Hsla, SharedString, Window, div, prelude::*, px};
 use serde_json::Value;
 use xctx_omp::{BtwRecord, SessionModel, Subagent, TodoPhase};
 use xctx_ui::{
@@ -20,6 +20,31 @@ use crate::changes::{CopyCallback, VoidCallback};
 use crate::hud::{compact_tokens, cost_label, format_elapsed};
 use crate::intent::OmpIntent;
 use crate::markdown;
+
+/// Callback invoked to refresh the pane's list of persisted sessions from disk.
+pub type SessionsRefresher = Rc<dyn Fn(&mut App)>;
+
+/// Callback invoked when the user asks to open a new independent agent session side-by-side.
+pub type SplitAgentHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// One persisted session available to view or switch to in an [`crate::OmpView`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    /// Session id.
+    pub id: SharedString,
+    /// Full path to the `.jsonl` file passed to [`OmpIntent::SwitchSession`].
+    pub path: SharedString,
+    /// Display title (explicit title, else first prompt snippet, else short id).
+    pub title: SharedString,
+    /// Optional first user prompt preview when distinct from `title`.
+    pub preview: Option<SharedString>,
+    /// Number of user and assistant turns recorded in this session.
+    pub message_count: usize,
+    /// Short human-readable timestamp (e.g. `"2m ago"`, `"Nov 26"`).
+    pub updated_label: SharedString,
+    /// Whether this session is currently active in the pane.
+    pub active: bool,
+}
 
 pub(crate) type SelectSubagent = Rc<dyn Fn(Option<String>, &mut App)>;
 pub(crate) type IntentCallback = Rc<dyn Fn(OmpIntent, &mut App)>;
@@ -914,6 +939,375 @@ pub(crate) fn render_session_info(props: SessionInfoProps<'_>, theme: &Theme) ->
                         .on_click(move |_, _, cx| on_new(OmpIntent::NewSession, cx)),
                 ),
         )
+        .into_any_element()
+}
+
+/// Inputs for rendering the multi-session quick strip and full Sessions switcher drawer.
+pub(crate) struct SessionsDrawerProps<'a> {
+    pub sessions: &'a [SessionEntry],
+    pub filter_input: Entity<PromptInput>,
+    pub filter_text: &'a str,
+    pub on_intent: IntentCallback,
+    pub on_refresh: Option<SessionsRefresher>,
+    pub on_split: Option<SplitAgentHandler>,
+    pub on_close: VoidCallback,
+}
+
+/// Compact horizontal strip shown below the session bar whenever multiple sessions exist,
+/// letting the user see and switch sessions in one click.
+pub(crate) fn render_sessions_strip(
+    sessions: &[SessionEntry],
+    on_intent: IntentCallback,
+    on_split: Option<SplitAgentHandler>,
+    on_open_drawer: VoidCallback,
+    theme: &Theme,
+) -> AnyElement {
+    let hover = theme.hover;
+    let active_bg = theme.selection;
+    let on_new = on_intent.clone();
+    let max_pills = 8usize;
+    let extra = sessions.len().saturating_sub(max_pills);
+
+    let pills = div()
+        .id("omp-sessions-strip-scroll")
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .gap(Theme::SPACE_1)
+        .overflow_x_scroll()
+        .children(sessions.iter().take(max_pills).enumerate().map(|(i, s)| {
+            let active = s.active;
+            let path = s.path.to_string();
+            let on_switch = on_intent.clone();
+            let sel = format!("omp-session-pill-{i}");
+            let count = (s.message_count > 0).then(|| format!("{}", s.message_count));
+            div()
+                .id(SharedString::from(format!("omp-session-pill-{i}")))
+                .debug_selector(move || sel)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(5.0))
+                .max_w(px(180.0))
+                .h(px(22.0))
+                .px(Theme::SPACE_2)
+                .rounded(Theme::RADIUS_SM)
+                .border_1()
+                .border_color(if active {
+                    theme.accent
+                } else {
+                    theme.border_subtle
+                })
+                .bg(if active { active_bg } else { theme.surface })
+                .cursor_pointer()
+                .hover(move |style| style.bg(if active { active_bg } else { hover }))
+                .on_click(move |_, _, cx| {
+                    if !active {
+                        on_switch(OmpIntent::SwitchSession { path: path.clone() }, cx);
+                    }
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(if active { theme.accent } else { theme.border }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(Theme::TEXT_XS)
+                        .font_weight(if active {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if active { theme.text } else { theme.text_muted })
+                        .child(s.title.clone()),
+                )
+                .children(count.map(|c| {
+                    div()
+                        .flex_none()
+                        .font_family("Menlo")
+                        .text_size(px(10.0))
+                        .text_color(theme.text_subtle)
+                        .child(c)
+                }))
+        }))
+        .when(extra > 0, |row| {
+            let on_open = on_open_drawer.clone();
+            row.child(
+                Button::new("omp-sessions-more", format!("+{extra} more"))
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .selector("omp-sessions-more")
+                    .on_click(move |_, _, cx| on_open(cx)),
+            )
+        });
+
+    div()
+        .debug_selector(|| "omp-sessions-strip".to_owned())
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(Theme::SPACE_1)
+        .w_full()
+        .h(px(28.0))
+        .px(Theme::SPACE_3)
+        .border_b_1()
+        .border_color(theme.border_subtle)
+        .bg(theme.surface)
+        .child(pills)
+        .child(
+            Button::new("omp-strip-new", "New")
+                .icon(IconName::Plus)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip("Start a new session in this pane")
+                .selector("omp-strip-new")
+                .on_click(move |_, _, cx| on_new(OmpIntent::NewSession, cx)),
+        )
+        .children(on_split.map(|split| {
+            Button::new("omp-strip-split", "Split")
+                .icon(IconName::SplitH)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip("Open another agent session side-by-side")
+                .selector("omp-strip-split")
+                .on_click(move |_, window, cx| split(window, cx))
+        }))
+        .into_any_element()
+}
+
+/// Full searchable Sessions drawer: list all persisted sessions, switch in one click,
+/// fork, start a new session, or open a second agent session side-by-side.
+pub(crate) fn render_sessions_drawer(props: SessionsDrawerProps<'_>, theme: &Theme) -> AnyElement {
+    let query = props.filter_text.trim().to_lowercase();
+    let filtered: Vec<(usize, &SessionEntry)> = props
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            query.is_empty()
+                || s.title.to_lowercase().contains(&query)
+                || s.id.to_lowercase().contains(&query)
+                || s.preview
+                    .as_deref()
+                    .is_some_and(|p| p.to_lowercase().contains(&query))
+        })
+        .collect();
+
+    let total = props.sessions.len();
+    let hover = theme.hover;
+    let selected_bg = theme.selection;
+    let on_new = props.on_intent.clone();
+    let on_fork = props.on_intent.clone();
+    let on_close = props.on_close.clone();
+
+    let header = div()
+        .flex()
+        .items_center()
+        .gap(Theme::SPACE_1)
+        .w_full()
+        .px(Theme::SPACE_3)
+        .py(px(6.0))
+        .border_b_1()
+        .border_color(theme.border_subtle)
+        .child(
+            div()
+                .text_size(Theme::TEXT_SM)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(format!("Sessions ({total})")),
+        )
+        .child(div().flex_1())
+        .child(
+            Button::new("omp-sessions-new", "New session")
+                .icon(IconName::Plus)
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Compact)
+                .tooltip("Start a fresh session in this pane")
+                .selector("omp-sessions-new")
+                .on_click(move |_, _, cx| on_new(OmpIntent::NewSession, cx)),
+        )
+        .child(
+            Button::new("omp-sessions-fork", "Fork")
+                .icon(IconName::Fork)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip("Fork the active session into a new branch")
+                .selector("omp-sessions-fork")
+                .on_click(move |_, _, cx| on_fork(OmpIntent::Fork, cx)),
+        )
+        .children(props.on_split.map(|split| {
+            Button::new("omp-sessions-split", "Split pane")
+                .icon(IconName::SplitH)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip("Open a second independent agent session side-by-side")
+                .selector("omp-sessions-split")
+                .on_click(move |_, window, cx| split(window, cx))
+        }))
+        .children(props.on_refresh.map(|refresh| {
+            Button::new("omp-sessions-refresh", "")
+                .icon(IconName::Refresh)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip("Refresh sessions list")
+                .selector("omp-sessions-refresh")
+                .on_click(move |_, _, cx| refresh(cx))
+        }))
+        .child(
+            Button::new("omp-sessions-close", "")
+                .icon(IconName::Close)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Compact)
+                .tooltip("Close sessions drawer")
+                .selector("omp-sessions-close")
+                .on_click(move |_, _, cx| on_close(cx)),
+        );
+
+    let filter_bar = (total > 4).then(|| {
+        div()
+            .px(Theme::SPACE_3)
+            .py(Theme::SPACE_1)
+            .border_b_1()
+            .border_color(theme.border_subtle)
+            .child(props.filter_input)
+    });
+
+    let rows: AnyElement = if filtered.is_empty() {
+        div()
+            .px(Theme::SPACE_3)
+            .py(Theme::SPACE_3)
+            .text_size(Theme::TEXT_XS)
+            .text_color(theme.text_muted)
+            .child(if total == 0 {
+                "No saved sessions yet — send a message to persist this session."
+            } else {
+                "No sessions match your filter."
+            })
+            .into_any_element()
+    } else {
+        div()
+            .id("omp-sessions-list")
+            .flex()
+            .flex_col()
+            .w_full()
+            .max_h(px(240.0))
+            .overflow_y_scroll()
+            .py(Theme::SPACE_1)
+            .children(filtered.into_iter().map(|(i, s)| {
+                let active = s.active;
+                let path = s.path.to_string();
+                let on_switch = props.on_intent.clone();
+                let sel = format!("omp-session-row-{i}");
+                let msgs = if s.message_count == 1 {
+                    "1 msg".to_owned()
+                } else {
+                    format!("{} msgs", s.message_count)
+                };
+                div()
+                    .id(SharedString::from(format!("omp-session-row-{i}")))
+                    .debug_selector(move || sel)
+                    .flex()
+                    .items_center()
+                    .gap(Theme::SPACE_2)
+                    .mx(Theme::SPACE_2)
+                    .px(Theme::SPACE_2)
+                    .py(px(5.0))
+                    .rounded(Theme::RADIUS_SM)
+                    .when(active, |row| row.bg(selected_bg))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(if active { selected_bg } else { hover }))
+                    .on_click(move |_, _, cx| {
+                        if !active {
+                            on_switch(OmpIntent::SwitchSession { path: path.clone() }, cx);
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(7.0))
+                            .rounded_full()
+                            .bg(if active { theme.accent } else { theme.border }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(Theme::TEXT_SM)
+                                            .font_weight(if active {
+                                                FontWeight::SEMIBOLD
+                                            } else {
+                                                FontWeight::MEDIUM
+                                            })
+                                            .text_color(theme.text)
+                                            .child(s.title.clone()),
+                                    )
+                                    .when(active, |row| {
+                                        row.child(Badge::new("active").tone(Tone::Accent))
+                                    }),
+                            )
+                            .children(s.preview.as_ref().map(|p| {
+                                div()
+                                    .truncate()
+                                    .text_size(Theme::TEXT_XS)
+                                    .text_color(theme.text_muted)
+                                    .child(p.clone())
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .items_end()
+                            .child(
+                                div()
+                                    .font_family("Menlo")
+                                    .text_size(Theme::TEXT_XS)
+                                    .text_color(theme.text_subtle)
+                                    .child(msgs),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_subtle)
+                                    .child(s.updated_label.clone()),
+                            ),
+                    )
+            }))
+            .into_any_element()
+    };
+
+    div()
+        .debug_selector(|| "omp-sessions-drawer".to_owned())
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .border_b_1()
+        .border_color(theme.border_subtle)
+        .bg(theme.raised)
+        .child(header)
+        .children(filter_bar)
+        .child(rows)
         .into_any_element()
 }
 

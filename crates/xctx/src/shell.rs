@@ -548,6 +548,12 @@ impl Workspace {
                     Some("⌘⇧D"),
                     &["shell", "terminal"],
                 ),
+                action(
+                    "split-agent",
+                    "New agent session side-by-side",
+                    None,
+                    &["agent", "session", "split", "omp"],
+                ),
                 action("close-pane", "Close pane", Some("⌘W"), &[]),
                 action("zoom", "Zoom pane", Some("⌘⇧Z"), &["maximize", "focus"]),
                 action("focus-next", "Focus next pane", Some("⌘]"), &[]),
@@ -701,6 +707,21 @@ impl Workspace {
             "rescan" => self.rescan(cx),
             "split-right" => self.split(SplitAxis::Horizontal, window, cx),
             "split-down" => self.split(SplitAxis::Vertical, window, cx),
+            "split-agent" => {
+                if let Some(id) = self.active_space_id()
+                    && let Err(e) = self.split_in(
+                        &id,
+                        None,
+                        SplitAxis::Horizontal,
+                        xctx_layout::PaneKind::Agent,
+                        None,
+                        window,
+                        cx,
+                    )
+                {
+                    self.show_op_error(e, cx);
+                }
+            }
             "close-pane" => self.close_focused_pane(window, cx),
             "zoom" => self.toggle_zoom(window, cx),
             "focus-next" => self.cycle_focus(true, window, cx),

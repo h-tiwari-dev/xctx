@@ -18,10 +18,12 @@ use gpui::{
 };
 use xctx_core::{Redactor, SpaceId};
 use xctx_graph::AgentNodeId;
-use xctx_layout::{PaneId, PaneKind, RolePane};
-use xctx_omp::{Frame, Incoming};
+use xctx_layout::{PaneId, PaneKind, RolePane, SplitAxis};
+use xctx_omp::{Frame, Incoming, list_sessions_in_dir};
 use xctx_omp_view::changes::diff_counts;
-use xctx_omp_view::{ChangeKind, ChangedFile, ModelChoice, OmpIntent, OmpView, SessionChanges};
+use xctx_omp_view::{
+    ChangeKind, ChangedFile, ModelChoice, OmpIntent, OmpView, SessionChanges, SessionEntry,
+};
 use xctx_plugin::RunnerManifest;
 use xctx_term_view::TerminalView;
 use xctx_ui::Theme;
@@ -136,6 +138,61 @@ fn worktree_changes(root: &Path, branch: Option<String>, redactor: &Redactor) ->
     }
 }
 
+/// Format an epoch millisecond timestamp into a compact relative label (`just now`, `5m ago`, `2h ago`, `3d ago`).
+fn format_updated_label(updated_ms: u64, now_ms: u64) -> String {
+    if updated_ms == 0 || updated_ms >= now_ms {
+        return "just now".to_owned();
+    }
+    let secs = (now_ms - updated_ms) / 1000;
+    if secs < 60 {
+        "just now".to_owned()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Scan `session_dir` for persisted sessions and map them into redacted [`SessionEntry`] rows.
+/// Blocks: runs on the background executor.
+fn sessions_for_pane(
+    session_dir: &Path,
+    active_id: Option<&str>,
+    active_file: Option<&str>,
+    redactor: &Redactor,
+) -> Vec<SessionEntry> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    list_sessions_in_dir(session_dir)
+        .into_iter()
+        .map(|s| {
+            let path_str = s.path.to_string_lossy().into_owned();
+            let active = active_id.is_some_and(|id| id == s.id)
+                || active_file.is_some_and(|f| f == path_str);
+            let display_title = redactor.redact(&s.display_title()).into_owned();
+            let preview = s
+                .preview
+                .as_deref()
+                .map(|p| redactor.redact(p).into_owned())
+                .filter(|p| !p.is_empty() && *p != display_title)
+                .map(Into::into);
+            SessionEntry {
+                id: s.id.into(),
+                path: path_str.into(),
+                title: display_title.into(),
+                preview,
+                message_count: s.message_count,
+                updated_label: format_updated_label(s.updated_ms, now_ms).into(),
+                active,
+            }
+        })
+        .collect()
+}
+
 /// Numbers each start of an RPC agent's child, so frames of a child that was replaced are dropped.
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -168,6 +225,17 @@ fn opening_for(start: &AgentStart) -> Opening {
 }
 
 impl Workspace {
+    /// Whether agent pane `pane` in `space` runs an RPC runner (`interface = "rpc"`), giving it its own
+    /// isolated session folder under the data directory.
+    pub(crate) fn pane_is_rpc(&mut self, space: &xctx_core::Space, pane: &RolePane) -> bool {
+        pane.role.kind == PaneKind::Agent
+            && self
+                .pane_runner(space, pane)
+                .0
+                .or_else(|| self.runners.default_runner().map(|r| r.manifest.clone()))
+                .is_some_and(|r| r.is_rpc())
+    }
+
     /// Start agent pane `pane` of open space `id` over RPC when its runner speaks RPC; `false` (nothing done)
     /// when it does not, so the pane gets a terminal.
     pub(crate) fn start_rpc_pane(
@@ -196,9 +264,15 @@ impl Workspace {
             return false;
         };
         let agent = self.pane_agent_of(id, pane);
+        // Only a pane actually bound to `node` owns that node's session folder and graph identity; an extra
+        // unbound split agent pane gets its own `pane-<id>` folder so it never collides with the repo's writer.
         let node = agent.as_ref().and_then(|agent| {
             let state = self.graphs.load(&space).ok()?;
-            state.graph().node(&AgentNodeId::new(&agent.id)).cloned()
+            state
+                .graph()
+                .node(&AgentNodeId::new(&agent.id))
+                .filter(|n| n.pane_id == Some(pane.id.0))
+                .cloned()
         });
         let folder = node.as_ref().map_or_else(
             || format!("pane-{}", pane.id.0),
@@ -260,12 +334,40 @@ impl Workspace {
         let (space_id, pane_id) = (id.clone(), pane.id);
         let ws = cx.weak_entity();
         let (refresh_space, refresh_pane) = (id.clone(), pane.id);
+        let ws_sessions = cx.weak_entity();
+        let (sess_space, sess_pane) = (id.clone(), pane.id);
+        let ws_split = cx.weak_entity();
+        let (split_space, split_pane, split_repo) = (id.clone(), pane.id, pane.role.repo.clone());
         view.update(cx, |view, _| {
             view.set_changes_refresher(Rc::new(move |cx| {
                 ws.update(cx, |this, cx| {
                     this.refresh_rpc_changes(&refresh_space, refresh_pane, cx);
                 })
                 .ok();
+            }));
+            view.set_sessions_refresher(Rc::new(move |cx| {
+                ws_sessions
+                    .update(cx, |this, cx| {
+                        this.refresh_rpc_sessions(&sess_space, sess_pane, cx);
+                    })
+                    .ok();
+            }));
+            view.set_split_agent_handler(Rc::new(move |window, cx| {
+                ws_split
+                    .update(cx, |this, cx| {
+                        if let Err(e) = this.split_in(
+                            &split_space,
+                            Some(split_pane),
+                            SplitAxis::Horizontal,
+                            PaneKind::Agent,
+                            Some(split_repo.clone()),
+                            window,
+                            cx,
+                        ) {
+                            this.show_op_error(e, cx);
+                        }
+                    })
+                    .ok();
             }));
         });
         let intents = cx.subscribe(&view, move |this, _, intent: &OmpIntent, cx| {
@@ -287,8 +389,51 @@ impl Workspace {
         }
         self.index_rpc_files(id, pane.id, &space, &pane.role, window, cx);
         self.refresh_rpc_changes(id, pane.id, cx);
+        self.refresh_rpc_sessions(id, pane.id, cx);
         self.boot_rpc_agent(id, pane.id, opening_for(start), window, cx);
         true
+    }
+
+    /// Scan persisted `.jsonl` sessions in RPC pane `pane`'s session directory off the UI thread and update its
+    /// session strip and switcher drawer.
+    fn refresh_rpc_sessions(&mut self, id: &SpaceId, pane: PaneId, cx: &mut Context<Self>) {
+        let Some((session_dir, active_id, active_file)) = self.rpc_pane_mut(id, pane).map(|omp| {
+            (
+                omp.agent.launch().session_dir.clone(),
+                omp.agent
+                    .model()
+                    .session
+                    .id
+                    .clone()
+                    .or_else(|| omp.agent.session_id().map(str::to_owned)),
+                omp.agent.model().session.file.clone(),
+            )
+        }) else {
+            return;
+        };
+        let redactor = self.redactor.clone();
+        let executor = cx.background_executor().clone();
+        let space_id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let entries = executor
+                .spawn(async move {
+                    sessions_for_pane(
+                        &session_dir,
+                        active_id.as_deref(),
+                        active_file.as_deref(),
+                        &redactor,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(omp) = this.rpc_pane_mut(&space_id, pane) else {
+                    return;
+                };
+                let view = omp.view.clone();
+                view.update(cx, |view, cx| view.set_sessions(entries, cx));
+            });
+        })
+        .detach();
     }
 
     /// Scan git status and diffs for RPC pane `pane`'s worktree off the UI thread and update its Changes panel.
@@ -447,6 +592,7 @@ impl Workspace {
         let view = omp.view.clone();
         let mut exit = None;
         let mut refresh_changes = false;
+        let mut refresh_sessions = false;
         match &incoming {
             Incoming::Malformed(detail) => {
                 view.update(cx, |view, cx| view.malformed_frame(detail, cx));
@@ -455,10 +601,22 @@ impl Workspace {
                 let choices = ModelChoice::from_picker(&r.data);
                 view.update(cx, |view, cx| view.set_model_choices(choices, cx));
             }
+            Incoming::Frame(Frame::Response(r))
+                if r.success
+                    && matches!(
+                        r.command.as_str(),
+                        "get_state" | "open_session" | "switch_session" | "new_session" | "fork"
+                    ) =>
+            {
+                refresh_sessions = true;
+            }
             Incoming::Frame(Frame::Event { kind, .. })
                 if matches!(kind.as_str(), "agent_end" | "tool_execution_end") =>
             {
                 refresh_changes = true;
+                if kind == "agent_end" {
+                    refresh_sessions = true;
+                }
             }
             Incoming::Exited { code, stderr } => exit = Some((*code, stderr.clone())),
             Incoming::Frame(_) => {}
@@ -467,6 +625,9 @@ impl Workspace {
         self.rpc_updates(id, pane, &updates, cx);
         if refresh_changes {
             self.refresh_rpc_changes(id, pane, cx);
+        }
+        if refresh_sessions {
+            self.refresh_rpc_sessions(id, pane, cx);
         }
         let Some(unexpected) = updates.iter().find_map(|update| match update {
             AgentUpdate::Exited { unexpected, .. } => Some(*unexpected),

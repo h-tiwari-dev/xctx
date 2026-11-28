@@ -26,6 +26,7 @@ mod error;
 pub mod form;
 pub mod frame;
 pub mod model;
+pub mod sessions;
 
 pub use client::{Incoming, LaunchSpec, OmpClient, Started};
 pub use command::{Command, Image, Queue, Streaming, SubagentLevel};
@@ -38,3 +39,4 @@ pub use model::{
     AssistantEntry, Block, BtwRecord, Effect, Entry, Gate, GateKind, Level, Phase, SessionInfo,
     SessionModel, Subagent, Todo, TodoPhase, ToolRun, ToolState,
 };
+pub use sessions::{SessionSummary, list_sessions_in_dir};

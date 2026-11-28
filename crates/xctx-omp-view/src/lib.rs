@@ -40,4 +40,5 @@ pub use composer::{Composer, FileCompleter, PaneEscape};
 pub use draft::DraftMode;
 pub use hud::ModelChoice;
 pub use intent::{GateAnswer, OmpIntent};
+pub use panels::{SessionEntry, SessionsRefresher, SplitAgentHandler};
 pub use view::OmpView;

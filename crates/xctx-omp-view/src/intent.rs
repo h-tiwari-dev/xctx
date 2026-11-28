@@ -112,6 +112,11 @@ pub enum OmpIntent {
     Fork,
     /// Start a fresh session in this pane.
     NewSession,
+    /// Switch this pane to an existing persisted session file.
+    SwitchSession {
+        /// Full path to the `.jsonl` session file on disk.
+        path: String,
+    },
     /// Cancel a running subagent by id.
     CancelSubagent {
         /// The subagent's id.
@@ -171,6 +176,7 @@ impl OmpIntent {
             OmpIntent::Compact { instructions } => Command::compact(instructions.as_deref()),
             OmpIntent::Fork => Command::fork(None),
             OmpIntent::NewSession => Command::new_session(),
+            OmpIntent::SwitchSession { path } => Command::switch_session(path),
             OmpIntent::CancelSubagent { id } => Command::cancel_subagent(id),
             OmpIntent::SteerSubagent { id, message } => Command::steer_subagent(id, message),
         }
@@ -314,6 +320,12 @@ mod tests {
         );
         assert_eq!(wire(OmpIntent::Fork), json!({"type": "fork"}));
         assert_eq!(wire(OmpIntent::NewSession), json!({"type": "new_session"}));
+        assert_eq!(
+            wire(OmpIntent::SwitchSession {
+                path: "/tmp/s1.jsonl".into()
+            }),
+            json!({"type": "switch_session", "sessionPath": "/tmp/s1.jsonl"})
+        );
         assert_eq!(
             wire(OmpIntent::CancelSubagent { id: "Sub1".into() }),
             json!({"type": "cancel_subagent", "subagentId": "Sub1"})

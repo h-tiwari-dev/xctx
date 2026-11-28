@@ -26,7 +26,10 @@ use crate::hud::{
     todo_progress,
 };
 use crate::intent::OmpIntent;
-use crate::panels::{self, IntentCallback, SessionInfoProps, SubagentTrayProps};
+use crate::panels::{
+    self, IntentCallback, SessionEntry, SessionInfoProps, SessionsDrawerProps, SessionsRefresher,
+    SplitAgentHandler, SubagentTrayProps,
+};
 use crate::transcript::Transcript;
 
 /// How long a Copy button shows its "Copied" confirmation before returning to "Copy".
@@ -68,6 +71,12 @@ pub struct OmpView {
     changes_refresher: Option<ChangesRefresher>,
     changes_open: bool,
     selected_change: usize,
+    /// Persisted sessions available to view or switch to in this pane.
+    sessions: Vec<SessionEntry>,
+    sessions_refresher: Option<SessionsRefresher>,
+    split_agent: Option<SplitAgentHandler>,
+    sessions_open: bool,
+    session_filter: Entity<PromptInput>,
     /// Collapsible drawers inspired by Tern's native omp UI.
     info_open: bool,
     tray_open: bool,
@@ -145,6 +154,13 @@ impl OmpView {
         });
         cx.observe(&steer_input, |_, _, cx| cx.notify()).detach();
 
+        let session_filter = cx.new(|cx| {
+            PromptInput::new(cx)
+                .placeholder("Filter sessions…")
+                .borderless(true)
+        });
+        cx.observe(&session_filter, |_, _, cx| cx.notify()).detach();
+
         let mut this = OmpView {
             session: Arc::new(SessionModel::new()),
             gate: None,
@@ -164,6 +180,11 @@ impl OmpView {
             changes_refresher: None,
             changes_open: false,
             selected_change: 0,
+            sessions: Vec::new(),
+            sessions_refresher: None,
+            split_agent: None,
+            sessions_open: false,
+            session_filter,
             info_open: false,
             tray_open: false,
             selected_subagent: None,
@@ -254,6 +275,31 @@ impl OmpView {
         &self.changes
     }
 
+    /// Update the list of persisted sessions shown by the session strip and switcher drawer.
+    pub fn set_sessions(&mut self, sessions: Vec<SessionEntry>, cx: &mut Context<Self>) {
+        self.sessions = sessions;
+        cx.notify();
+    }
+
+    /// Register the host callback used to re-scan persisted sessions on disk.
+    pub fn set_sessions_refresher(&mut self, refresher: SessionsRefresher) {
+        self.sessions_refresher = Some(refresher);
+    }
+
+    /// Register the host callback used to open another independent agent session side-by-side.
+    pub fn set_split_agent_handler(&mut self, handler: SplitAgentHandler) {
+        self.split_agent = Some(handler);
+    }
+
+    /// Open or close the Sessions switcher drawer.
+    pub fn set_sessions_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.sessions_open = open;
+        if open && let Some(refresher) = &self.sessions_refresher {
+            refresher(cx);
+        }
+        cx.notify();
+    }
+
     /// Write `text` to the system clipboard and flash "Copied" on the control identified by `key`.
     fn copy_text(&mut self, key: String, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -287,7 +333,17 @@ impl OmpView {
     fn intent_callback(&self, cx: &Context<Self>) -> IntentCallback {
         let view = cx.weak_entity();
         Rc::new(move |intent, cx| {
-            view.update(cx, |_, cx| cx.emit(intent)).ok();
+            let closes_sessions = matches!(
+                intent,
+                OmpIntent::SwitchSession { .. } | OmpIntent::NewSession | OmpIntent::Fork
+            );
+            view.update(cx, |this, cx| {
+                if closes_sessions {
+                    this.sessions_open = false;
+                }
+                cx.emit(intent);
+            })
+            .ok();
         })
     }
 
@@ -401,6 +457,12 @@ impl OmpView {
 
         let last_reply = self.transcript.last_reply();
         let copied_last = self.copied.as_deref() == Some("last-reply");
+        let session_count = self.sessions.len();
+        let switcher_label: SharedString = if session_count > 1 {
+            format!("{title} ({session_count})").into()
+        } else {
+            title
+        };
 
         div()
             .debug_selector(|| "omp-session-bar".to_owned())
@@ -422,14 +484,21 @@ impl OmpView {
                     .items_center()
                     .gap(Theme::SPACE_2)
                     .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(180.0))
-                            .truncate()
-                            .text_size(Theme::TEXT_XS)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(title),
+                        Button::new("omp-sessions-toggle", switcher_label)
+                            .icon(if self.sessions_open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Compact)
+                            .selected(self.sessions_open)
+                            .tooltip("Switch, fork, start, or split agent sessions")
+                            .selector("omp-sessions-toggle")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let next = !this.sessions_open;
+                                this.set_sessions_open(next, cx);
+                            })),
                     )
                     .children(goal.map(|g| {
                         div()
@@ -448,6 +517,15 @@ impl OmpView {
                             .map(|seg| Badge::new(seg.clone()).tone(Tone::Neutral)),
                     ),
             )
+            .children(self.split_agent.clone().map(|split| {
+                Button::new("omp-split-agent", "")
+                    .icon(IconName::SplitH)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .tooltip("Open another agent session side-by-side")
+                    .selector("omp-split-agent")
+                    .on_click(move |_, window, cx| split(window, cx))
+            }))
             .child(
                 Button::new("omp-changes-toggle", changes_label)
                     .icon(IconName::Git)
@@ -1065,6 +1143,45 @@ impl Render for OmpView {
             )
         });
 
+        let sessions_strip = (!self.sessions_open && self.sessions.len() > 1).then(|| {
+            let view_open = cx.weak_entity();
+            panels::render_sessions_strip(
+                &self.sessions,
+                on_intent.clone(),
+                self.split_agent.clone(),
+                Rc::new(move |cx| {
+                    view_open
+                        .update(cx, |this, cx| this.set_sessions_open(true, cx))
+                        .ok();
+                }),
+                &theme,
+            )
+        });
+
+        let sessions_drawer = self.sessions_open.then(|| {
+            let view_close = cx.weak_entity();
+            let filter_text = self.session_filter.read(cx).value().to_owned();
+            panels::render_sessions_drawer(
+                SessionsDrawerProps {
+                    sessions: &self.sessions,
+                    filter_input: self.session_filter.clone(),
+                    filter_text: &filter_text,
+                    on_intent: on_intent.clone(),
+                    on_refresh: self.sessions_refresher.clone(),
+                    on_split: self.split_agent.clone(),
+                    on_close: Rc::new(move |cx| {
+                        view_close
+                            .update(cx, |this, cx| {
+                                this.sessions_open = false;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+                },
+                &theme,
+            )
+        });
+
         let info_panel = self.info_open.then(|| {
             let view_close = cx.weak_entity();
             panels::render_session_info(
@@ -1209,6 +1326,8 @@ impl Render for OmpView {
                     .update(cx, |composer, cx| composer.attach_paths(paths.paths(), cx));
             }))
             .child(self.render_session_bar(&theme, cx))
+            .children(sessions_strip)
+            .children(sessions_drawer)
             .children(info_panel)
             .children(changes_panel)
             .child(

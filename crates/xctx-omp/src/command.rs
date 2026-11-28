@@ -249,6 +249,11 @@ impl Command {
         Command::raw("open_session", json!({"sessionDir": session_dir}))
     }
 
+    /// Switch the current process to a specific persisted session file (`sessionPath`).
+    pub fn switch_session(session_path: &str) -> Command {
+        Command::raw("switch_session", json!({"sessionPath": session_path}))
+    }
+
     /// Fork the session (at `entry_id`, or whole when `None`).
     pub fn fork(entry_id: Option<&str>) -> Command {
         match entry_id {
@@ -268,6 +273,11 @@ impl Command {
     /// Ask a side question that is not added to the conversation.
     pub fn btw(question: &str) -> Command {
         Command::raw("btw", json!({"question": question}))
+    }
+
+    /// The session's side-question (`btw`) history.
+    pub fn get_btw_history() -> Command {
+        Command::raw("get_btw_history", json!({}))
     }
 
     /// Run a shell command the way omp's `!` prefix does; `exclude_from_context` is omp's `!!`.

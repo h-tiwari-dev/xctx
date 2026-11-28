@@ -6,4 +6,8 @@
 > {"id":"o1","type":"open_session","sessionDir":"{sessionDir}"}
 < {"id":"o1","type":"response","command":"open_session","success":true,"data":{"resumed":true,"cancelled":false,"sessionId":"sess-1","sessionFile":"{sessionDir}/sess-1.jsonl"}}
 > {"id":"st2","type":"get_state"}
-< {"id":"st2","type":"response","command":"get_state","success":true,"data":{"sessionId":"sess-1","sessionFile":"{sessionDir}/sess-1.jsonl","isStreaming":false,"isSettled":true}}
+< {"id":"st2","type":"response","command":"get_state","success":true,"data":{"sessionId":"sess-1","sessionFile":"{sessionDir}/sess-1.jsonl","isStreaming":false,"isSettled":true,"messageCount":3}}
+> {"id":"stats2","type":"get_session_stats"}
+< {"id":"stats2","type":"response","command":"get_session_stats","success":true,"data":{"tokens":{"total":4200},"cost":0.04,"toolCalls":1}}
+> {"id":"pg1","type":"get_messages_page","limit":100}
+< {"id":"pg1","type":"response","command":"get_messages_page","success":true,"data":{"totalMessages":3,"messages":[{"role":"user","content":[{"type":"text","text":"make checkout retries safe"}],"attribution":"user"},{"role":"assistant","model":"claude-sonnet","stopReason":"toolUse","content":[{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"src/checkout.rs"}}]},{"role":"toolResult","toolCallId":"call-1","toolName":"read","isError":false,"content":[{"type":"text","text":"fn charge() {}"}]},{"role":"assistant","model":"claude-sonnet","stopReason":"stop","content":[{"type":"text","text":"Retries now reuse one idempotency key."}]}]}}

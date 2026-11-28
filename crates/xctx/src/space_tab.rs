@@ -276,7 +276,14 @@ impl Workspace {
             .unwrap_or_default();
         let starts = restore_agent_starts(&space, &panes, &preferred);
         for (pane, start) in panes.iter().zip(&starts) {
-            self.spawn_pane(id, pane, start, window, cx);
+            // Each RPC agent pane has its own isolated `--session-dir`, so every restored RPC agent
+            // resumes its own session rather than falling back to Fresh on shared worktrees.
+            let start = if self.pane_is_rpc(&space, pane) {
+                AgentStart::Continue
+            } else {
+                start.clone()
+            };
+            self.spawn_pane(id, pane, &start, window, cx);
         }
         self.start_live_attempts(id, window, cx);
         if let Some(reason) = restored.fallback {
@@ -784,7 +791,15 @@ impl Workspace {
                 .ok()
                 .and_then(|state| state.graph().node(agent).cloned())
         {
-            start = AgentStart::Task(crate::agent_brief::lane_brief(&space, &node));
+            let has_saved_session = node.session.is_some()
+                || self.data_dir.as_deref().is_some_and(|data| {
+                    crate::omp_agent::agent_session_dir_has_session(data, id, node.id.as_str())
+                });
+            start = if has_saved_session {
+                AgentStart::Continue
+            } else {
+                AgentStart::Task(crate::agent_brief::lane_brief(&space, &node))
+            };
         }
         if let Some(agent) = &agent
             && let Err(e) = self.bind_agent_pane(id, agent, pane.id)

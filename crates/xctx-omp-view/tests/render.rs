@@ -768,3 +768,78 @@ fn btw_panel_and_todo_drawer_render_and_copy(cx: &mut TestAppContext) {
     assert!(md.contains("- [x] Add copy"));
     assert!(md.contains("- [-] Run ci"));
 }
+
+#[gpui::test]
+fn multiple_sessions_show_quick_strip_switcher_drawer_and_split_action(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use xctx_omp_view::SessionEntry;
+
+    let (host, cx) = host(cx, SessionModel::new());
+    let view = view(&host, cx);
+    let splits = Rc::new(Cell::new(0usize));
+    let splits_cb = splits.clone();
+
+    view.update(cx, |v, cx| {
+        v.set_split_agent_handler(Rc::new(move |_, _| {
+            splits_cb.set(splits_cb.get() + 1);
+        }));
+        v.set_sessions(
+            vec![
+                SessionEntry {
+                    id: "sess-2".into(),
+                    path: "/tmp/sess-2.jsonl".into(),
+                    title: "Fix retry bug".into(),
+                    preview: Some("Make checkout retries idempotent".into()),
+                    message_count: 14,
+                    updated_label: "2m ago".into(),
+                    active: true,
+                },
+                SessionEntry {
+                    id: "sess-1".into(),
+                    path: "/tmp/sess-1.jsonl".into(),
+                    title: "Initial design".into(),
+                    preview: Some("Explore payment architecture".into()),
+                    message_count: 8,
+                    updated_label: "2h ago".into(),
+                    active: false,
+                },
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // Multiple sessions immediately show the quick session strip with clickable pills.
+    assert!(shown(cx, "omp-sessions-strip"));
+    assert!(shown(cx, "omp-session-pill-0"));
+    assert!(shown(cx, "omp-session-pill-1"));
+
+    // Clicking an inactive session pill switches directly to that session file.
+    click(cx, "omp-session-pill-1");
+    assert_eq!(
+        intents(&host, cx),
+        [OmpIntent::SwitchSession {
+            path: "/tmp/sess-1.jsonl".into()
+        }]
+    );
+
+    // Clicking the Sessions toggle opens the full drawer with rows, New, Fork, and Split pane.
+    click(cx, "omp-sessions-toggle");
+    assert!(shown(cx, "omp-sessions-drawer"));
+    assert!(!shown(cx, "omp-sessions-strip"));
+    assert!(shown(cx, "omp-session-row-0"));
+    assert!(shown(cx, "omp-session-row-1"));
+
+    click(cx, "omp-sessions-split");
+    assert_eq!(splits.get(), 1);
+
+    click(cx, "omp-session-row-1");
+    assert!(!shown(cx, "omp-sessions-drawer"));
+    assert_eq!(
+        intents(&host, cx),
+        [OmpIntent::SwitchSession {
+            path: "/tmp/sess-1.jsonl".into()
+        }]
+    );
+}

@@ -68,6 +68,17 @@ pub fn agent_session_dir(data_dir: &Path, space: &SpaceId, agent: &str) -> PathB
         .join(folder)
 }
 
+/// Whether `agent` of `space` already has a persisted `.jsonl` session file in its session folder.
+pub fn agent_session_dir_has_session(data_dir: &Path, space: &SpaceId, agent: &str) -> bool {
+    let dir = agent_session_dir(data_dir, space, agent);
+    std::fs::read_dir(dir).ok().is_some_and(|entries| {
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        })
+    })
+}
+
 /// The client spec that starts `launch` with `args`.
 pub fn launch_spec(launch: &RpcLaunch, args: Vec<String>) -> LaunchSpec {
     let mut spec = LaunchSpec::new(&launch.program, &launch.cwd);

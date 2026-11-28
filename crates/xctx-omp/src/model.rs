@@ -297,6 +297,12 @@ pub struct Subagent {
     pub recent_output: Vec<String>,
 }
 
+/// Messages requested per `get_messages_page` call when hydrating a resumed session.
+const HISTORY_PAGE_LIMIT: u32 = 100;
+
+/// Safety cap on pages fetched while hydrating one session's transcript.
+const MAX_HISTORY_PAGES: u32 = 200;
+
 /// The state of one omp session as a pane shows it.
 #[derive(Debug, Clone, Default)]
 pub struct SessionModel {
@@ -344,6 +350,11 @@ pub struct SessionModel {
     pub banner: Option<String>,
     running: bool,
     message_index: HashMap<String, usize>,
+    history_gen: u64,
+    history_page: u32,
+    history_insert_at: usize,
+    history_loading: bool,
+    history_last_cursor: Option<String>,
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -565,17 +576,190 @@ impl SessionModel {
                     }
                 }
             }
-            "new_session" | "open_session" | "fork" | "switch_session"
+            "new_session" if data.get("cancelled").and_then(Value::as_bool) != Some(true) => {
+                self.reset_session_view();
+                self.history_gen = self.history_gen.wrapping_add(1);
+                self.history_loading = false;
+                self.history_last_cursor = None;
+                effects.push(Effect::Send(Command::get_state().with_id("session-state")));
+                effects.push(Effect::Send(
+                    Command::get_session_stats().with_id("session-stats"),
+                ));
+            }
+            "open_session" | "fork" | "switch_session"
                 if data.get("cancelled").and_then(Value::as_bool) != Some(true) =>
             {
-                self.entries.clear();
-                self.tools.clear();
-                self.message_index.clear();
-                self.queue = QueueState::default();
-                self.pending_ui.clear();
+                self.reset_session_view();
                 effects.push(Effect::Send(Command::get_state().with_id("session-state")));
+                self.start_history_load(effects);
             }
+            "get_messages_page" => self.apply_messages_page(response.id.as_deref(), data, effects),
             _ => {}
+        }
+    }
+
+    fn reset_session_view(&mut self) {
+        self.entries.clear();
+        self.tools.clear();
+        self.message_index.clear();
+        self.queue = QueueState::default();
+        self.pending_ui.clear();
+        self.btw.clear();
+        self.subagents.clear();
+        self.todos.clear();
+        self.goal = None;
+        self.context = None;
+        self.stats = Stats::default();
+        self.banner = None;
+        self.history_insert_at = 0;
+    }
+
+    fn history_page_id(&self) -> String {
+        format!(
+            "session-messages-{}-{}",
+            self.history_gen, self.history_page
+        )
+    }
+
+    fn start_history_load(&mut self, effects: &mut Vec<Effect>) {
+        self.history_gen = self.history_gen.wrapping_add(1);
+        self.history_page = 1;
+        self.history_insert_at = 0;
+        self.history_loading = true;
+        self.history_last_cursor = None;
+        effects.push(Effect::Send(
+            Command::get_session_stats().with_id("session-stats"),
+        ));
+        effects.push(Effect::Send(
+            Command::get_messages_page(None, HISTORY_PAGE_LIMIT).with_id(self.history_page_id()),
+        ));
+        effects.push(Effect::Send(
+            Command::get_btw_history().with_id("session-btw"),
+        ));
+        effects.push(Effect::Send(
+            Command::get_subagents().with_id("session-subagents"),
+        ));
+    }
+
+    fn insert_history_entry(&mut self, entry: Entry) {
+        let at = self.history_insert_at.min(self.entries.len());
+        self.entries.insert(at, entry);
+        for idx in self.message_index.values_mut() {
+            if *idx >= at {
+                *idx += 1;
+            }
+        }
+        self.history_insert_at = at + 1;
+    }
+
+    fn apply_messages_page(&mut self, id: Option<&str>, data: &Value, effects: &mut Vec<Effect>) {
+        if let Some(id) = id
+            && id.starts_with("session-messages-")
+        {
+            let expected_prefix = format!("session-messages-{}-", self.history_gen);
+            if !id.starts_with(&expected_prefix) {
+                return;
+            }
+        }
+        let messages = data
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for msg in messages {
+            self.apply_history_message(msg);
+        }
+        let next = s(data, "nextCursor").filter(|c| !c.is_empty());
+        if let Some(cursor) = next
+            && !messages.is_empty()
+            && self.history_page < MAX_HISTORY_PAGES
+            && self.history_last_cursor.as_deref() != Some(cursor)
+        {
+            self.history_last_cursor = Some(cursor.to_owned());
+            self.history_page += 1;
+            effects.push(Effect::Send(
+                Command::get_messages_page(Some(cursor), HISTORY_PAGE_LIMIT)
+                    .with_id(self.history_page_id()),
+            ));
+        } else {
+            self.history_loading = false;
+            self.history_last_cursor = None;
+        }
+    }
+
+    fn apply_history_message(&mut self, message: &Value) {
+        match s(message, "role") {
+            Some("user") => {
+                let content = &message["content"];
+                self.insert_history_entry(Entry::User {
+                    text: content_text(content),
+                    images: image_count(content),
+                    from_agent: s(message, "attribution") == Some("agent"),
+                });
+            }
+            Some("assistant") => {
+                let blocks = self.blocks_from(&message["content"]);
+                self.insert_history_entry(Entry::Assistant(AssistantEntry {
+                    message_id: s(message, "id").unwrap_or_default().to_owned(),
+                    blocks,
+                    streaming: false,
+                    stop_reason: s(message, "stopReason").map(str::to_owned),
+                    error: s(message, "errorMessage").map(str::to_owned),
+                    model: s(message, "model").map(str::to_owned),
+                }));
+            }
+            Some("toolResult") => {
+                let id = s(message, "toolCallId").unwrap_or_default().to_owned();
+                if id.is_empty() {
+                    return;
+                }
+                self.ensure_tool(&id, s(message, "toolName"), None);
+                let failed = message
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if let Some(run) = self.tools.get_mut(&id) {
+                    run.state = if failed {
+                        ToolState::Failed
+                    } else {
+                        ToolState::Done
+                    };
+                    run.output = content_text(&message["content"]);
+                    run.details = message.get("details").cloned().unwrap_or(Value::Null);
+                }
+            }
+            Some("bashExecution") => {
+                let cmd = s(message, "command").unwrap_or_default();
+                let out = s(message, "output").unwrap_or_default();
+                let text = match (cmd.is_empty(), out.is_empty()) {
+                    (false, false) => format!("$ {cmd}\n{out}"),
+                    (false, true) => format!("$ {cmd}"),
+                    (true, false) => out.to_owned(),
+                    (true, true) => return,
+                };
+                self.insert_history_entry(Entry::Notice {
+                    level: Level::Info,
+                    text: strip_ansi(&text),
+                });
+            }
+            Some("compactionSummary" | "branchSummary") => {
+                if let Some(summary) = s(message, "summary").filter(|t| !t.trim().is_empty()) {
+                    self.insert_history_entry(Entry::Notice {
+                        level: Level::Info,
+                        text: strip_ansi(summary),
+                    });
+                }
+            }
+            Some(_) if message.get("display").and_then(Value::as_bool) != Some(false) => {
+                let text = content_text(&message["content"]);
+                if !text.is_empty() {
+                    self.insert_history_entry(Entry::Notice {
+                        level: Level::Info,
+                        text: strip_ansi(&text),
+                    });
+                }
+            }
+            Some(_) | None => {}
         }
     }
 
@@ -630,6 +814,19 @@ impl SessionModel {
         if session != self.session {
             self.session = session.clone();
             effects.push(Effect::SessionBound(session));
+        }
+        // If omp started directly on a resumed session (e.g. via CLI flags rather than `open_session`)
+        // and reports prior messages we have not hydrated yet, fetch its transcript now.
+        if data
+            .get("messageCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+            && self.entries.is_empty()
+            && !self.history_loading
+            && !self.running
+        {
+            self.start_history_load(effects);
         }
     }
 
@@ -1154,7 +1351,9 @@ pub fn strip_ansi(text: &str) -> String {
 
 #[cfg(test)]
 mod ansi_tests {
-    use super::strip_ansi;
+    use serde_json::json;
+
+    use super::{Block, Effect, Entry, Frame, SessionModel, ToolState, strip_ansi};
 
     #[test]
     fn colour_and_link_codes_go_and_text_stays() {
@@ -1167,5 +1366,197 @@ mod ansi_tests {
             "link"
         );
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn open_session_hydrates_paginated_history_and_cross_page_tool_results() {
+        let mut model = SessionModel::new();
+        let effects = model.apply(Frame::parse(json!({
+            "id": "o1",
+            "type": "response",
+            "command": "open_session",
+            "success": true,
+            "data": {"cancelled": false, "resumed": true, "sessionId": "s1"}
+        })));
+        let cmds: Vec<&str> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send(c) => Some(c.kind()),
+                _ => None,
+            })
+            .collect();
+        assert!(cmds.contains(&"get_state"), "{cmds:?}");
+        assert!(cmds.contains(&"get_session_stats"), "{cmds:?}");
+        assert!(cmds.contains(&"get_messages_page"), "{cmds:?}");
+        assert!(cmds.contains(&"get_btw_history"), "{cmds:?}");
+        assert!(cmds.contains(&"get_subagents"), "{cmds:?}");
+
+        let page1_id = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send(c) if c.kind() == "get_messages_page" => c.id().map(str::to_owned),
+                _ => None,
+            })
+            .expect("page 1 command");
+
+        // Page 1 has a user prompt and an assistant message calling tool `t1` (whose result is on page 2).
+        let next_effects = model.apply(Frame::parse(json!({
+            "id": page1_id,
+            "type": "response",
+            "command": "get_messages_page",
+            "success": true,
+            "data": {
+                "totalMessages": 4,
+                "nextCursor": "cur-2",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Fix checkout retries"}],
+                        "attribution": "user"
+                    },
+                    {
+                        "role": "assistant",
+                        "model": "claude-sonnet",
+                        "stopReason": "toolUse",
+                        "content": [
+                            {"type": "thinking", "thinking": "Checking files"},
+                            {"type": "toolCall", "id": "t1", "name": "read", "arguments": {"path": "src/pay.rs"}}
+                        ]
+                    }
+                ]
+            }
+        })));
+        let page2_cmd = next_effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send(c) if c.kind() == "get_messages_page" => Some(c),
+                _ => None,
+            })
+            .expect("requests page 2 with cursor");
+        assert_eq!(page2_cmd.as_value()["cursor"], "cur-2");
+        assert_eq!(model.tools["t1"].state, ToolState::Pending);
+
+        // Page 2 completes the tool result and adds the final assistant reply.
+        let done_effects = model.apply(Frame::parse(json!({
+            "id": page2_cmd.id().unwrap(),
+            "type": "response",
+            "command": "get_messages_page",
+            "success": true,
+            "data": {
+                "totalMessages": 4,
+                "messages": [
+                    {
+                        "role": "toolResult",
+                        "toolCallId": "t1",
+                        "toolName": "read",
+                        "isError": false,
+                        "content": [{"type": "text", "text": "fn retry() {}"}]
+                    },
+                    {
+                        "role": "assistant",
+                        "model": "claude-sonnet",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": "Retries now reuse one idempotency key."}]
+                    }
+                ]
+            }
+        })));
+        assert!(
+            !done_effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send(c) if c.kind() == "get_messages_page")),
+            "pagination stops when nextCursor is absent"
+        );
+        assert_eq!(model.entries.len(), 3);
+        assert!(matches!(
+            &model.entries[0],
+            Entry::User { text, from_agent: false, .. } if text == "Fix checkout retries"
+        ));
+        assert_eq!(model.tools["t1"].state, ToolState::Done);
+        assert_eq!(model.tools["t1"].output, "fn retry() {}");
+        assert!(matches!(
+            &model.entries[2],
+            Entry::Assistant(a) if !a.streaming && a.blocks == vec![Block::Text("Retries now reuse one idempotency key.".into())]
+        ));
+    }
+
+    #[test]
+    fn stale_history_pages_are_ignored_and_live_messages_stay_after_history() {
+        let mut model = SessionModel::new();
+        let effects = model.apply(Frame::parse(json!({
+            "id": "o1",
+            "type": "response",
+            "command": "open_session",
+            "success": true,
+            "data": {"cancelled": false, "resumed": true}
+        })));
+        let page1_id = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send(c) if c.kind() == "get_messages_page" => c.id().map(str::to_owned),
+                _ => None,
+            })
+            .unwrap();
+
+        // A live user prompt arrives before page 1 returns.
+        model.apply(Frame::parse(json!({
+            "type": "message_start",
+            "message": {"role": "user", "content": "live follow-up"}
+        })));
+        // Page 1 from the current generation inserts before the live message.
+        model.apply(Frame::parse(json!({
+            "id": page1_id,
+            "type": "response",
+            "command": "get_messages_page",
+            "success": true,
+            "data": {
+                "totalMessages": 1,
+                "messages": [{"role": "user", "content": "earlier prompt"}]
+            }
+        })));
+        assert_eq!(model.entries.len(), 2);
+        assert!(matches!(&model.entries[0], Entry::User { text, .. } if text == "earlier prompt"));
+        assert!(matches!(&model.entries[1], Entry::User { text, .. } if text == "live follow-up"));
+
+        // A stale page from an older generation is ignored after new_session.
+        model.apply(Frame::parse(json!({
+            "id": "n1",
+            "type": "response",
+            "command": "new_session",
+            "success": true,
+            "data": {"cancelled": false}
+        })));
+        model.apply(Frame::parse(json!({
+            "id": page1_id,
+            "type": "response",
+            "command": "get_messages_page",
+            "success": true,
+            "data": {
+                "totalMessages": 1,
+                "messages": [{"role": "user", "content": "stale"}]
+            }
+        })));
+        assert!(model.entries.is_empty());
+    }
+
+    #[test]
+    fn get_state_with_unloaded_messages_triggers_history_load() {
+        let mut model = SessionModel::new();
+        let effects = model.apply(Frame::parse(json!({
+            "id": "startup-state",
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "sessionId": "s1",
+                "isStreaming": false,
+                "messageCount": 6
+            }
+        })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send(c) if c.kind() == "get_messages_page"))
+        );
     }
 }

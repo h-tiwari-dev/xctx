@@ -219,9 +219,10 @@ fn an_rpc_agent_records_its_session_once_persisted_and_resumes_it_after_a_reopen
     let session = node(&graph)?.session;
     let (mut omp, log) = agent(&fixture, &space, &ours("resume"), session)?;
     let mut updates = omp.start_blocking(Opening::Resume);
-    updates.extend(pump(&mut omp, |_, all| {
+    updates.extend(pump(&mut omp, |a, all| {
         all.iter()
             .any(|u| matches!(u, AgentUpdate::SessionRecorded { id, .. } if id == "sess-1"))
+            && !a.model().entries.is_empty()
     })?);
     omp.apply_updates(&updates, Some(&mut graph), None, &none);
     let dir_text = dir.to_string_lossy().into_owned();
@@ -234,6 +235,14 @@ fn an_rpc_agent_records_its_session_once_persisted_and_resumes_it_after_a_reopen
     assert_eq!(omp.session_id(), Some("sess-1"));
     assert_eq!(omp.status(), &AgentStatus::Idle);
     assert_eq!(node(&graph)?.session.as_deref(), Some("sess-1"));
+    let resumed_text = omp.transcript_tail(20);
+    assert!(
+        resumed_text.contains("make checkout retries safe")
+            && resumed_text.contains("Retries now reuse one idempotency key."),
+        "resumed session hydrates prior conversation: {resumed_text}"
+    );
+    assert_eq!(omp.model().stats.tokens, 4200);
+    assert_eq!(omp.model().stats.tool_calls, 1);
     Ok(())
 }
 
