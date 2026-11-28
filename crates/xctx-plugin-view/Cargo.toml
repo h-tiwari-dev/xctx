@@ -5,9 +5,9 @@ edition.workspace = true
 description = "GPUI panes for xctx's first-party plugins: the API client, logs, read-only database and browser"
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3" }
+gpui = { package = "gpui-pre", version = "=0.3.14" }
 pulldown-cmark = { version = "0.13", default-features = false }
 xctx-ui = { path = "../xctx-ui" }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.14", features = ["test-support"] }

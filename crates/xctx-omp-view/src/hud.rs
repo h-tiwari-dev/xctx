@@ -78,7 +78,9 @@ impl TurnMeter {
             && model.stats.tokens > before
             && !took.is_zero()
         {
-            self.rate = Some((model.stats.tokens - before) as f64 / took.as_secs_f64());
+            if !(before == 0 && took < Duration::from_millis(250)) {
+                self.rate = Some((model.stats.tokens - before) as f64 / took.as_secs_f64());
+            }
             self.pending = None;
         }
     }

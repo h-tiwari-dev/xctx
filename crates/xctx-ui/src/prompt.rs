@@ -396,6 +396,8 @@ pub struct PromptInput {
     submit_blank: bool,
     /// Whether the input draws no outline, fill or side padding, for an input inside its own frame.
     borderless: bool,
+    /// Whether the input uses body-sized text and compact vertical padding.
+    compact: bool,
 }
 
 impl EventEmitter<PromptEvent> for PromptInput {}
@@ -416,6 +418,7 @@ impl PromptInput {
             selecting: false,
             submit_blank: false,
             borderless: false,
+            compact: false,
         }
     }
 
@@ -442,6 +445,12 @@ impl PromptInput {
     /// palette's query row.
     pub fn borderless(mut self, borderless: bool) -> Self {
         self.borderless = borderless;
+        self
+    }
+
+    /// Use body-sized text (`TEXT_MD`) and tighter vertical padding for inline toolbars and composers.
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
         self
     }
 
@@ -481,7 +490,9 @@ impl PromptInput {
         let Some(command) = command_for(&event.keystroke, self.buffer.is_multiline()) else {
             return;
         };
-        cx.stop_propagation();
+        if !matches!(command, PromptCommand::Copy) {
+            cx.stop_propagation();
+        }
         match command {
             PromptCommand::Submit => {
                 if self.submit_blank || !self.buffer.text().trim().is_empty() {
@@ -495,6 +506,7 @@ impl PromptInput {
             }
             PromptCommand::Copy => {
                 if let Some(text) = self.buffer.selected_text() {
+                    cx.stop_propagation();
                     cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
                 }
                 return;
@@ -645,7 +657,7 @@ impl Render for PromptInput {
             .flex()
             .items_start()
             .w_full()
-            .min_h(px(40.0))
+            .min_h(if self.compact { px(30.0) } else { px(40.0) })
             .when(!self.borderless, |input| {
                 input
                     .px(Theme::SPACE_3)
@@ -654,8 +666,16 @@ impl Render for PromptInput {
                     .border_color(theme.outline(focused))
                     .bg(theme.raised)
             })
-            .py(Theme::SPACE_2 + px(2.0))
-            .text_size(Theme::TEXT_LG)
+            .py(if self.compact {
+                px(5.0)
+            } else {
+                Theme::SPACE_2 + px(2.0)
+            })
+            .text_size(if self.compact {
+                Theme::TEXT_MD
+            } else {
+                Theme::TEXT_LG
+            })
             .cursor_text()
             .child(body)
     }

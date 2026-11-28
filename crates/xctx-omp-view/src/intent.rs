@@ -117,6 +117,23 @@ pub enum OmpIntent {
         /// Full path to the `.jsonl` session file on disk.
         path: String,
     },
+    /// Rename the active session.
+    RenameSession {
+        /// New display name for the session.
+        name: String,
+    },
+    /// Enable or disable fast mode for the session.
+    SetFastMode {
+        /// Whether fast mode should be enabled.
+        enabled: bool,
+    },
+    /// Enable or disable slow mode for the session.
+    SetSlowMode {
+        /// Whether slow mode should be enabled.
+        enabled: bool,
+    },
+    /// Export the current session to an HTML transcript file.
+    ExportHtml,
     /// Cancel a running subagent by id.
     CancelSubagent {
         /// The subagent's id.
@@ -177,6 +194,10 @@ impl OmpIntent {
             OmpIntent::Fork => Command::fork(None),
             OmpIntent::NewSession => Command::new_session(),
             OmpIntent::SwitchSession { path } => Command::switch_session(path),
+            OmpIntent::RenameSession { name } => Command::set_session_name(name),
+            OmpIntent::SetFastMode { enabled } => Command::set_fast_mode(*enabled),
+            OmpIntent::SetSlowMode { enabled } => Command::set_slow_mode(*enabled),
+            OmpIntent::ExportHtml => Command::export_html(),
             OmpIntent::CancelSubagent { id } => Command::cancel_subagent(id),
             OmpIntent::SteerSubagent { id, message } => Command::steer_subagent(id, message),
         }
@@ -326,6 +347,21 @@ mod tests {
             }),
             json!({"type": "switch_session", "sessionPath": "/tmp/s1.jsonl"})
         );
+        assert_eq!(
+            wire(OmpIntent::RenameSession {
+                name: "Ship fix".into()
+            }),
+            json!({"type": "set_session_name", "name": "Ship fix"})
+        );
+        assert_eq!(
+            wire(OmpIntent::SetFastMode { enabled: true }),
+            json!({"type": "set_fast_mode", "enabled": true})
+        );
+        assert_eq!(
+            wire(OmpIntent::SetSlowMode { enabled: false }),
+            json!({"type": "set_slow_mode", "enabled": false})
+        );
+        assert_eq!(wire(OmpIntent::ExportHtml), json!({"type": "export_html"}));
         assert_eq!(
             wire(OmpIntent::CancelSubagent { id: "Sub1".into() }),
             json!({"type": "cancel_subagent", "subagentId": "Sub1"})

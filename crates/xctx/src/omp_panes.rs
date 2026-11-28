@@ -138,6 +138,24 @@ fn worktree_changes(root: &Path, branch: Option<String>, redactor: &Redactor) ->
     }
 }
 
+/// Split an optional trailing `:line` (or `:line:col`) suffix from a path reference.
+fn split_path_line(raw: &str) -> (&str, Option<usize>) {
+    let trimmed = raw.trim();
+    if let Some((head, tail)) = trimmed.rsplit_once(':')
+        && let Ok(n) = tail.parse::<usize>()
+        && !head.is_empty()
+    {
+        if let Some((path, line_s)) = head.rsplit_once(':')
+            && let Ok(line) = line_s.parse::<usize>()
+            && !path.is_empty()
+        {
+            return (path, Some(line));
+        }
+        return (head, Some(n));
+    }
+    (trimmed, None)
+}
+
 /// Format an epoch millisecond timestamp into a compact relative label (`just now`, `5m ago`, `2h ago`, `3d ago`).
 fn format_updated_label(updated_ms: u64, now_ms: u64) -> String {
     if updated_ms == 0 || updated_ms >= now_ms {
@@ -338,6 +356,10 @@ impl Workspace {
         let (sess_space, sess_pane) = (id.clone(), pane.id);
         let ws_split = cx.weak_entity();
         let (split_space, split_pane, split_repo) = (id.clone(), pane.id, pane.role.repo.clone());
+        let ws_open = cx.weak_entity();
+        let (open_space, open_repo) = (id.clone(), pane.role.repo.clone());
+        let ws_link = cx.weak_entity();
+        let (link_space, link_repo) = (id.clone(), pane.role.repo.clone());
         view.update(cx, |view, _| {
             view.set_changes_refresher(Rc::new(move |cx| {
                 ws.update(cx, |this, cx| {
@@ -368,6 +390,30 @@ impl Workspace {
                         }
                     })
                     .ok();
+            }));
+            view.set_open_file_handler(Rc::new(move |path, window, cx| {
+                let (file, line) = split_path_line(path);
+                ws_open
+                    .update(cx, |this, cx| {
+                        this.open_file_pane(&open_space, &open_repo, file, line, window, cx);
+                    })
+                    .ok();
+            }));
+            view.set_link_handler(Rc::new(move |url, window, cx| {
+                if url.starts_with("http://")
+                    || url.starts_with("https://")
+                    || url.starts_with("mailto:")
+                {
+                    cx.open_url(url);
+                } else {
+                    let raw = url.strip_prefix("file://").unwrap_or(url);
+                    let (file, line) = split_path_line(raw);
+                    ws_link
+                        .update(cx, |this, cx| {
+                            this.open_file_pane(&link_space, &link_repo, file, line, window, cx);
+                        })
+                        .ok();
+                }
             }));
         });
         let intents = cx.subscribe(&view, move |this, _, intent: &OmpIntent, cx| {
@@ -605,7 +651,12 @@ impl Workspace {
                 if r.success
                     && matches!(
                         r.command.as_str(),
-                        "get_state" | "open_session" | "switch_session" | "new_session" | "fork"
+                        "get_state"
+                            | "open_session"
+                            | "switch_session"
+                            | "new_session"
+                            | "fork"
+                            | "set_session_name"
                     ) =>
             {
                 refresh_sessions = true;

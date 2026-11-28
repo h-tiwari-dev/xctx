@@ -128,11 +128,7 @@ fn edge_in_focus(edge: &FlowEdge, focus: &FlowFocus) -> bool {
 }
 
 /// A stroked cubic Bézier through `points` (start, first control, second control, end), in window coordinates.
-fn stroke_curve(
-    points: [Point<Pixels>; 4],
-    width: f32,
-    dash: Option<&[Pixels]>,
-) -> Option<Path<Pixels>> {
+fn stroke_curve(points: [Point<Pixels>; 4], width: f32, dash: Option<&[Pixels]>) -> Option<Path> {
     let mut builder = PathBuilder::stroke(px(width));
     if let Some(dash) = dash {
         builder = builder.dash_array(dash);
@@ -253,7 +249,7 @@ struct CanvasPrepaint {
     /// Under everything: a click on it (and on nothing above it) clears the selection.
     background: Hitbox,
     /// The edges' strokes, in graph order.
-    edges: Vec<(Path<Pixels>, Hsla)>,
+    edges: Vec<(Path, Hsla)>,
     /// The `contract` labels on contract edges.
     labels: Vec<AnyElement>,
     /// The agents' cards.

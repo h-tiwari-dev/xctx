@@ -22,6 +22,7 @@ pub mod home_hero;
 pub mod icon;
 pub mod inbox;
 pub mod inspector;
+pub mod kit;
 pub mod motion;
 pub mod overlay;
 pub mod parent_agent;
@@ -34,6 +35,7 @@ pub mod spinner;
 pub mod split_view;
 pub mod stage_track;
 pub mod status_bar;
+pub mod syntax;
 pub mod theme;
 pub mod title_bar;
 pub mod toast;
@@ -66,6 +68,10 @@ pub use frame_overlay::{
 pub use home_hero::{ComposerCard, ComposerChip, HomeBackdrop, HomeHero};
 pub use icon::{Icon, IconName, IconSize, UiAssets};
 pub use inbox::{INBOX_EMPTY, InboxAction, InboxEntry, InboxKind, InboxPanel};
+pub use kit::{
+    KitAssets, ScrollableElement, Scrollbar, ScrollbarAxis, gpui_component, init_kit,
+    is_dark_theme, sync_kit_theme,
+};
 pub use motion::{
     MAX_DURATION, MAX_DURATION_MS, MotionFrame, MotionSettings, OVERLAY_DURATION,
     OVERLAY_DURATION_MS, OVERLAY_OFFSET_PX, SPINNER_PERIOD, SPINNER_PERIOD_MS, clamp_duration,
@@ -96,6 +102,7 @@ pub use status_bar::{
     BannerKind, KeyHint, StatusBanner, StatusBar, default_key_hints, format_key_hints,
     is_production_env, keycap,
 };
+pub use syntax::{highlight_code, highlight_lines, language_for_path};
 pub use theme::{Theme, Tone, ToneColors};
 pub use title_bar::{SHAPES, SpaceHeaderInfo, TitleBar, shape_label};
 pub use toast::{

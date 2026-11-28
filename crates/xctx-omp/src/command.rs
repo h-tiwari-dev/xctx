@@ -254,6 +254,26 @@ impl Command {
         Command::raw("switch_session", json!({"sessionPath": session_path}))
     }
 
+    /// Rename the active session.
+    pub fn set_session_name(name: &str) -> Command {
+        Command::raw("set_session_name", json!({"name": name}))
+    }
+
+    /// Toggle fast mode (when the active provider/model supports it).
+    pub fn set_fast_mode(enabled: bool) -> Command {
+        Command::raw("set_fast_mode", json!({"enabled": enabled}))
+    }
+
+    /// Toggle slow mode (when supported).
+    pub fn set_slow_mode(enabled: bool) -> Command {
+        Command::raw("set_slow_mode", json!({"enabled": enabled}))
+    }
+
+    /// Export the persisted session transcript to an HTML file.
+    pub fn export_html() -> Command {
+        Command::raw("export_html", json!({}))
+    }
+
     /// Fork the session (at `entry_id`, or whole when `None`).
     pub fn fork(entry_id: Option<&str>) -> Command {
         match entry_id {

@@ -344,6 +344,12 @@ pub struct SessionModel {
     pub subagents: BTreeMap<String, Subagent>,
     /// Whether a compaction runs.
     pub compacting: bool,
+    /// Whether fast mode is enabled.
+    pub fast_mode: bool,
+    /// Whether slow mode is supported by the active session.
+    pub slow_mode_supported: bool,
+    /// Whether slow mode is enabled.
+    pub slow_mode: bool,
     /// Whether omp reports the session settled (nothing can wake it).
     pub settled: bool,
     /// The generation of the last failure the host should show above the composer, if any.
@@ -594,6 +600,26 @@ impl SessionModel {
                 self.start_history_load(effects);
             }
             "get_messages_page" => self.apply_messages_page(response.id.as_deref(), data, effects),
+            "set_session_name" => {
+                effects.push(Effect::Send(Command::get_state().with_id("rename-state")));
+            }
+            "set_fast_mode" => {
+                if let Some(enabled) = data.get("enabled").and_then(Value::as_bool) {
+                    self.fast_mode = enabled;
+                }
+            }
+            "set_slow_mode" => {
+                if let Some(enabled) = data.get("enabled").and_then(Value::as_bool) {
+                    self.slow_mode = enabled;
+                }
+            }
+            "export_html" => {
+                if let Some(path) = s(data, "path") {
+                    self.notice(Level::Info, format!("Exported session HTML to {path}"));
+                } else {
+                    self.notice(Level::Info, "Exported session to HTML");
+                }
+            }
             _ => {}
         }
     }
@@ -785,6 +811,19 @@ impl SessionModel {
         }
         if let Some(settled) = data.get("isSettled").and_then(Value::as_bool) {
             self.settled = settled;
+        }
+        if let Some(fast) = data
+            .get("fastModeActive")
+            .or_else(|| data.get("fastModeEnabled"))
+            .and_then(Value::as_bool)
+        {
+            self.fast_mode = fast;
+        }
+        if let Some(supported) = data.get("slowModeSupported").and_then(Value::as_bool) {
+            self.slow_mode_supported = supported;
+        }
+        if let Some(slow) = data.get("slowModeEnabled").and_then(Value::as_bool) {
+            self.slow_mode = slow;
         }
         if let Some(usage) = data.get("contextUsage").filter(|u| u.is_object()) {
             self.context = Some(ContextUsage {

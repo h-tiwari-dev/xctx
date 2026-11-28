@@ -104,6 +104,7 @@ impl Workspace {
     pub(crate) fn apply_theme(&mut self, appearance: WindowAppearance, cx: &mut Context<Self>) {
         let theme = theme_for(appearance, self.prefs.translucent);
         cx.set_global(theme);
+        xctx_ui::sync_kit_theme(theme, appearance, cx);
         self.terminal_theme = terminal_theme(&theme);
         let terminal_theme = self.terminal_theme;
         for tab in self.tabs.values() {

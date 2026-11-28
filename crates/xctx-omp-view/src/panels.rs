@@ -685,6 +685,8 @@ pub(crate) struct SessionInfoProps<'a> {
     pub session: &'a SessionModel,
     pub transcript_text: String,
     pub last_reply: Option<String>,
+    pub rename_input: Entity<PromptInput>,
+    pub rename_value: &'a str,
     pub copied: Option<&'a str>,
     pub on_copy: CopyCallback,
     pub on_intent: IntentCallback,
@@ -775,6 +777,10 @@ pub(crate) fn render_session_info(props: SessionInfoProps<'_>, theme: &Theme) ->
     let on_compact = props.on_intent.clone();
     let on_fork = props.on_intent.clone();
     let on_new = props.on_intent.clone();
+    let on_export = props.on_intent.clone();
+    let on_rename = props.on_intent.clone();
+    let rename_text = props.rename_value.trim().to_owned();
+    let can_rename = !rename_text.is_empty();
 
     div()
         .debug_selector(|| "omp-info-panel".to_owned())
@@ -857,6 +863,49 @@ pub(crate) fn render_session_info(props: SessionInfoProps<'_>, theme: &Theme) ->
         .child(
             div()
                 .flex()
+                .items_center()
+                .gap(Theme::SPACE_2)
+                .w_full()
+                .child(
+                    div()
+                        .w(px(84.0))
+                        .flex_none()
+                        .text_size(Theme::TEXT_XS)
+                        .text_color(theme.text_subtle)
+                        .child("Rename"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(Theme::SPACE_2)
+                        .rounded(Theme::RADIUS_SM)
+                        .bg(theme.surface)
+                        .border_1()
+                        .border_color(theme.border_subtle)
+                        .child(props.rename_input),
+                )
+                .child(
+                    Button::new("omp-action-rename", "Save name")
+                        .variant(ButtonVariant::Secondary)
+                        .size(ButtonSize::Compact)
+                        .disabled(!can_rename)
+                        .selector("omp-action-rename")
+                        .on_click(move |_, _, cx| {
+                            if !rename_text.is_empty() {
+                                on_rename(
+                                    OmpIntent::RenameSession {
+                                        name: rename_text.clone(),
+                                    },
+                                    cx,
+                                );
+                            }
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .flex()
                 .flex_wrap()
                 .items_center()
                 .gap(Theme::SPACE_1)
@@ -928,6 +977,16 @@ pub(crate) fn render_session_info(props: SessionInfoProps<'_>, theme: &Theme) ->
                         .tooltip("Fork this session into a new branch")
                         .selector("omp-action-fork")
                         .on_click(move |_, _, cx| on_fork(OmpIntent::Fork, cx)),
+                )
+                .child(
+                    Button::new("omp-action-export", "Export HTML")
+                        .icon(IconName::ExternalLink)
+                        .variant(ButtonVariant::Secondary)
+                        .size(ButtonSize::Compact)
+                        .disabled(session.session.file.is_none())
+                        .tooltip("Export persisted session to an HTML file")
+                        .selector("omp-action-export")
+                        .on_click(move |_, _, cx| on_export(OmpIntent::ExportHtml, cx)),
                 )
                 .child(
                     Button::new("omp-action-new", "New session")

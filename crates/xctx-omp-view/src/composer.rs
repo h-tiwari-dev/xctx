@@ -43,9 +43,8 @@ pub enum ComposerOutput {
 /// Where a [`Composer`] sends what the user did. The intent is moved, so attached images are never copied.
 pub type ComposerSink = Rc<dyn Fn(ComposerOutput, &mut App)>;
 
-const IDLE_PLACEHOLDER: &str =
-    "Message omp — / commands, @ files, ! bash, $ python, ? side question";
-const RUNNING_PLACEHOLDER: &str = "Steer the agent (Enter) or queue a follow-up (Alt+Enter)";
+const IDLE_PLACEHOLDER: &str = "Ask anything…  (/ commands · @ files · ! bash · ? side question)";
+const RUNNING_PLACEHOLDER: &str = "Steer the agent (↵) or queue a follow-up (⌥↵)";
 
 /// The border colour of the composer in `mode`: success for bash, warning for python, the read-out colour for a
 /// side question, else the focus outline.
@@ -114,6 +113,10 @@ pub struct Composer {
     note: Option<SharedString>,
     seed: Option<String>,
     last_text: String,
+    /// Previously sent prompts (oldest first), plus active recall index and saved draft.
+    history: Vec<String>,
+    history_ix: Option<usize>,
+    history_draft: String,
     _subscriptions: [Subscription; 2],
 }
 
@@ -131,6 +134,7 @@ impl Composer {
                 .placeholder(IDLE_PLACEHOLDER)
                 .multiline(true)
                 .borderless(true)
+                .compact(true)
         });
         let events = cx.subscribe(
             &input,
@@ -154,6 +158,9 @@ impl Composer {
             note: None,
             seed: None,
             last_text: String::new(),
+            history: Vec::new(),
+            history_ix: None,
+            history_draft: String::new(),
             _subscriptions: [events, edits],
         }
     }
@@ -180,6 +187,24 @@ impl Composer {
         if session.is_running() != self.session.is_running() {
             self.input
                 .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+        }
+        // Seed prompt history from hydrated user messages when history is empty.
+        if self.history.is_empty() {
+            for entry in &session.entries {
+                if let xctx_omp::Entry::User {
+                    text,
+                    from_agent: false,
+                    ..
+                } = entry
+                {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty()
+                        && self.history.last().map(String::as_str) != Some(trimmed)
+                    {
+                        self.history.push(trimmed.to_owned());
+                    }
+                }
+            }
         }
         self.session = session;
         cx.notify();
@@ -387,6 +412,12 @@ impl Composer {
             &mut self.images,
         ) {
             Ok(intent) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() && self.history.last().map(String::as_str) != Some(trimmed) {
+                    self.history.push(trimmed.to_owned());
+                }
+                self.history_ix = None;
+                self.history_draft.clear();
                 if self.images.is_empty() {
                     self.previews.clear();
                 }
@@ -407,18 +438,55 @@ impl Composer {
             self.submit(WhileRunning::FollowUp, cx);
             return;
         }
-        let Some(menu) = self.current_menu(cx) else {
+        if let Some(menu) = self.current_menu(cx) {
+            let len = Self::menu_len(&menu, self.file_matches.len());
+            match keystroke.key.as_str() {
+                "down" if len > 0 => self.menu_index = (self.menu_index + 1) % len,
+                "up" if len > 0 => self.menu_index = (self.menu_index + len - 1) % len,
+                "tab" => self.accept(self.menu_index, cx),
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
             return;
-        };
-        let len = Self::menu_len(&menu, self.file_matches.len());
-        match keystroke.key.as_str() {
-            "down" if len > 0 => self.menu_index = (self.menu_index + 1) % len,
-            "up" if len > 0 => self.menu_index = (self.menu_index + len - 1) % len,
-            "tab" => self.accept(self.menu_index, cx),
-            _ => return,
         }
-        cx.stop_propagation();
-        cx.notify();
+        if !m.platform && !m.control && !m.alt && !m.shift && !self.history.is_empty() {
+            let current = self.text(cx);
+            let single_line = !current.contains('\n');
+            match keystroke.key.as_str() {
+                "up" if single_line && (current.is_empty() || self.history_ix.is_some()) => {
+                    let next_ix = match self.history_ix {
+                        None => {
+                            self.history_draft = current.to_owned();
+                            self.history.len() - 1
+                        }
+                        Some(0) => 0,
+                        Some(i) => i - 1,
+                    };
+                    self.history_ix = Some(next_ix);
+                    let recalled = self.history[next_ix].clone();
+                    self.set_text(&recalled, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                "down" if self.history_ix.is_some() => {
+                    if let Some(ix) = self.history_ix {
+                        if ix + 1 < self.history.len() {
+                            self.history_ix = Some(ix + 1);
+                            let recalled = self.history[ix + 1].clone();
+                            self.set_text(&recalled, cx);
+                        } else {
+                            self.history_ix = None;
+                            let draft = std::mem::take(&mut self.history_draft);
+                            self.set_text(&draft, cx);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn capture_paste(
@@ -486,11 +554,12 @@ impl Composer {
             .flex()
             .flex_col()
             .w_full()
-            .py(Theme::SPACE_1)
-            .rounded(Theme::RADIUS_MD)
+            .py(px(4.0))
+            .rounded(px(8.0))
             .border_1()
             .border_color(theme.border_strong)
             .bg(theme.overlay)
+            .shadow_md()
             .children(rows.into_iter().enumerate().map(|(i, (label, detail))| {
                 let selected = i == self.menu_index;
                 let hover = theme.hover;
@@ -500,8 +569,8 @@ impl Composer {
                     .flex()
                     .items_center()
                     .gap(Theme::SPACE_2)
-                    .px(Theme::SPACE_2)
-                    .h(px(24.0))
+                    .px(Theme::SPACE_3)
+                    .h(px(28.0))
                     .cursor_pointer()
                     .when(selected, |row| row.bg(theme.selection))
                     .hover(move |s| s.bg(hover))

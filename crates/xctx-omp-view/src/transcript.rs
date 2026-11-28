@@ -11,11 +11,33 @@ use gpui::{
     prelude::*, px,
 };
 use xctx_omp::{AssistantEntry, Block, Entry, Level, SessionModel};
-use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Theme, Tone};
+use xctx_ui::{
+    Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, ScrollableElement as _,
+    Theme, Tone,
+};
 
 use crate::changes::CopyCallback;
 use crate::markdown::{self, MdBlock};
-use crate::tool_card;
+use crate::selectable::{SegmentId, SelectContext, find_matches, selectable_plain};
+use crate::tool_card::{self, OpenFileHandler};
+
+/// Callback invoked when the user clicks Edit on a previous user message to load it into the composer.
+pub type EditPromptCallback = Rc<dyn Fn(String, &mut App)>;
+
+/// Optional interactive callbacks and selection state for [`Transcript::render_interactive`].
+#[derive(Clone, Default)]
+pub struct TranscriptOptions {
+    /// Active "Copied" feedback key.
+    pub copied: Option<String>,
+    /// One-click Copy button callback.
+    pub on_copy: Option<CopyCallback>,
+    /// Mouse-drag selection & search highlight context.
+    pub select: Option<SelectContext>,
+    /// Open-file button callback on Read/Edit/Write tool cards.
+    pub on_open_file: Option<OpenFileHandler>,
+    /// Edit-prompt callback on user messages.
+    pub on_edit_prompt: Option<EditPromptCallback>,
+}
 
 /// One row of the transcript, addressed by where its content sits in the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,6 +233,26 @@ impl Transcript {
         self.state.set_follow_mode(FollowMode::Tail);
     }
 
+    /// Scroll to reveal transcript row `ix` (for in-session search).
+    pub fn scroll_to_row(&self, ix: usize) {
+        self.state.scroll_to_reveal_item(ix);
+    }
+
+    /// Indices of rows whose visible text matches `query` (case-insensitive).
+    pub fn search_rows(&self, query: &str) -> Vec<usize> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, key)| {
+                let text = row_search_text(&self.model, *key);
+                (!find_matches(&text, query).is_empty()).then_some(ix)
+            })
+            .collect()
+    }
+
     /// Format the full session transcript as Markdown (messages, tool summaries/diffs, and notices).
     pub fn format_markdown(&self) -> String {
         format_transcript_markdown(&self.model)
@@ -223,7 +265,7 @@ impl Transcript {
 
     /// The list element; `view` is notified when a card is opened or closed.
     pub fn render(&self, view: EntityId) -> AnyElement {
-        self.render_with_copy(view, None, None)
+        self.render_interactive(view, TranscriptOptions::default())
     }
 
     /// The list element with one-click Copy buttons wired to `on_copy` and active `copied` feedback key.
@@ -233,6 +275,18 @@ impl Transcript {
         copied: Option<String>,
         on_copy: Option<CopyCallback>,
     ) -> AnyElement {
+        self.render_interactive(
+            view,
+            TranscriptOptions {
+                copied,
+                on_copy,
+                ..TranscriptOptions::default()
+            },
+        )
+    }
+
+    /// The list element with full selection, search highlighting, copy, open-file, and edit-prompt callbacks.
+    pub fn render_interactive(&self, view: EntityId, opts: TranscriptOptions) -> AnyElement {
         let ctx = RowContext {
             model: self.model.clone(),
             rows: self.rows.clone(),
@@ -241,12 +295,52 @@ impl Transcript {
             open_thinking: self.open_thinking.clone(),
             state: self.state.clone(),
             view,
-            copied,
-            on_copy,
+            copied: opts.copied,
+            on_copy: opts.on_copy,
+            select: opts.select,
+            on_open_file: opts.on_open_file,
+            on_edit_prompt: opts.on_edit_prompt,
         };
-        gpui::list(self.state.clone(), move |ix, _window, cx| ctx.row(ix, cx))
+        div()
+            .relative()
             .size_full()
+            .child(
+                gpui::list(self.state.clone(), move |ix, _window, cx| ctx.row(ix, cx)).size_full(),
+            )
+            .vertical_scrollbar(&self.state)
             .into_any_element()
+    }
+}
+
+fn row_search_text(model: &SessionModel, key: RowKey) -> String {
+    match key {
+        RowKey::User(i) => match model.entries.get(i) {
+            Some(Entry::User { text, .. }) => text.clone(),
+            _ => String::new(),
+        },
+        RowKey::Notice(i) => match model.entries.get(i) {
+            Some(Entry::Notice { text, .. }) => text.clone(),
+            _ => String::new(),
+        },
+        RowKey::Stop(i) => assistant(model, i)
+            .and_then(|a| a.error.clone())
+            .unwrap_or_default(),
+        RowKey::Block { entry, block: b } => match block(model, entry, b) {
+            Some(Block::Text(t) | Block::Thinking(t)) => t.clone(),
+            Some(Block::ToolCall(id)) => model
+                .tools
+                .get(id)
+                .map(|run| {
+                    let mut s = format!("{} {}", tool_card::title(run), tool_card::summary(run));
+                    if !run.output.is_empty() {
+                        s.push('\n');
+                        s.push_str(&run.output);
+                    }
+                    s
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
+        },
     }
 }
 
@@ -362,6 +456,9 @@ struct RowContext {
     view: EntityId,
     copied: Option<String>,
     on_copy: Option<CopyCallback>,
+    select: Option<SelectContext>,
+    on_open_file: Option<OpenFileHandler>,
+    on_edit_prompt: Option<EditPromptCallback>,
 }
 
 impl RowContext {
@@ -402,6 +499,7 @@ impl RowContext {
         let Some(&key) = self.rows.get(ix) else {
             return div().into_any_element();
         };
+        let mut seg_ix = 0usize;
         let content = match key {
             RowKey::User(i) => match self.model.entries.get(i) {
                 Some(Entry::User {
@@ -409,10 +507,12 @@ impl RowContext {
                     images,
                     from_agent,
                 }) => {
+                    let copy_key = format!("user-{ix}");
+                    let is_copied = self.copied.as_deref() == Some(copy_key.as_str());
                     let copy_btn = (!text.trim().is_empty())
                         .then(|| {
                             self.copy_button(
-                                format!("user-{ix}"),
+                                copy_key,
                                 format!("omp-copy-user-{ix}"),
                                 "Copy message",
                                 text.clone(),
@@ -420,16 +520,50 @@ impl RowContext {
                             )
                         })
                         .flatten();
-                    user_row(text, *images, *from_agent, copy_btn, &theme)
+                    let edit_btn = (!from_agent && !text.trim().is_empty())
+                        .then(|| {
+                            let on_edit = self.on_edit_prompt.clone()?;
+                            let draft_text = text.clone();
+                            Some(
+                                Button::new(SharedString::from(format!("omp-edit-user-{ix}")), "")
+                                    .icon(IconName::PenTool)
+                                    .variant(ButtonVariant::Ghost)
+                                    .size(ButtonSize::Compact)
+                                    .tooltip("Edit in composer")
+                                    .selector(format!("omp-edit-user-{ix}"))
+                                    .on_click(move |_, _, cx| on_edit(draft_text.clone(), cx)),
+                            )
+                        })
+                        .flatten();
+                    let body = if let Some(sel) = &self.select {
+                        let seg = SegmentId::new(ix, seg_ix);
+                        seg_ix += 1;
+                        selectable_plain(seg, text.clone(), sel, &theme)
+                    } else {
+                        text.clone().into_any_element()
+                    };
+                    let _ = seg_ix;
+                    user_row(
+                        ix,
+                        body,
+                        *images,
+                        *from_agent,
+                        is_copied,
+                        edit_btn,
+                        copy_btn,
+                        &theme,
+                    )
                 }
                 _ => div().into_any_element(),
             },
             RowKey::Notice(i) => match self.model.entries.get(i) {
                 Some(Entry::Notice { level, text }) => {
+                    let copy_key = format!("notice-{ix}");
+                    let is_copied = self.copied.as_deref() == Some(copy_key.as_str());
                     let copy_btn = (!text.trim().is_empty())
                         .then(|| {
                             self.copy_button(
-                                format!("notice-{ix}"),
+                                copy_key,
                                 format!("omp-copy-notice-{ix}"),
                                 "Copy notice",
                                 text.clone(),
@@ -437,7 +571,13 @@ impl RowContext {
                             )
                         })
                         .flatten();
-                    notice_row(*level, text, copy_btn, &theme)
+                    let body = if let Some(sel) = &self.select {
+                        let seg = SegmentId::new(ix, seg_ix);
+                        selectable_plain(seg, text.clone(), sel, &theme)
+                    } else {
+                        text.clone().into_any_element()
+                    };
+                    notice_row(ix, *level, body, is_copied, copy_btn, &theme)
                 }
                 _ => div().into_any_element(),
             },
@@ -453,9 +593,16 @@ impl RowContext {
                         .entry(key)
                         .or_insert_with(|| Rc::new(markdown::parse(text)))
                         .clone();
-                    let model_badge = assistant(&self.model, entry)
-                        .and_then(|a| a.model.as_deref())
-                        .filter(|_| b == 0)
+                    let next_same_entry = matches!(
+                        self.rows.get(ix + 1),
+                        Some(RowKey::Block { entry: e, .. }) if *e == entry
+                    );
+                    let is_turn_tail = !next_same_entry;
+                    let copy_key = format!("assistant-{ix}");
+                    let is_copied = self.copied.as_deref() == Some(copy_key.as_str());
+                    let model_badge = is_turn_tail
+                        .then(|| assistant(&self.model, entry).and_then(|a| a.model.as_deref()))
+                        .flatten()
                         .map(|m| {
                             div()
                                 .text_size(Theme::TEXT_XS)
@@ -463,41 +610,78 @@ impl RowContext {
                                 .child(m.to_owned())
                         });
                     let copy_btn = self.copy_button(
-                        format!("assistant-{ix}"),
+                        copy_key,
                         format!("omp-copy-assistant-{ix}"),
                         "Copy response",
                         text.clone(),
-                        true,
+                        is_turn_tail,
                     );
-                    let show_bar = model_badge.is_some() || copy_btn.is_some();
-                    div()
-                        .debug_selector(|| "omp-assistant-text".to_owned())
-                        .flex()
-                        .flex_col()
-                        .gap(Theme::SPACE_1)
-                        .w_full()
-                        .child(markdown::render_with_copy(
+                    let group_name: SharedString = format!("omp-assistant-group-{ix}").into();
+                    let md = if let Some(sel) = &self.select {
+                        markdown::render_selectable(
+                            &parsed,
+                            &format!("row-{ix}"),
+                            self.copied.as_deref(),
+                            self.on_copy.clone(),
+                            (sel, ix, &mut seg_ix),
+                            &theme,
+                        )
+                    } else {
+                        markdown::render_with_copy(
                             &parsed,
                             &format!("row-{ix}"),
                             self.copied.as_deref(),
                             self.on_copy.clone(),
                             &theme,
-                        ))
-                        .when(show_bar, |col| {
-                            col.child(
+                        )
+                    };
+                    let mut col = div()
+                        .group(group_name.clone())
+                        .relative()
+                        .debug_selector(|| "omp-assistant-text".to_owned())
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .child(md);
+                    if is_turn_tail {
+                        let show_bar = model_badge.is_some() || copy_btn.is_some();
+                        if show_bar {
+                            col = col.child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .gap(Theme::SPACE_2)
                                     .w_full()
+                                    .pt(px(6.0))
+                                    .when(!is_copied, |bar| {
+                                        bar.opacity(0.55)
+                                            .group_hover(group_name, |s| s.opacity(1.0))
+                                    })
                                     .children(model_badge)
                                     .child(div().flex_1())
                                     .children(copy_btn),
-                            )
-                        })
-                        .into_any_element()
+                            );
+                        }
+                    } else if let Some(btn) = copy_btn {
+                        col = col.child(
+                            div()
+                                .absolute()
+                                .top(px(-2.0))
+                                .right_0()
+                                .rounded(Theme::RADIUS_SM)
+                                .bg(theme.surface.alpha(0.92))
+                                .when(!is_copied, |pill| {
+                                    pill.opacity(0.0)
+                                        .group_hover(group_name, |s| s.opacity(1.0))
+                                })
+                                .child(btn),
+                        );
+                    }
+                    col.into_any_element()
                 }
-                Some(Block::Thinking(text)) => self.thinking_row(ix, key, text, &theme),
+                Some(Block::Thinking(text)) => {
+                    self.thinking_row(ix, key, text, &mut seg_ix, &theme)
+                }
                 Some(Block::ToolCall(id)) => match self.model.tools.get(id) {
                     Some(run) => {
                         let open = self.open_tools.borrow().contains(id);
@@ -505,7 +689,7 @@ impl RowContext {
                         let state = self.state.clone();
                         let view = self.view;
                         let id = id.clone();
-                        tool_card::card_with_copy(
+                        tool_card::card_interactive(
                             run,
                             open,
                             Box::new(move |_, _, cx| {
@@ -515,6 +699,10 @@ impl RowContext {
                             }),
                             self.copied.as_deref(),
                             self.on_copy.clone(),
+                            self.on_open_file.clone(),
+                            self.select.as_ref(),
+                            ix,
+                            &mut seg_ix,
                             &theme,
                         )
                     }
@@ -524,15 +712,27 @@ impl RowContext {
                 None => div().into_any_element(),
             },
         };
+        let prev = ix.checked_sub(1).and_then(|p| self.rows.get(p)).copied();
+        let (pad_top, pad_bottom) = row_spacing(&self.model, prev, key);
         div()
+            .flex()
+            .justify_center()
             .w_full()
-            .px(Theme::SPACE_3)
-            .py(Theme::SPACE_1)
-            .child(content)
+            .px(Theme::SPACE_4)
+            .pt(pad_top)
+            .pb(pad_bottom)
+            .child(div().w_full().max_w(px(880.0)).min_w_0().child(content))
             .into_any_element()
     }
 
-    fn thinking_row(&self, ix: usize, key: RowKey, text: &str, theme: &Theme) -> AnyElement {
+    fn thinking_row(
+        &self,
+        ix: usize,
+        key: RowKey,
+        text: &str,
+        seg_ix: &mut usize,
+        theme: &Theme,
+    ) -> AnyElement {
         let open = self.open_thinking.borrow().contains(&key);
         let preview: SharedString = if text.trim().is_empty() {
             "redacted".into()
@@ -559,6 +759,30 @@ impl RowContext {
                 )
             })
             .flatten();
+        let expanded_body = open.then(|| {
+            let body: AnyElement = if let Some(sel) = &self.select {
+                let seg = SegmentId::new(ix, *seg_ix);
+                *seg_ix += 1;
+                selectable_plain(seg, text.to_owned(), sel, theme)
+            } else {
+                text.to_owned().into_any_element()
+            };
+            div()
+                .pl(Theme::SPACE_3)
+                .pr(Theme::SPACE_3)
+                .ml(px(8.0))
+                .mt(px(4.0))
+                .py(px(6.0))
+                .rounded_r(Theme::RADIUS_SM)
+                .bg(theme.raised.alpha(0.28))
+                .border_l_2()
+                .border_color(theme.border)
+                .text_size(Theme::TEXT_SM)
+                .line_height(px(20.0))
+                .text_color(theme.text_muted)
+                .italic()
+                .child(body)
+        });
         div()
             .debug_selector(|| "omp-thinking".to_owned())
             .flex()
@@ -576,9 +800,11 @@ impl RowContext {
                             .flex_1()
                             .min_w_0()
                             .items_center()
-                            .gap(Theme::SPACE_1)
+                            .gap(px(6.0))
+                            .h(px(24.0))
+                            .px(px(6.0))
                             .cursor_pointer()
-                            .rounded(Theme::RADIUS_SM)
+                            .rounded(px(6.0))
                             .hover(move |s| s.bg(hover))
                             .on_click(move |_, _, cx| {
                                 {
@@ -602,9 +828,9 @@ impl RowContext {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(Theme::TEXT_SM)
+                                    .text_size(Theme::TEXT_XS)
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted)
+                                    .text_color(theme.text_subtle)
                                     .child("Thinking"),
                             )
                             .when(!open, |row| {
@@ -613,67 +839,129 @@ impl RowContext {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(Theme::TEXT_SM)
+                                        .text_size(Theme::TEXT_XS)
                                         .italic()
-                                        .text_color(theme.text_subtle)
+                                        .text_color(theme.text_subtle.alpha(0.78))
                                         .child(preview),
                                 )
                             }),
                     )
                     .children(copy_btn),
             )
-            .when(open, |col| {
-                col.child(
-                    div()
-                        .pl(Theme::SPACE_4)
-                        .text_size(Theme::TEXT_SM)
-                        .text_color(theme.text_muted)
-                        .italic()
-                        .child(text.to_owned()),
-                )
-            })
+            .children(expanded_body)
             .into_any_element()
     }
 }
 
+fn row_spacing(
+    model: &SessionModel,
+    prev: Option<RowKey>,
+    curr: RowKey,
+) -> (gpui::Pixels, gpui::Pixels) {
+    let is_activity = |key: RowKey| match key {
+        RowKey::Block { entry, block: b } => matches!(
+            block(model, entry, b),
+            Some(Block::ToolCall(_) | Block::Thinking(_))
+        ),
+        _ => false,
+    };
+    let is_text = |key: RowKey| match key {
+        RowKey::Block { entry, block: b } => matches!(block(model, entry, b), Some(Block::Text(_))),
+        _ => false,
+    };
+    match (prev, curr) {
+        (None, RowKey::User(_)) => (px(8.0), px(4.0)),
+        (Some(_), RowKey::User(_)) => (px(18.0), px(4.0)),
+        (Some(p), c) if is_activity(p) && is_activity(c) => (px(2.0), px(1.0)),
+        (Some(p), c) if is_activity(p) && is_text(c) => (px(10.0), px(2.0)),
+        (Some(RowKey::User(_)), c) if is_text(c) => (px(10.0), px(2.0)),
+        (Some(RowKey::User(_)), c) if is_activity(c) => (px(8.0), px(1.0)),
+        (_, c) if is_activity(c) => (px(4.0), px(1.0)),
+        _ => (px(6.0), px(3.0)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn user_row(
-    text: &str,
+    ix: usize,
+    body: AnyElement,
     images: usize,
     from_agent: bool,
+    is_copied: bool,
+    edit_btn: Option<Button>,
     copy_btn: Option<Button>,
     theme: &Theme,
 ) -> AnyElement {
+    let group_name: SharedString = format!("omp-user-group-{ix}").into();
+    let has_actions = edit_btn.is_some() || copy_btn.is_some();
+    let tint = if from_agent {
+        theme.raised.alpha(0.55)
+    } else {
+        theme.raised.alpha(0.88)
+    };
+    let border = if from_agent {
+        theme.border_subtle
+    } else {
+        theme.border
+    };
+    let dot_color = if from_agent {
+        theme.text_subtle
+    } else {
+        theme.accent
+    };
     div()
+        .group(group_name.clone())
         .debug_selector(|| "omp-user-message".to_owned())
         .flex()
         .flex_col()
-        .gap(Theme::SPACE_1)
+        .gap(px(5.0))
         .w_full()
-        .p(Theme::SPACE_2)
-        .rounded(Theme::RADIUS_MD)
-        .bg(theme.raised)
+        .px(px(14.0))
+        .py(px(10.0))
+        .rounded(px(10.0))
+        .bg(tint)
         .border_1()
-        .border_color(theme.border_subtle)
+        .border_color(border)
         .child(
             div()
                 .flex()
                 .items_center()
+                .gap(Theme::SPACE_1)
                 .w_full()
+                .h(px(20.0))
+                .child(div().size(px(6.0)).rounded_full().bg(dot_color))
                 .child(
                     div()
                         .flex_1()
+                        .pl(px(2.0))
                         .text_size(Theme::TEXT_XS)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.text_subtle)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
                         .child(if from_agent { "Agent" } else { "You" }),
                 )
-                .children(copy_btn),
+                .when(has_actions, |row| {
+                    row.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(2.0))
+                            .when(!is_copied, |actions| {
+                                actions
+                                    .opacity(0.0)
+                                    .group_hover(group_name, |s| s.opacity(1.0))
+                            })
+                            .children(edit_btn)
+                            .children(copy_btn),
+                    )
+                }),
         )
         .child(
             div()
-                .text_size(Theme::TEXT_MD)
+                .text_size(px(13.5))
+                .line_height(px(22.0))
                 .text_color(theme.text)
-                .child(text.to_owned()),
+                .child(body),
         )
         .when(images > 0, |col| {
             col.child(
@@ -714,32 +1002,66 @@ fn level_tone(level: Level) -> Tone {
     }
 }
 
-fn notice_row(level: Level, text: &str, copy_btn: Option<Button>, theme: &Theme) -> AnyElement {
+fn notice_row(
+    ix: usize,
+    level: Level,
+    body: AnyElement,
+    is_copied: bool,
+    copy_btn: Option<Button>,
+    theme: &Theme,
+) -> AnyElement {
     let tone = level_tone(level);
     let colors = theme.tone(tone);
+    let group_name: SharedString = format!("omp-notice-group-{ix}").into();
     div()
+        .group(group_name.clone())
         .debug_selector(|| "omp-notice".to_owned())
         .flex()
         .items_start()
         .gap(Theme::SPACE_2)
         .w_full()
+        .px(px(10.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if tone == Tone::Neutral {
+            theme.border_subtle.alpha(0.65)
+        } else {
+            colors.border
+        })
+        .bg(if tone == Tone::Neutral {
+            theme.raised.alpha(0.4)
+        } else {
+            colors.bg
+        })
         .text_size(Theme::TEXT_SM)
+        .line_height(px(18.0))
         .text_color(if tone == Tone::Neutral {
             theme.text_muted
         } else {
             colors.fg
         })
         .child(
-            Icon::new(match level {
-                Level::Info => IconName::Idle,
-                Level::Warning => IconName::Warning,
-                Level::Error => IconName::Error,
-            })
-            .size(IconSize::Xs)
-            .tone(tone),
+            div().flex_none().pt(px(3.0)).child(
+                Icon::new(match level {
+                    Level::Info => IconName::Idle,
+                    Level::Warning => IconName::Warning,
+                    Level::Error => IconName::Error,
+                })
+                .size(IconSize::Xs)
+                .tone(tone),
+            ),
         )
-        .child(div().flex_1().min_w_0().child(text.to_owned()))
-        .children(copy_btn)
+        .child(div().flex_1().min_w_0().child(body))
+        .children(copy_btn.map(|btn| {
+            div()
+                .flex_none()
+                .when(!is_copied, |wrap| {
+                    wrap.opacity(0.0)
+                        .group_hover(group_name, |s| s.opacity(1.0))
+                })
+                .child(btn)
+        }))
         .into_any_element()
 }
 

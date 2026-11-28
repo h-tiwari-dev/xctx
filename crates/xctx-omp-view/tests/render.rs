@@ -486,8 +486,15 @@ fn the_hud_reads_out_the_session_and_switches_model_and_effort(cx: &mut TestAppC
         }}),
     );
     let (host, cx) = host(cx, model);
-    assert!(shown(cx, "omp-hud-session"));
+    assert!(shown(cx, "omp-session-bar"));
     assert!(shown(cx, "omp-hud-todos"));
+    assert!(shown(cx, "omp-hud-fast"));
+
+    click(cx, "omp-hud-fast");
+    assert_eq!(
+        intents(&host, cx),
+        [OmpIntent::SetFastMode { enabled: true }]
+    );
 
     click(cx, "omp-hud-effort");
     assert!(shown(cx, "omp-effort-menu"));
@@ -842,4 +849,210 @@ fn multiple_sessions_show_quick_strip_switcher_drawer_and_split_action(cx: &mut 
             path: "/tmp/sess-1.jsonl".into()
         }]
     );
+}
+
+#[gpui::test]
+fn text_selection_copies_via_cmd_c_even_when_composer_is_focused_and_clears_on_escape(
+    cx: &mut TestAppContext,
+) {
+    use xctx_omp_view::SegmentId;
+
+    let mut model = SessionModel::new();
+    model.entries.push(Entry::User {
+        text: "Check harsh_resume_new.pdf".into(),
+        images: 0,
+        from_agent: false,
+    });
+    model.entries.push(Entry::Assistant(AssistantEntry {
+        message_id: "m1".into(),
+        blocks: vec![Block::Text(
+            "Rebuilt `harsh_resume_new.pdf` from `demo_ai_resume.tex`.".into(),
+        )],
+        streaming: false,
+        ..AssistantEntry::default()
+    }));
+    let (host, cx) = host(cx, model);
+    let view = view(&host, cx);
+
+    // Select a phrase inside the rendered assistant paragraph (row 1, segment 0).
+    let seg = SegmentId::new(1, 0);
+    view.update(cx, |v, cx| {
+        v.selection().set_range(seg, 8..28);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(shown(cx, "omp-copy-selection"));
+    assert!(shown(cx, "omp-clear-selection"));
+
+    // Focus the composer (empty input selection) and press Cmd+C: must bubble to OmpView and copy transcript selection.
+    let composer_focus = view.read_with(cx, |v, cx| v.focus_handle(cx));
+    cx.update(|window, app| composer_focus.focus(window, app));
+    cx.simulate_keystrokes("cmd-c");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("harsh_resume_new.pdf")
+    );
+
+    // Clicking the floating Copy selection button also copies, and Escape clears the selection.
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("stale".into()));
+    click(cx, "omp-copy-selection");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("harsh_resume_new.pdf")
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!shown(cx, "omp-copy-selection"));
+    assert!(view.read_with(cx, |v, _| !v.selection().has_selection()));
+}
+
+#[gpui::test]
+fn in_session_search_highlights_navigates_and_closes_on_escape(cx: &mut TestAppContext) {
+    let mut model = SessionModel::new();
+    model.entries.push(Entry::User {
+        text: "Please rebuild the resume pdf".into(),
+        images: 0,
+        from_agent: false,
+    });
+    model.entries.push(Entry::Assistant(AssistantEntry {
+        message_id: "m1".into(),
+        blocks: vec![Block::Text(
+            "Done: harsh_resume_new.pdf compiled cleanly.".into(),
+        )],
+        streaming: false,
+        ..AssistantEntry::default()
+    }));
+    let (_host, cx) = host(cx, model);
+
+    assert!(!shown(cx, "omp-search-bar"));
+    click(cx, "omp-search-toggle");
+    assert!(shown(cx, "omp-search-bar"));
+
+    cx.simulate_input("resume");
+    cx.run_until_parked();
+    assert!(shown(cx, "omp-search-count"));
+
+    click(cx, "omp-search-next");
+    click(cx, "omp-search-prev");
+    assert!(shown(cx, "omp-search-bar"));
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!shown(cx, "omp-search-bar"));
+}
+
+#[gpui::test]
+fn composer_history_and_edit_in_composer_recall_prompts(cx: &mut TestAppContext) {
+    let mut model = SessionModel::new();
+    model.entries.push(Entry::User {
+        text: "first prompt".into(),
+        images: 0,
+        from_agent: false,
+    });
+    model.entries.push(Entry::User {
+        text: "second prompt".into(),
+        images: 0,
+        from_agent: false,
+    });
+    let (host, cx) = host(cx, model);
+    let view = view(&host, cx);
+
+    let composer_focus = view.read_with(cx, |v, cx| v.focus_handle(cx));
+    cx.update(|window, app| composer_focus.focus(window, app));
+
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    click(cx, "omp-send");
+    assert_eq!(
+        intents(&host, cx),
+        [OmpIntent::Prompt {
+            text: "second prompt".into(),
+            images: vec![],
+        }]
+    );
+
+    // Clicking Edit on the first user message loads it into the composer ready to send.
+    click(cx, "omp-edit-user-0");
+    click(cx, "omp-send");
+    assert_eq!(
+        intents(&host, cx),
+        [OmpIntent::Prompt {
+            text: "first prompt".into(),
+            images: vec![],
+        }]
+    );
+}
+
+#[gpui::test]
+fn session_controls_open_file_export_and_new_session_work(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut model = SessionModel::new();
+    model.session.id = Some("sess-9".into());
+    model.session.file = Some("/tmp/sess-9.jsonl".into());
+    model.tools.insert(
+        "read-1".into(),
+        ToolRun {
+            id: "read-1".into(),
+            name: "read".into(),
+            args: json!({"path": "src/main.rs"}),
+            output: "fn main() {}\n".into(),
+            details: serde_json::Value::Null,
+            state: ToolState::Done,
+        },
+    );
+    model.entries.push(Entry::Assistant(AssistantEntry {
+        message_id: "m1".into(),
+        blocks: vec![Block::ToolCall("read-1".into())],
+        streaming: false,
+        ..AssistantEntry::default()
+    }));
+    let (host, cx) = host(cx, model);
+    let view = view(&host, cx);
+
+    let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let opened_cb = opened.clone();
+    view.update(cx, |v, cx| {
+        v.set_open_file_handler(Rc::new(move |path, _, _| {
+            opened_cb.borrow_mut().push(path.to_owned());
+        }));
+        v.set_changes(
+            SessionChanges {
+                branch: Some("main".into()),
+                files: vec![ChangedFile {
+                    path: "src/lib.rs".into(),
+                    kind: ChangeKind::Modified,
+                    additions: 2,
+                    deletions: 1,
+                    diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                }],
+                error: None,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // Quick "+" button on the session bar starts a new session.
+    click(cx, "omp-bar-new");
+    assert_eq!(intents(&host, cx), [OmpIntent::NewSession]);
+
+    // Tool card Open button fires the host open_file callback.
+    click(cx, "omp-open-tool-read-1");
+    assert_eq!(opened.borrow().as_slice(), ["src/main.rs"]);
+
+    // Changes panel Open button also fires the host open_file callback.
+    click(cx, "omp-changes-toggle");
+    assert!(shown(cx, "omp-changes-panel"));
+    click(cx, "omp-changes-open-file");
+    assert_eq!(opened.borrow().as_slice(), ["src/main.rs", "src/lib.rs"]);
+
+    // Session info drawer Export HTML emits OmpIntent::ExportHtml.
+    click(cx, "omp-session-info");
+    assert!(shown(cx, "omp-info-panel"));
+    click(cx, "omp-action-export");
+    assert_eq!(intents(&host, cx), [OmpIntent::ExportHtml]);
 }

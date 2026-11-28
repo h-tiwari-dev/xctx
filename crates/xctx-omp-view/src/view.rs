@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, Hsla, SharedString, Window, div, prelude::*, px, relative,
+    Focusable, FontWeight, Hsla, KeyDownEvent, MouseButton, SharedString, Window, div, prelude::*,
+    px, relative,
 };
-use xctx_omp::{Phase, SessionModel};
+use xctx_omp::{Entry, Phase, SessionModel};
 use xctx_ui::{
-    Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Pill, PromptInput, Spinner,
-    Theme, Tone,
+    Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Pill, PromptEvent,
+    PromptInput, Spinner, Theme, Tone, Tooltip,
 };
 
 use crate::banner::{self, Banner, Exit, banners_for};
@@ -30,7 +31,9 @@ use crate::panels::{
     self, IntentCallback, SessionEntry, SessionInfoProps, SessionsDrawerProps, SessionsRefresher,
     SplitAgentHandler, SubagentTrayProps,
 };
-use crate::transcript::Transcript;
+use crate::selectable::{LinkHandler, SelectContext, TextSelection};
+use crate::tool_card::OpenFileHandler;
+use crate::transcript::{Transcript, TranscriptOptions};
 
 /// How long a Copy button shows its "Copied" confirmation before returning to "Copy".
 const COPY_FEEDBACK_MS: u64 = 1500;
@@ -87,6 +90,21 @@ pub struct OmpView {
     /// Key of the Copy control currently showing its brief "Copied" state.
     copied: Option<String>,
     copied_gen: u64,
+    /// Shared mouse-drag text selection across transcript rows and diffs.
+    selection: TextSelection,
+    /// Host callback to open a referenced file in xctx's side file viewer.
+    open_file: Option<OpenFileHandler>,
+    /// Host callback to open a clicked markdown link (external URL or local file).
+    on_link: Option<LinkHandler>,
+    /// Inline transcript search (`Cmd+F`).
+    search_open: bool,
+    search_input: Entity<PromptInput>,
+    search_matches: Vec<usize>,
+    search_index: usize,
+    /// Inline session rename input in the Session info drawer.
+    rename_input: Entity<PromptInput>,
+    /// Pane-level focus handle so mouse selection in the transcript receives `Cmd+C`/`Cmd+F`/`Esc`.
+    focus_handle: FocusHandle,
 }
 
 /// The most todo dots the rail draws; more become a `+N`.
@@ -106,9 +124,28 @@ fn todo_dot(status: &str, theme: &Theme) -> Hsla {
 fn readout(selector: &'static str, text: impl Into<SharedString>, color: Hsla) -> Div {
     div()
         .debug_selector(move || selector.to_owned())
-        .text_size(Theme::TEXT_SM)
+        .text_size(Theme::TEXT_XS)
         .text_color(color)
         .child(text.into())
+}
+
+fn clip_title(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}…", text[..cut].trim_end()),
+        None => text.to_owned(),
+    }
+}
+
+/// Intensity ramp colour for omp's thinking effort level (`docs/m6-theme.md`).
+fn effort_color(level: Option<&str>, theme: &Theme) -> Hsla {
+    match level.unwrap_or("") {
+        "off" | "none" | "minimal" => theme.text_subtle,
+        "low" => theme.text_muted,
+        "medium" => theme.text,
+        "high" => theme.accent,
+        "xhigh" | "max" => theme.meta,
+        _ => theme.text_muted,
+    }
 }
 
 impl EventEmitter<OmpIntent> for OmpView {}
@@ -144,6 +181,7 @@ impl OmpView {
             PromptInput::new(cx)
                 .placeholder("Filter models…")
                 .borderless(true)
+                .compact(true)
         });
         cx.observe(&model_filter, |_, _, cx| cx.notify()).detach();
 
@@ -151,6 +189,7 @@ impl OmpView {
             PromptInput::new(cx)
                 .placeholder("Steer this subagent…")
                 .borderless(true)
+                .compact(true)
         });
         cx.observe(&steer_input, |_, _, cx| cx.notify()).detach();
 
@@ -158,8 +197,54 @@ impl OmpView {
             PromptInput::new(cx)
                 .placeholder("Filter sessions…")
                 .borderless(true)
+                .compact(true)
         });
         cx.observe(&session_filter, |_, _, cx| cx.notify()).detach();
+
+        let search_input = cx.new(|cx| {
+            PromptInput::new(cx)
+                .placeholder("Find in session…")
+                .borderless(true)
+                .compact(true)
+        });
+        cx.observe(&search_input, |this: &mut Self, _, cx| {
+            this.update_search(true, cx);
+        })
+        .detach();
+        cx.subscribe(
+            &search_input,
+            |this: &mut Self, _, event: &PromptEvent, cx| match event {
+                PromptEvent::Submit(_) => this.step_search(true, cx),
+                PromptEvent::Cancel => {
+                    this.search_open = false;
+                    this.search_matches.clear();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+
+        let rename_input = cx.new(|cx| {
+            PromptInput::new(cx)
+                .placeholder("Session title…")
+                .borderless(true)
+                .compact(true)
+        });
+        cx.observe(&rename_input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(
+            &rename_input,
+            |_this: &mut Self, _, event: &PromptEvent, cx| {
+                if let PromptEvent::Submit(name) = event {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() {
+                        cx.emit(OmpIntent::RenameSession {
+                            name: trimmed.to_owned(),
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
 
         let mut this = OmpView {
             session: Arc::new(SessionModel::new()),
@@ -193,6 +278,15 @@ impl OmpView {
             todos_open: false,
             copied: None,
             copied_gen: 0,
+            selection: TextSelection::new(),
+            open_file: None,
+            on_link: None,
+            search_open: false,
+            search_input,
+            search_matches: Vec::new(),
+            search_index: 0,
+            rename_input,
+            focus_handle: cx.focus_handle(),
         };
         this.set_session(session, cx);
         this
@@ -202,6 +296,17 @@ impl OmpView {
     pub fn set_session(&mut self, session: Arc<SessionModel>, cx: &mut Context<Self>) {
         let prev_btw = self.session.btw.len();
         let prev_subagents = self.session.subagents.len();
+        let session_changed =
+            self.session.session.id != session.session.id && self.session.session.id.is_some();
+        if session_changed {
+            self.selection.reset();
+        }
+        if session.session.name != self.session.session.name
+            && let Some(name) = &session.session.name
+        {
+            self.rename_input
+                .update(cx, |input, cx| input.set_value(name, cx));
+        }
 
         self.meter.observe(&session, Instant::now());
         let started = self.meter.started();
@@ -241,6 +346,9 @@ impl OmpView {
             self.todos_open = false;
         }
         self.session = session;
+        if self.search_open {
+            self.update_search(false, cx);
+        }
         cx.notify();
     }
 
@@ -300,6 +408,112 @@ impl OmpView {
         cx.notify();
     }
 
+    /// Register the host callback invoked when the user clicks to open a file from a tool card or Changes panel.
+    pub fn set_open_file_handler(&mut self, handler: OpenFileHandler) {
+        self.open_file = Some(handler);
+    }
+
+    /// Register the host callback invoked when the user clicks a markdown link in the transcript.
+    pub fn set_link_handler(&mut self, handler: LinkHandler) {
+        self.on_link = Some(handler);
+    }
+
+    /// Active text selection handle for the transcript and diff viewer.
+    pub fn selection(&self) -> &TextSelection {
+        &self.selection
+    }
+
+    /// Copy any active text selection in the transcript/diffs to the clipboard. Returns `true` if something was copied.
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selection.selected_text() else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        self.copy_text("selection".to_owned(), text, cx);
+        true
+    }
+
+    /// Open or close the inline transcript search bar (`Cmd+F`).
+    pub fn set_search_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = open;
+        if open {
+            self.search_input.focus_handle(cx).focus(window, cx);
+            self.update_search(true, cx);
+        } else {
+            self.search_matches.clear();
+            self.search_index = 0;
+            self.composer.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn update_search(&mut self, jump: bool, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).value().to_owned();
+        self.search_matches = self.transcript.search_rows(&query);
+        if self.search_matches.is_empty() {
+            self.search_index = 0;
+        } else {
+            self.search_index = self.search_index.min(self.search_matches.len() - 1);
+            if jump {
+                self.transcript
+                    .scroll_to_row(self.search_matches[self.search_index]);
+            }
+        }
+        cx.notify();
+    }
+
+    fn step_search(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let len = self.search_matches.len();
+        if len == 0 {
+            return;
+        }
+        self.search_index = if forward {
+            (self.search_index + 1) % len
+        } else {
+            (self.search_index + len - 1) % len
+        };
+        self.transcript
+            .scroll_to_row(self.search_matches[self.search_index]);
+        cx.notify();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let k = &event.keystroke;
+        let m = k.modifiers;
+        if m.platform && !m.control && !m.alt && !m.shift {
+            match k.key.as_str() {
+                "c" => {
+                    if self.copy_selection(cx) {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                "f" => {
+                    let next = !self.search_open;
+                    self.set_search_open(next, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if k.key == "escape" && !m.platform && !m.control && !m.alt {
+            if self.search_open {
+                self.set_search_open(false, window, cx);
+                cx.stop_propagation();
+            } else if self.selection.has_selection() {
+                self.selection.clear();
+                cx.stop_propagation();
+                cx.notify();
+            } else if self.session.is_running() && self.focus_handle.is_focused(window) {
+                cx.emit(OmpIntent::Abort);
+                cx.stop_propagation();
+            }
+        }
+    }
+
     /// Write `text` to the system clipboard and flash "Copied" on the control identified by `key`.
     fn copy_text(&mut self, key: String, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -345,12 +559,6 @@ impl OmpView {
             })
             .ok();
         })
-    }
-
-    /// Send the draft from the footer's Send button, as the composer's own submit would.
-    fn submit_draft(&mut self, queue: WhileRunning, cx: &mut Context<Self>) {
-        self.composer
-            .update(cx, |composer, cx| composer.submit(queue, cx));
     }
 
     /// Show where the pane runs: the folder (its last component is shown) and the git branch checked out there.
@@ -425,24 +633,55 @@ impl OmpView {
         cx.notify();
     }
 
-    /// Compact session top bar (Tern's `omp.app.head`): session title & goal, Changes diff toggle, Subagents and
-    /// Btw toggles, Expand/collapse tools, quick Copy last reply, and Session info/actions.
-    fn render_session_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = &self.session;
-        let title: SharedString = session
+    /// Derive the best human-readable title for the active session: explicit session name, else active persisted
+    /// session title, else the first user message's opening line, else `"New session"`.
+    fn session_display_title(&self) -> SharedString {
+        if let Some(name) = self
+            .session
             .session
             .name
-            .clone()
-            .map(SharedString::from)
-            .unwrap_or_else(|| "Agent session".into());
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return SharedString::from(clip_title(name, 48));
+        }
+        if let Some(active) = self
+            .sessions
+            .iter()
+            .find(|s| s.active && !s.title.trim().is_empty())
+        {
+            return SharedString::from(clip_title(active.title.trim(), 48));
+        }
+        for entry in &self.session.entries {
+            if let Entry::User {
+                text,
+                from_agent: false,
+                ..
+            } = entry
+                && let Some(line) = text.lines().find(|l| !l.trim().is_empty())
+            {
+                return SharedString::from(clip_title(line.trim(), 48));
+            }
+        }
+        "New session".into()
+    }
+
+    /// Compact session top bar: real session title & switcher, worktree git diffstat, subagents/btw when present,
+    /// and a quiet utility icon cluster (search, split, expand tools, copy reply, session menu).
+    fn render_session_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let session = &self.session;
+        let title = self.session_display_title();
         let goal = session.goal.as_ref().and_then(panels::goal_summary);
 
         let change_count = self.changes.files.len();
-        let changes_label: SharedString = if change_count > 0 {
-            format!("Changes ({change_count})").into()
-        } else {
-            "Changes".into()
-        };
+        let (total_add, total_del) = self
+            .changes
+            .files
+            .iter()
+            .fold((0usize, 0usize), |(a, d), f| {
+                (a + f.additions, d + f.deletions)
+            });
 
         let subagent_count = session.subagents.len();
         let subagent_running = session
@@ -463,6 +702,87 @@ impl OmpView {
         } else {
             title
         };
+        let hover = theme.hover;
+        let changes_selected = self.changes_open;
+
+        let changes_chip = div()
+            .id("omp-changes-toggle")
+            .debug_selector(|| "omp-changes-toggle".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(5.0))
+            .h(px(24.0))
+            .px(Theme::SPACE_2)
+            .rounded(Theme::RADIUS_SM)
+            .border_1()
+            .border_color(if changes_selected {
+                theme.accent.alpha(0.55)
+            } else if change_count > 0 {
+                theme.border_subtle
+            } else {
+                gpui::transparent_black()
+            })
+            .bg(if changes_selected {
+                theme.selection
+            } else if change_count > 0 {
+                theme.raised.alpha(0.55)
+            } else {
+                gpui::transparent_black()
+            })
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .tooltip(|_, cx| Tooltip::view("View and copy worktree git changes", cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let next = !this.changes_open;
+                this.set_changes_open(next, cx);
+            }))
+            .child(Icon::new(IconName::Git).size(IconSize::Xs).color(
+                if changes_selected || change_count > 0 {
+                    theme.text
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .child(
+                div()
+                    .text_size(Theme::TEXT_XS)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if changes_selected || change_count > 0 {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(if change_count > 0 {
+                        format!("Changes {change_count}")
+                    } else {
+                        "Changes".to_owned()
+                    }),
+            )
+            .when(total_add > 0 || total_del > 0, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(3.0))
+                        .font_family("Menlo")
+                        .text_size(Theme::TEXT_XS)
+                        .when(total_add > 0, |r| {
+                            r.child(
+                                div()
+                                    .text_color(theme.success)
+                                    .child(format!("+{total_add}")),
+                            )
+                        })
+                        .when(total_del > 0, |r| {
+                            r.child(
+                                div()
+                                    .text_color(theme.danger)
+                                    .child(format!("−{total_del}")),
+                            )
+                        }),
+                )
+            });
 
         div()
             .debug_selector(|| "omp-session-bar".to_owned())
@@ -471,42 +791,75 @@ impl OmpView {
             .items_center()
             .gap(Theme::SPACE_1)
             .w_full()
-            .h(px(30.0))
+            .h(px(34.0))
             .px(Theme::SPACE_3)
             .border_b_1()
-            .border_color(theme.border_subtle)
-            .bg(theme.raised)
+            .border_color(theme.border_subtle.alpha(0.75))
+            .bg(theme.surface)
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
-                    .gap(Theme::SPACE_2)
+                    .gap(Theme::SPACE_1)
                     .child(
-                        Button::new("omp-sessions-toggle", switcher_label)
-                            .icon(if self.sessions_open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
+                        div()
+                            .id("omp-sessions-toggle")
+                            .debug_selector(|| "omp-sessions-toggle".to_owned())
+                            .flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(5.0))
+                            .h(px(24.0))
+                            .px(Theme::SPACE_2)
+                            .rounded(Theme::RADIUS_SM)
+                            .when(self.sessions_open, |d| d.bg(theme.selection))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .tooltip(|_, cx| {
+                                Tooltip::view("Switch, fork, start, or split agent sessions", cx)
                             })
-                            .variant(ButtonVariant::Ghost)
-                            .size(ButtonSize::Compact)
-                            .selected(self.sessions_open)
-                            .tooltip("Switch, fork, start, or split agent sessions")
-                            .selector("omp-sessions-toggle")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let next = !this.sessions_open;
                                 this.set_sessions_open(next, cx);
-                            })),
+                            }))
+                            .child(
+                                Icon::new(if self.sessions_open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(IconSize::Xs)
+                                .color(theme.text_subtle),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(Theme::TEXT_SM)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(switcher_label),
+                            ),
+                    )
+                    .child(
+                        Button::new("omp-bar-new", "")
+                            .icon(IconName::Plus)
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Compact)
+                            .tooltip("Start a new session")
+                            .selector("omp-bar-new")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(OmpIntent::NewSession))),
                     )
                     .children(goal.map(|g| {
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .pl(Theme::SPACE_1)
                             .text_size(Theme::TEXT_XS)
-                            .text_color(theme.text_muted)
+                            .text_color(theme.text_subtle)
                             .child(g)
                     }))
                     .children(
@@ -517,28 +870,7 @@ impl OmpView {
                             .map(|seg| Badge::new(seg.clone()).tone(Tone::Neutral)),
                     ),
             )
-            .children(self.split_agent.clone().map(|split| {
-                Button::new("omp-split-agent", "")
-                    .icon(IconName::SplitH)
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Compact)
-                    .tooltip("Open another agent session side-by-side")
-                    .selector("omp-split-agent")
-                    .on_click(move |_, window, cx| split(window, cx))
-            }))
-            .child(
-                Button::new("omp-changes-toggle", changes_label)
-                    .icon(IconName::Git)
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Compact)
-                    .selected(self.changes_open)
-                    .tooltip("View and copy worktree git changes")
-                    .selector("omp-changes-toggle")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let next = !this.changes_open;
-                        this.set_changes_open(next, cx);
-                    })),
-            )
+            .child(changes_chip)
             .when(subagent_count > 0, |row| {
                 let label: SharedString = if subagent_running > 0 {
                     format!("Agents ({subagent_running}/{subagent_count})").into()
@@ -573,55 +905,80 @@ impl OmpView {
                         })),
                 )
             })
-            .when(has_tools, |row| {
-                row.child(
-                    Button::new(
-                        "omp-tools-toggle",
-                        if all_open {
-                            "Collapse tools"
-                        } else {
-                            "Expand tools"
-                        },
-                    )
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(14.0))
+                    .mx(px(2.0))
+                    .bg(theme.border_subtle),
+            )
+            .child(
+                Button::new("omp-search-toggle", "")
+                    .icon(IconName::Search)
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
-                    .tooltip("Expand or collapse all tool cards")
-                    .selector("omp-tools-toggle")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if this.transcript.all_tools_open() {
-                            this.transcript.collapse_all_tools();
-                        } else {
-                            this.transcript.expand_all_tools();
-                        }
-                        cx.notify();
+                    .selected(self.search_open)
+                    .tooltip("Find in session (⌘F)")
+                    .selector("omp-search-toggle")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let next = !this.search_open;
+                        this.set_search_open(next, window, cx);
                     })),
+            )
+            .children(self.split_agent.clone().map(|split| {
+                Button::new("omp-split-agent", "")
+                    .icon(IconName::SplitH)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .tooltip("Open another agent session side-by-side")
+                    .selector("omp-split-agent")
+                    .on_click(move |_, window, cx| split(window, cx))
+            }))
+            .when(has_tools, |row| {
+                row.child(
+                    Button::new("omp-tools-toggle", "")
+                        .icon(IconName::Layers)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .selected(all_open)
+                        .tooltip(if all_open {
+                            "Collapse all tool cards"
+                        } else {
+                            "Expand all tool cards"
+                        })
+                        .selector("omp-tools-toggle")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.transcript.all_tools_open() {
+                                this.transcript.collapse_all_tools();
+                            } else {
+                                this.transcript.expand_all_tools();
+                            }
+                            cx.notify();
+                        })),
                 )
             })
             .children(last_reply.map(|reply| {
-                Button::new(
-                    "omp-copy-last",
-                    if copied_last { "Copied" } else { "Copy reply" },
-                )
-                .icon(if copied_last {
-                    IconName::Check
-                } else {
-                    IconName::Copy
-                })
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::Compact)
-                .tooltip("Copy the assistant's latest reply")
-                .selector("omp-copy-last")
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.copy_text("last-reply".to_owned(), reply.clone(), cx);
-                }))
+                Button::new("omp-copy-last", if copied_last { "Copied" } else { "" })
+                    .icon(if copied_last {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    })
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .tooltip("Copy the assistant's latest reply")
+                    .selector("omp-copy-last")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy_text("last-reply".to_owned(), reply.clone(), cx);
+                    }))
             }))
             .child(
-                Button::new("omp-session-info", "Session")
+                Button::new("omp-session-info", "")
                     .icon(IconName::More)
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
                     .selected(self.info_open)
-                    .tooltip("Session info, copy transcript, compact, fork, new session")
+                    .tooltip("Session info, rename, export HTML, copy transcript, compact, fork")
                     .selector("omp-session-info")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.info_open = !this.info_open;
@@ -630,9 +987,95 @@ impl OmpView {
             )
     }
 
-    /// The dock's top rail: the working state with Stop, the needs-you badge, clickable todos, and the context
-    /// meter (with a quick Compact button when context gets full).
-    fn render_rail(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Inline find bar shown when `Cmd+F` or the search icon is toggled.
+    fn render_search_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.search_open {
+            return None;
+        }
+        let query = self.search_input.read(cx).value();
+        let total = self.search_matches.len();
+        let count_label: SharedString = if query.trim().is_empty() {
+            "".into()
+        } else if total == 0 {
+            "No matches".into()
+        } else {
+            format!("{} / {total}", self.search_index + 1).into()
+        };
+        Some(
+            div()
+                .debug_selector(|| "omp-search-bar".to_owned())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(Theme::SPACE_1)
+                .w_full()
+                .px(Theme::SPACE_3)
+                .py(px(4.0))
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.raised)
+                .child(
+                    Icon::new(IconName::Search)
+                        .size(IconSize::Xs)
+                        .color(theme.text_subtle),
+                )
+                .child(div().flex_1().min_w_0().child(self.search_input.clone()))
+                .when(!count_label.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .debug_selector(|| "omp-search-count".to_owned())
+                            .font_family("Menlo")
+                            .text_size(Theme::TEXT_XS)
+                            .text_color(theme.text_subtle)
+                            .child(count_label),
+                    )
+                })
+                .child(
+                    Button::new("omp-search-prev", "Prev")
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .disabled(total == 0)
+                        .selector("omp-search-prev")
+                        .on_click(cx.listener(|this, _, _, cx| this.step_search(false, cx))),
+                )
+                .child(
+                    Button::new("omp-search-next", "Next")
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .disabled(total == 0)
+                        .selector("omp-search-next")
+                        .on_click(cx.listener(|this, _, _, cx| this.step_search(true, cx))),
+                )
+                .child(
+                    Button::new("omp-search-close", "")
+                        .icon(IconName::Close)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .tooltip("Close search (Esc)")
+                        .selector("omp-search-close")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_search_open(false, window, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Whether the dock's top status rail has live content to show (working, needs-you, todos, or high context).
+    fn rail_visible(&self) -> bool {
+        let s = &self.session;
+        s.is_running()
+            || s.phase() == Phase::NeedsYou
+            || todo_progress(s).is_some()
+            || context_is_high(s)
+    }
+
+    /// The dock's top rail: only rendered when active (working + Stop, needs-you badge, clickable todos, or high
+    /// context warning). When idle, the context readout lives cleanly in the footer instead of leaving a blank row.
+    fn render_rail(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.rail_visible() {
+            return None;
+        }
         let session = &self.session;
         let running = session.is_running();
         let hover = theme.hover;
@@ -707,44 +1150,52 @@ impl OmpView {
                     theme.text_muted,
                 ))
         });
-        div()
-            .debug_selector(|| "omp-rail".to_owned())
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(Theme::SPACE_2)
-            .w_full()
-            .h(px(32.0))
-            .px(Theme::SPACE_3)
-            .border_b_1()
-            .border_color(theme.border_subtle)
-            .children(working)
-            .children(needs_you)
-            .children(todos)
-            .child(div().flex_1())
-            .children(self.render_context(theme, cx))
+        Some(
+            div()
+                .debug_selector(|| "omp-rail".to_owned())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(Theme::SPACE_2)
+                .w_full()
+                .h(px(30.0))
+                .px(Theme::SPACE_3)
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .children(working)
+                .children(needs_you)
+                .children(todos)
+                .child(div().flex_1())
+                .children(self.render_context(theme, cx)),
+        )
     }
 
     /// The context meter: how full the model's window is, with the window's size. Warns from 80% and offers a
     /// one-click Compact action when high.
-    fn render_context(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_context(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let usage = self.session.context?;
         let percent = usage.percent.clamp(0.0, 100.0);
         let high = context_is_high(&self.session);
         let color = if high { theme.warning } else { theme.accent };
+        let window_label = compact_tokens(usage.window);
+        let tip: SharedString = format!("Context window: {percent:.0}% of {window_label}").into();
         Some(
             div()
+                .id("omp-hud-context")
                 .debug_selector(|| "omp-hud-context".to_owned())
                 .flex()
+                .flex_none()
                 .items_center()
-                .gap(Theme::SPACE_1)
+                .gap(px(5.0))
+                .tooltip(move |_, cx| Tooltip::view(tip.clone(), cx))
                 .child(
                     div()
                         .relative()
-                        .w(px(96.0))
-                        .h(px(4.0))
+                        .w(px(44.0))
+                        .h(px(5.0))
                         .rounded_full()
-                        .bg(theme.border_subtle)
+                        .bg(theme.border_strong.alpha(0.45))
+                        .overflow_hidden()
                         .child(
                             div()
                                 .absolute()
@@ -756,16 +1207,22 @@ impl OmpView {
                                 .bg(color),
                         ),
                 )
-                .child(readout(
-                    "omp-hud-context-percent",
-                    format!("{percent:.0}%"),
-                    color,
-                ))
-                .child(readout(
-                    "omp-hud-context-window",
-                    compact_tokens(usage.window),
-                    theme.meta,
-                ))
+                .child(
+                    readout(
+                        "omp-hud-context-percent",
+                        format!("{percent:.0}%"),
+                        if high {
+                            theme.warning
+                        } else {
+                            theme.text_muted
+                        },
+                    )
+                    .font_family("Menlo"),
+                )
+                .child(
+                    readout("omp-hud-context-window", window_label, theme.text_subtle)
+                        .font_family("Menlo"),
+                )
                 .when(high && !self.session.compacting, |row| {
                     row.child(
                         Button::new("omp-hud-compact", "Compact")
@@ -777,7 +1234,8 @@ impl OmpView {
                                 cx.emit(OmpIntent::Compact { instructions: None });
                             })),
                     )
-                }),
+                })
+                .into_any_element(),
         )
     }
 
@@ -785,129 +1243,261 @@ impl OmpView {
     fn render_send(&self, cx: &mut Context<Self>) -> AnyElement {
         let sendable = self.composer.read(cx).can_send(cx);
         if self.session.is_running() {
+            let composer_follow = self.composer.clone();
+            let composer_steer = self.composer.clone();
             div()
                 .flex()
                 .flex_none()
                 .gap(Theme::SPACE_1)
                 .child(
                     Button::new("omp-send-follow-up", "Follow up")
+                        .variant(ButtonVariant::Secondary)
                         .size(ButtonSize::Compact)
+                        .rounded_full()
                         .tooltip("Queue for when the turn ends (Alt+Enter)")
                         .disabled(!sendable)
                         .selector("omp-send-follow-up")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.submit_draft(WhileRunning::FollowUp, cx)
-                        })),
+                        .on_click(move |_, _, cx| {
+                            composer_follow
+                                .update(cx, |c, cx| c.submit(WhileRunning::FollowUp, cx));
+                        }),
                 )
                 .child(
                     Button::new("omp-send-steer", "Steer")
+                        .icon(IconName::Send)
                         .variant(ButtonVariant::Primary)
                         .size(ButtonSize::Compact)
+                        .rounded_full()
                         .tooltip("Interrupt at the next step (Enter)")
                         .disabled(!sendable)
                         .selector("omp-send-steer")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.submit_draft(WhileRunning::Steer, cx)
-                            }),
-                        ),
+                        .on_click(move |_, _, cx| {
+                            composer_steer.update(cx, |c, cx| c.submit(WhileRunning::Steer, cx));
+                        }),
                 )
                 .into_any_element()
         } else {
+            let composer = self.composer.clone();
             div()
                 .flex()
                 .flex_none()
                 .child(
                     Button::new("omp-send", "Send")
+                        .icon(IconName::Send)
                         .variant(ButtonVariant::Primary)
                         .size(ButtonSize::Compact)
+                        .rounded_full()
                         .tooltip("Send (Enter)")
                         .disabled(!sendable)
                         .selector("omp-send")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.submit_draft(WhileRunning::Steer, cx)
-                            }),
-                        ),
+                        .on_click(move |_, _, cx| {
+                            composer.update(cx, |c, cx| c.submit(WhileRunning::Steer, cx));
+                        }),
                 )
                 .into_any_element()
         }
     }
 
-    /// The dock's footer: the model and thinking level to change, the folder and branch the pane runs in, and the
-    /// turn's cost and speed.
+    /// The dock's footer: sleek model/effort/mode selectors on the left, clean breathing space in the middle,
+    /// context meter/cost/rate and primary Send pill anchored on the right.
     fn render_footer(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let session = &self.session;
         let model_label: SharedString = session
             .model
             .as_ref()
-            .map_or_else(|| "model".into(), |m| m.label().to_owned().into());
-        let effort_label: SharedString = session
-            .thinking
-            .clone()
-            .map_or_else(|| "effort".into(), SharedString::from);
-        let location = self.location.as_ref().map(|(folder, branch)| {
-            div()
+            .map_or_else(|| "Model".into(), |m| m.label().to_owned().into());
+        let effort_raw = session.thinking.as_deref();
+        let effort_label: SharedString = effort_raw
+            .map(|e| e.to_owned().into())
+            .unwrap_or_else(|| "Effort".into());
+        let effort_fg = effort_color(effort_raw, theme);
+        let inline_context = (!self.rail_visible())
+            .then(|| self.render_context(theme, cx))
+            .flatten();
+        let inline_context_present = inline_context.is_some();
+        let fast_active = session.fast_mode;
+        let show_slow = session.slow_mode_supported;
+        let slow_active = session.slow_mode;
+        let model_open = self.menu == Some(HudMenu::Model);
+        let effort_open = self.menu == Some(HudMenu::Effort);
+        let effort_disabled = session.thinking_levels.is_empty();
+        let hover = theme.hover;
+        let cost_zero = session.stats.cost <= 0.0;
+
+        let model_picker = div()
+            .id("omp-hud-model")
+            .debug_selector(|| "omp-hud-model".to_owned())
+            .flex()
+            .flex_shrink(1.0)
+            .min_w(px(64.0))
+            .max_w(px(210.0))
+            .items_center()
+            .gap(px(5.0))
+            .h(px(24.0))
+            .px(Theme::SPACE_2)
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if model_open {
+                theme.accent.alpha(0.6)
+            } else {
+                theme.border_subtle
+            })
+            .bg(if model_open {
+                theme.selection
+            } else {
+                theme.surface.alpha(0.55)
+            })
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .tooltip(|_, cx| Tooltip::view("Choose model", cx))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(HudMenu::Model, cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(Theme::TEXT_XS)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(model_label),
+            )
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::Xs)
+                    .color(theme.text_subtle),
+            );
+
+        let effort_picker = {
+            let mut el = div()
+                .id("omp-hud-effort")
+                .debug_selector(|| "omp-hud-effort".to_owned())
                 .flex()
+                .flex_none()
                 .items_center()
-                .gap(Theme::SPACE_1)
-                .min_w_0()
+                .gap(px(4.0))
+                .h(px(24.0))
+                .px(Theme::SPACE_2)
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(if effort_open {
+                    theme.accent.alpha(0.6)
+                } else {
+                    theme.border_subtle
+                })
+                .bg(if effort_open {
+                    theme.selection
+                } else {
+                    theme.surface.alpha(0.55)
+                })
+                .tooltip(|_, cx| Tooltip::view("Thinking effort", cx))
                 .child(
-                    readout("omp-location", folder.clone(), theme.text_muted)
-                        .min_w_0()
-                        .truncate(),
+                    div()
+                        .text_size(Theme::TEXT_XS)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(effort_fg)
+                        .child(effort_label),
                 )
-                .children(branch.clone().map(|branch| {
-                    readout("omp-branch", format!("⎇ {branch}"), theme.meta).flex_none()
-                }))
-        });
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(IconSize::Xs)
+                        .color(theme.text_subtle),
+                );
+            if effort_disabled {
+                el = el.opacity(0.45);
+            } else {
+                el = el
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(HudMenu::Effort, cx)));
+            }
+            el
+        };
+
         div()
             .debug_selector(|| "omp-footer".to_owned())
             .flex()
             .flex_none()
             .items_center()
-            .gap(Theme::SPACE_2)
+            .gap(px(6.0))
             .w_full()
-            .h(px(32.0))
-            .px(Theme::SPACE_3)
+            .h(px(38.0))
+            .px(px(10.0))
             .border_t_1()
-            .border_color(theme.border_subtle)
+            .border_color(theme.border_subtle.alpha(0.6))
+            .child(model_picker)
+            .child(effort_picker)
             .child(
-                Button::new("omp-hud-model", model_label)
+                Button::new("omp-hud-fast", "Fast")
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Compact)
-                    .selected(self.menu == Some(HudMenu::Model))
-                    .tooltip("Model")
-                    .selector("omp-hud-model")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(HudMenu::Model, cx))),
+                    .selected(fast_active)
+                    .tooltip("Toggle fast mode")
+                    .selector("omp-hud-fast")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(OmpIntent::SetFastMode {
+                            enabled: !fast_active,
+                        });
+                    })),
             )
+            .when(show_slow, |row| {
+                row.child(
+                    Button::new("omp-hud-slow", "Slow")
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Compact)
+                        .selected(slow_active)
+                        .tooltip("Toggle slow mode")
+                        .selector("omp-hud-slow")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(OmpIntent::SetSlowMode {
+                                enabled: !slow_active,
+                            });
+                        })),
+                )
+            })
+            .child(div().flex_1().min_w_0())
+            .children(inline_context)
+            .when(inline_context_present, |row| {
+                row.child(
+                    div()
+                        .w(px(1.0))
+                        .h(px(12.0))
+                        .mx(px(2.0))
+                        .bg(theme.border_subtle),
+                )
+            })
             .child(
-                Button::new("omp-hud-effort", effort_label)
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Compact)
-                    .selected(self.menu == Some(HudMenu::Effort))
-                    .disabled(session.thinking_levels.is_empty())
-                    .tooltip("Thinking level")
-                    .selector("omp-hud-effort")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(HudMenu::Effort, cx))),
+                readout(
+                    "omp-hud-cost",
+                    cost_label(session),
+                    if cost_zero {
+                        theme.text_subtle
+                    } else {
+                        theme.meta
+                    },
+                )
+                .font_family("Menlo"),
             )
-            .child(div().flex_1().min_w_0().children(location))
-            .child(readout("omp-hud-cost", cost_label(session), theme.meta))
-            .child(self.render_send(cx))
-            .children(
-                self.meter
-                    .rate()
-                    .map(|rate| readout("omp-hud-rate", rate_label(rate), theme.meta)),
-            )
-            .children(session.session.name.clone().map(|name| {
-                readout("omp-hud-session", name, theme.text_muted)
-                    .max_w(px(160.0))
-                    .truncate()
+            .children(self.meter.rate().map(|rate| {
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(
+                        div()
+                            .text_size(Theme::TEXT_XS)
+                            .text_color(theme.text_subtle)
+                            .child("·"),
+                    )
+                    .child(
+                        readout("omp-hud-rate", rate_label(rate), theme.meta).font_family("Menlo"),
+                    )
             }))
+            .child(div().pl(px(4.0)).child(self.render_send(cx)))
     }
 
     fn render_menu(&self, menu: HudMenu, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        match menu {
+        let inner: AnyElement = match menu {
             HudMenu::Effort => {
                 let current = self.session.thinking.as_deref();
                 div()
@@ -918,10 +1508,15 @@ impl OmpView {
                     .gap(Theme::SPACE_1)
                     .w_full()
                     .px(Theme::SPACE_3)
-                    .py(Theme::SPACE_1)
-                    .border_t_1()
-                    .border_color(theme.border_subtle)
-                    .bg(theme.raised)
+                    .py(Theme::SPACE_2)
+                    .child(
+                        div()
+                            .pr(Theme::SPACE_1)
+                            .text_size(Theme::TEXT_XS)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text_subtle)
+                            .child("Thinking effort"),
+                    )
                     .children(self.session.thinking_levels.iter().map(|level| {
                         let pick = level.clone();
                         Pill::new(
@@ -1005,13 +1600,10 @@ impl OmpView {
                     .debug_selector(|| "omp-model-menu".to_owned())
                     .flex()
                     .flex_col()
-                    .gap(Theme::SPACE_1)
+                    .gap(Theme::SPACE_2)
                     .w_full()
                     .px(Theme::SPACE_3)
                     .py(Theme::SPACE_2)
-                    .border_t_1()
-                    .border_color(theme.border_subtle)
-                    .bg(theme.raised)
                     .when(!choices.is_empty(), |col| {
                         col.child(
                             div()
@@ -1019,7 +1611,7 @@ impl OmpView {
                                 .items_center()
                                 .gap(Theme::SPACE_1)
                                 .px(Theme::SPACE_2)
-                                .py(px(2.0))
+                                .py(px(3.0))
                                 .rounded(Theme::RADIUS_SM)
                                 .bg(theme.surface)
                                 .border_1()
@@ -1035,52 +1627,147 @@ impl OmpView {
                     .child(body)
                     .into_any_element()
             }
-        }
+        };
+        div()
+            .flex_none()
+            .w_full()
+            .px(Theme::SPACE_4)
+            .pb(px(6.0))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(880.0))
+                    .mx_auto()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .bg(theme.overlay)
+                    .shadow_md()
+                    .overflow_hidden()
+                    .child(inner),
+            )
+            .into_any_element()
     }
 
-    fn render_empty(theme: &Theme) -> impl IntoElement {
+    fn render_empty(&self, theme: &Theme) -> impl IntoElement {
         let hint = |keys: &'static str, what: &'static str| {
             div()
                 .flex()
+                .items_center()
                 .gap(Theme::SPACE_2)
                 .child(
                     div()
-                        .w(px(28.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .min_w(px(28.0))
+                        .h(px(20.0))
+                        .px(px(6.0))
+                        .rounded(px(5.0))
+                        .bg(theme.raised)
+                        .border_1()
+                        .border_color(theme.border)
                         .font_family("Menlo")
+                        .text_size(Theme::TEXT_XS)
                         .text_color(theme.meta)
                         .child(keys),
                 )
-                .child(div().text_color(theme.text_muted).child(what))
+                .child(
+                    div()
+                        .text_size(Theme::TEXT_SM)
+                        .text_color(theme.text_muted)
+                        .child(what),
+                )
         };
+        let location_pill = self.location.as_ref().map(|(folder, branch)| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(10.0))
+                .py(px(3.0))
+                .rounded_full()
+                .bg(theme.raised.alpha(0.7))
+                .border_1()
+                .border_color(theme.border_subtle)
+                .text_size(Theme::TEXT_XS)
+                .child(
+                    Icon::new(IconName::Folder)
+                        .size(IconSize::Xs)
+                        .color(theme.text_subtle),
+                )
+                .child(
+                    div()
+                        .font_family("Menlo")
+                        .text_color(theme.text_muted)
+                        .child(folder.clone()),
+                )
+                .children(branch.clone().map(|b| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .pl(px(4.0))
+                        .border_l_1()
+                        .border_color(theme.border_subtle)
+                        .font_family("Menlo")
+                        .text_color(theme.meta)
+                        .child(format!("⎇ {b}"))
+                }))
+        });
         div()
             .debug_selector(|| "omp-empty".to_owned())
             .flex()
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(Theme::SPACE_3)
+            .gap(px(10.0))
             .size_full()
+            .px(Theme::SPACE_4)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(36.0))
+                    .rounded(px(10.0))
+                    .bg(theme.tone(Tone::Accent).bg)
+                    .border_1()
+                    .border_color(theme.tone(Tone::Accent).border)
+                    .child(
+                        Icon::new(IconName::Orchestrator)
+                            .size(IconSize::Md)
+                            .color(theme.accent),
+                    ),
+            )
             .child(
                 div()
                     .text_size(Theme::TEXT_XL)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text)
-                    .child("What should the agent do?"),
+                    .child("What should we work on?"),
             )
+            .children(location_pill)
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(Theme::SPACE_1)
-                    .text_size(Theme::TEXT_SM)
-                    .child(hint("/", "slash commands"))
-                    .child(hint("@", "reference a file"))
+                    .gap(px(6.0))
+                    .mt(px(4.0))
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .rounded(px(10.0))
+                    .bg(theme.raised.alpha(0.35))
+                    .border_1()
+                    .border_color(theme.border_subtle.alpha(0.75))
+                    .child(hint("/", "Run slash commands"))
+                    .child(hint("@", "Reference a file in the workspace"))
                     .child(hint(
                         "!",
-                        "run a shell command (!! keeps it out of context)",
+                        "Run a shell command (!! keeps output out of context)",
                     ))
-                    .child(hint("?", "ask a side question"))
-                    .child(hint("⌥↵", "queue a follow-up while the agent works")),
+                    .child(hint("?", "Ask a quick side question"))
+                    .child(hint("⌥↵", "Queue a follow-up while the agent works")),
             )
     }
 }
@@ -1090,18 +1777,47 @@ impl Render for OmpView {
         let theme = Theme::of(cx);
         let on_copy = self.copy_callback(cx);
         let on_intent = self.intent_callback(cx);
+        let search_query: SharedString = if self.search_open {
+            self.search_input.read(cx).value().to_owned().into()
+        } else {
+            SharedString::default()
+        };
+        let select_ctx = SelectContext {
+            selection: self.selection.clone(),
+            view: cx.entity_id(),
+            search_query,
+            on_copy: Some(on_copy.clone()),
+            on_link: self.on_link.clone(),
+        };
+        let view_edit = cx.weak_entity();
+        let on_edit_prompt = Rc::new(move |text: String, cx: &mut App| {
+            view_edit
+                .update(cx, |this, cx| {
+                    this.composer
+                        .update(cx, |composer, cx| composer.set_text(&text, cx));
+                    cx.notify();
+                })
+                .ok();
+        });
 
         let body = if self.transcript.is_empty() {
-            Self::render_empty(&theme).into_any_element()
+            self.render_empty(&theme).into_any_element()
         } else {
-            self.transcript.render_with_copy(
+            self.transcript.render_interactive(
                 cx.entity_id(),
-                self.copied.clone(),
-                Some(on_copy.clone()),
+                TranscriptOptions {
+                    copied: self.copied.clone(),
+                    on_copy: Some(on_copy.clone()),
+                    select: Some(select_ctx.clone()),
+                    on_open_file: self.open_file.clone(),
+                    on_edit_prompt: Some(on_edit_prompt),
+                },
             )
         };
 
         let show_jump = !self.transcript.is_empty() && !self.transcript.is_scrolled_to_end();
+        let has_selection = self.selection.has_selection();
+        let copied_sel = self.copied.as_deref() == Some("selection");
 
         let changes_panel = self.changes_open.then(|| {
             let view = cx.weak_entity();
@@ -1121,6 +1837,8 @@ impl Render for OmpView {
                         .ok();
                     }),
                     on_copy: on_copy.clone(),
+                    on_open_file: self.open_file.clone(),
+                    select: Some(select_ctx),
                     on_refresh: Rc::new(move |cx| {
                         view_refresh
                             .update(cx, |this, cx| {
@@ -1184,11 +1902,14 @@ impl Render for OmpView {
 
         let info_panel = self.info_open.then(|| {
             let view_close = cx.weak_entity();
+            let rename_value = self.rename_input.read(cx).value().to_owned();
             panels::render_session_info(
                 SessionInfoProps {
                     session: &self.session,
                     transcript_text: self.transcript.format_markdown(),
                     last_reply: self.transcript.last_reply(),
+                    rename_input: self.rename_input.clone(),
+                    rename_value: &rename_value,
                     copied: self.copied.as_deref(),
                     on_copy: on_copy.clone(),
                     on_intent: on_intent.clone(),
@@ -1294,25 +2015,35 @@ impl Render for OmpView {
             .flex()
             .flex_col()
             .flex_none()
-            .mx(Theme::SPACE_3)
-            .mt(Theme::SPACE_2)
-            .mb(Theme::SPACE_3)
-            .rounded(Theme::RADIUS_LG)
+            .w_full()
+            .max_w(px(880.0))
+            .mx_auto()
+            .rounded(px(12.0))
             .border_1()
             .when(mode.label().is_some(), |dock| dock.border_2())
             .border_color(mode_border(mode, focused, &theme))
             .bg(theme.raised)
+            .shadow_md()
             .overflow_hidden()
-            .child(self.render_rail(&theme, cx))
+            .children(self.render_rail(&theme, cx))
             .child(
                 div()
-                    .px(Theme::SPACE_2)
-                    .pt(Theme::SPACE_1)
+                    .px(px(14.0))
+                    .pt(px(8.0))
+                    .pb(px(4.0))
                     .child(self.composer.clone()),
             )
             .child(self.render_footer(&theme, cx));
+        let dock_wrap = div()
+            .flex_none()
+            .w_full()
+            .px(Theme::SPACE_4)
+            .pt(px(4.0))
+            .pb(px(14.0))
+            .child(dock);
         div()
             .debug_selector(|| "omp-view".to_owned())
+            .on_key_down(cx.listener(Self::on_key_down))
             .flex()
             .flex_col()
             .size_full()
@@ -1326,6 +2057,7 @@ impl Render for OmpView {
                     .update(cx, |composer, cx| composer.attach_paths(paths.paths(), cx));
             }))
             .child(self.render_session_bar(&theme, cx))
+            .children(self.render_search_bar(&theme, cx))
             .children(sessions_strip)
             .children(sessions_drawer)
             .children(info_panel)
@@ -1333,29 +2065,78 @@ impl Render for OmpView {
             .child(
                 div()
                     .debug_selector(|| "omp-transcript".to_owned())
+                    .track_focus(&self.focus_handle)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.focus_handle.focus(window, cx);
+                        }),
+                    )
                     .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
                     .py(Theme::SPACE_2)
                     .child(body)
-                    .when(show_jump, |wrap| {
+                    .when(show_jump || has_selection, |wrap| {
                         wrap.child(
                             div()
                                 .absolute()
                                 .bottom(Theme::SPACE_2)
-                                .right(Theme::SPACE_3)
-                                .child(
-                                    Button::new("omp-scroll-bottom", "Jump to bottom")
-                                        .icon(IconName::ChevronDown)
-                                        .variant(ButtonVariant::Secondary)
+                                .right(Theme::SPACE_4)
+                                .flex()
+                                .items_center()
+                                .gap(Theme::SPACE_1)
+                                .when(has_selection, |row| {
+                                    row.child(
+                                        Button::new(
+                                            "omp-copy-selection",
+                                            if copied_sel {
+                                                "Copied"
+                                            } else {
+                                                "Copy selection ⌘C"
+                                            },
+                                        )
+                                        .icon(if copied_sel {
+                                            IconName::Check
+                                        } else {
+                                            IconName::Copy
+                                        })
+                                        .variant(ButtonVariant::Primary)
                                         .size(ButtonSize::Compact)
-                                        .selector("omp-scroll-bottom")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.transcript.scroll_to_end();
-                                            cx.notify();
-                                        })),
-                                ),
+                                        .selector("omp-copy-selection")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.copy_selection(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new("omp-clear-selection", "")
+                                            .icon(IconName::Close)
+                                            .variant(ButtonVariant::Secondary)
+                                            .size(ButtonSize::Compact)
+                                            .tooltip("Clear selection (Esc)")
+                                            .selector("omp-clear-selection")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.selection.clear();
+                                                cx.notify();
+                                            })),
+                                    )
+                                })
+                                .when(show_jump, |row| {
+                                    row.child(
+                                        Button::new("omp-scroll-bottom", "Jump to bottom")
+                                            .icon(IconName::ChevronDown)
+                                            .variant(ButtonVariant::Secondary)
+                                            .size(ButtonSize::Compact)
+                                            .selector("omp-scroll-bottom")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.transcript.scroll_to_end();
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
                         )
                     }),
             )
@@ -1365,6 +2146,6 @@ impl Render for OmpView {
             .children(self.render_gate(&theme, cx))
             .children(banner)
             .children(self.menu.map(|menu| self.render_menu(menu, &theme, cx)))
-            .child(dock)
+            .child(dock_wrap)
     }
 }

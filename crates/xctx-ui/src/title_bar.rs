@@ -53,7 +53,7 @@ type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 type ShapeHandler = Rc<dyn Fn(Shape, &mut Window, &mut App)>;
 
 /// Width of the search pill at rest; it shrinks first when the window is narrow.
-const SEARCH_WIDTH: Pixels = px(280.0);
+const SEARCH_WIDTH: Pixels = px(220.0);
 /// Height of the search pill, the shape control and the buttons.
 const CONTROL_HEIGHT: Pixels = px(26.0);
 /// Width of the Roster toggle and the room right of it when the Roster is collapsed.
@@ -226,14 +226,14 @@ impl TitleBar {
             .id("title-palette")
             .debug_selector(|| "title-palette".to_owned())
             .flex()
+            .flex_1()
+            .max_w(SEARCH_WIDTH)
+            .min_w(px(64.0))
             .items_center()
-            .gap(Theme::SPACE_2)
-            .w(SEARCH_WIDTH)
-            .min_w(px(120.0))
-            .flex_shrink_1()
+            .gap(Theme::SPACE_1)
             .h(CONTROL_HEIGHT)
-            .pl(Theme::SPACE_2 + px(2.0))
-            .pr(Theme::SPACE_1 + px(1.0))
+            .pl(Theme::SPACE_2)
+            .pr(Theme::SPACE_1)
             .rounded(Theme::RADIUS_MD)
             .border_1()
             .border_color(theme.border_subtle)
@@ -488,9 +488,9 @@ impl TitleBar {
             .flex()
             .flex_none()
             .items_center()
-            .gap(Theme::SPACE_1)
-            .child(control(self.render_mode(info.flow_open, theme)).mr(Theme::SPACE_2))
-            .child(control(self.render_shapes(info.shape, theme)).mr(Theme::SPACE_2))
+            .gap(px(2.0))
+            .child(control(self.render_mode(info.flow_open, theme)).mr(Theme::SPACE_1))
+            .child(control(self.render_shapes(info.shape, theme)).mr(Theme::SPACE_1))
             .child(control(tool_button(
                 "title-add-agent",
                 IconName::Plus,
@@ -510,7 +510,7 @@ impl TitleBar {
                     .flex_none()
                     .w(px(1.0))
                     .h(px(16.0))
-                    .mx(Theme::SPACE_1)
+                    .mx(px(2.0))
                     .bg(theme.border),
             )
             .child(control(self.render_discard(theme)))
@@ -537,16 +537,17 @@ impl RenderOnce for TitleBar {
             .min_w_0()
             .items_center()
             .h_full()
-            .pl(Theme::SPACE_3)
+            .pl(Theme::SPACE_2)
             .pr(Theme::SPACE_2)
-            .gap(Theme::SPACE_2)
+            .gap(Theme::SPACE_1)
             .when(!self.sidebar_collapsed, |main| {
                 main.border_b_1().border_color(theme.border_subtle)
             })
             .child(
                 div()
                     .flex_shrink_1()
-                    .min_w(px(40.0))
+                    .max_w(px(170.0))
+                    .min_w(px(48.0))
                     .truncate()
                     .text_size(Theme::TEXT_MD)
                     .font_weight(FontWeight::SEMIBOLD)
@@ -554,11 +555,9 @@ impl RenderOnce for TitleBar {
                     .child(self.title.clone()),
             )
             .children(chips)
-            // Flexible room either side of the search pill keeps it near the centre; it is not a control, so the
-            // drag area behind the row receives presses on it.
-            .child(div().flex_1().min_w(Theme::SPACE_2))
+            .child(div().flex_1().min_w(px(4.0)))
             .child(self.render_search(&theme))
-            .child(div().flex_1().min_w(Theme::SPACE_2))
+            .child(div().flex_1().min_w(px(4.0)))
             .children(actions);
 
         div()

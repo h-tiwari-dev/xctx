@@ -1,13 +1,19 @@
 //! Tool calls as cards: one line per call while collapsed (the kind, what it touched, how it ended), the call's
 //! output, diff or content when expanded.
 
+use std::rc::Rc;
+
 use gpui::{AnyElement, App, ClickEvent, FontWeight, SharedString, Window, div, prelude::*, px};
 use serde_json::Value;
 use xctx_omp::{ToolRun, ToolState};
 use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Theme, Tone};
 
 use crate::changes::CopyCallback;
-use crate::markdown::code_block;
+use crate::markdown::{code_block_selectable, code_block_selectable_lang};
+use crate::selectable::{SegmentId, SelectContext, selectable_plain};
+
+/// Callback invoked when the user clicks to open a file referenced by a tool card or change entry.
+pub type OpenFileHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
 /// The kinds of tool card, each with its own summary and body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,6 +84,18 @@ impl ToolKind {
             ToolKind::Todo => IconName::Check,
             ToolKind::Web => IconName::Globe,
             ToolKind::Other => IconName::Plugin,
+        }
+    }
+
+    fn icon_color(self, failed: bool, theme: &Theme) -> gpui::Hsla {
+        if failed {
+            theme.danger
+        } else {
+            match self {
+                ToolKind::Edit | ToolKind::Write | ToolKind::Task => theme.accent,
+                ToolKind::Bash | ToolKind::Eval => theme.meta,
+                _ => theme.text_muted,
+            }
         }
     }
 }
@@ -240,34 +258,79 @@ pub fn clip_lines(text: &str) -> (&str, usize) {
     }
 }
 
-fn state_badge(state: ToolState) -> Badge {
+fn state_indicator(state: ToolState, theme: &Theme) -> AnyElement {
     match state {
-        ToolState::Pending => Badge::new("queued"),
-        ToolState::Running => Badge::new("running").tone(Tone::Accent),
-        ToolState::Done => Badge::new("done").tone(Tone::Success),
-        ToolState::Failed => Badge::new("failed").tone(Tone::Danger),
+        ToolState::Done => Icon::new(IconName::Check)
+            .size(IconSize::Xs)
+            .color(theme.success.alpha(0.85))
+            .into_any_element(),
+        ToolState::Running => Badge::new("running").tone(Tone::Accent).into_any_element(),
+        ToolState::Pending => div()
+            .flex_none()
+            .text_size(Theme::TEXT_XS)
+            .text_color(theme.text_subtle)
+            .child("queued")
+            .into_any_element(),
+        ToolState::Failed => Badge::new("failed").tone(Tone::Danger).into_any_element(),
     }
 }
 
-fn body(run: &ToolRun, theme: &Theme) -> AnyElement {
+fn next_sel<'a>(
+    select: &mut Option<(&'a SelectContext, usize, &mut usize)>,
+) -> Option<(&'a SelectContext, SegmentId)> {
+    select.as_mut().map(|(ctx, row, ix)| {
+        let seg = SegmentId::new(*row, **ix);
+        **ix += 1;
+        (*ctx, seg)
+    })
+}
+
+fn body(
+    run: &ToolRun,
+    select: Option<(&SelectContext, usize, &mut usize)>,
+    theme: &Theme,
+) -> AnyElement {
     let kind = ToolKind::of(&run.name);
     let failed = run.state == ToolState::Failed;
+    let file_lang = arg(run, &["path", "file_path", "file"])
+        .and_then(xctx_ui::language_for_path)
+        .unwrap_or("");
     let mut parts: Vec<AnyElement> = Vec::new();
+    let mut select = select;
     match kind {
         ToolKind::Bash => {
             if let Some(command) = arg(run, &["command", "cmd"]) {
-                parts.push(code_block(&format!("$ {command}"), false, theme));
+                parts.push(code_block_selectable_lang(
+                    "sh",
+                    &format!("$ {command}"),
+                    false,
+                    next_sel(&mut select),
+                    theme,
+                ));
             }
         }
         ToolKind::Eval => {
             if let Some(code) = arg(run, &["code", "input", "source"]) {
-                parts.push(code_block(clip_lines(code).0, false, theme));
+                let eval_lang = arg(run, &["language", "lang"]).unwrap_or("py");
+                parts.push(code_block_selectable_lang(
+                    eval_lang,
+                    clip_lines(code).0,
+                    false,
+                    next_sel(&mut select),
+                    theme,
+                ));
             }
         }
         ToolKind::Write if !failed => {
             if let Some(content) = arg(run, &["content"]) {
                 let (shown, more) = clip_lines(content);
-                parts.push(code_block(shown, false, theme));
+                parts.push(code_block_selectable_lang(
+                    file_lang,
+                    shown,
+                    false,
+                    next_sel(&mut select),
+                    theme,
+                ));
                 if more > 0 {
                     parts.push(more_lines(more, theme));
                 }
@@ -277,7 +340,12 @@ fn body(run: &ToolRun, theme: &Theme) -> AnyElement {
         ToolKind::Edit if !failed => {
             if let Some(diff) = edit_diff(run) {
                 let (shown, more) = clip_lines(diff);
-                parts.push(code_block(shown, true, theme));
+                parts.push(code_block_selectable(
+                    shown,
+                    true,
+                    next_sel(&mut select),
+                    theme,
+                ));
                 if more > 0 {
                     parts.push(more_lines(more, theme));
                 }
@@ -289,19 +357,31 @@ fn body(run: &ToolRun, theme: &Theme) -> AnyElement {
     if !run.output.is_empty() {
         let (shown, more) = clip_lines(&run.output);
         let block = if failed {
+            let content: AnyElement = if let Some((ctx, seg)) = next_sel(&mut select) {
+                selectable_plain(seg, shown.to_owned(), ctx, theme)
+            } else {
+                shown.to_owned().into_any_element()
+            };
             div()
                 .debug_selector(|| "omp-tool-error".to_owned())
                 .w_full()
-                .p(Theme::SPACE_2)
-                .rounded(Theme::RADIUS_SM)
+                .px(Theme::SPACE_3)
+                .py(Theme::SPACE_2)
+                .rounded(Theme::RADIUS_MD)
                 .bg(theme.tone(Tone::Danger).bg)
                 .font_family("Menlo")
                 .text_size(Theme::TEXT_SM)
+                .line_height(px(19.0))
                 .text_color(theme.danger)
-                .child(shown.to_owned())
+                .child(content)
                 .into_any_element()
         } else {
-            code_block(shown, false, theme)
+            let out_lang = if kind == ToolKind::Read {
+                file_lang
+            } else {
+                ""
+            };
+            code_block_selectable_lang(out_lang, shown, false, next_sel(&mut select), theme)
         };
         parts.push(block);
         if more > 0 {
@@ -310,7 +390,13 @@ fn body(run: &ToolRun, theme: &Theme) -> AnyElement {
     } else if kind == ToolKind::Other || parts.is_empty() {
         let args = serde_json::to_string_pretty(&run.args).unwrap_or_default();
         if !run.args.is_null() {
-            parts.push(code_block(&args, false, theme));
+            parts.push(code_block_selectable_lang(
+                "json",
+                &args,
+                false,
+                next_sel(&mut select),
+                theme,
+            ));
         }
     }
     column(parts)
@@ -411,12 +497,44 @@ pub fn card_with_copy(
     on_copy: Option<CopyCallback>,
     theme: &Theme,
 ) -> AnyElement {
+    let mut seg_ix = 0usize;
+    card_interactive(
+        run,
+        expanded,
+        on_toggle,
+        copied,
+        on_copy,
+        None,
+        None,
+        0,
+        &mut seg_ix,
+        theme,
+    )
+}
+
+/// Full interactive tool card: expandable, copyable, open-file button for file tools, and selectable output/diff.
+#[allow(clippy::too_many_arguments)]
+pub fn card_interactive(
+    run: &ToolRun,
+    expanded: bool,
+    on_toggle: Toggle,
+    copied: Option<&str>,
+    on_copy: Option<CopyCallback>,
+    on_open_file: Option<OpenFileHandler>,
+    select: Option<&SelectContext>,
+    row_ix: usize,
+    seg_ix: &mut usize,
+    theme: &Theme,
+) -> AnyElement {
     let kind = ToolKind::of(&run.name);
     let failed = run.state == ToolState::Failed;
     let selector = format!("omp-tool-{}", kind.slug());
     let hover = theme.hover;
     let edit_stat = (kind == ToolKind::Edit)
         .then(|| edit_diff(run).map(diffstat))
+        .flatten();
+    let file_path = matches!(kind, ToolKind::Read | ToolKind::Edit | ToolKind::Write)
+        .then(|| arg(run, &["path", "file_path", "file"]).map(str::to_owned))
         .flatten();
     let header_summary = if edit_stat.is_some() {
         arg(run, &["path", "file_path", "file"])
@@ -425,12 +543,23 @@ pub fn card_with_copy(
     } else {
         summary(run)
     };
+    let open_button = on_open_file.zip(file_path).map(|(open, path)| {
+        let sel = format!("omp-open-tool-{}", run.id);
+        Button::new(SharedString::from(format!("omp-tool-open-{}", run.id)), "")
+            .icon(IconName::ExternalLink)
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Compact)
+            .tooltip("Open file in side panel")
+            .selector(sel)
+            .on_click(move |_, window, cx| open(&path, window, cx))
+    });
+    let copy_key = format!("tool-{}", run.id);
+    let is_copied = copied == Some(copy_key.as_str());
     let copy_button = on_copy.and_then(|cb| {
         let payload = copyable_text(run)?;
-        let copy_key = format!("tool-{}", run.id);
-        let is_copied = copied == Some(copy_key.as_str());
         let tip = copy_tooltip(run);
         let sel = format!("omp-copy-tool-{}", run.id);
+        let key = copy_key.clone();
         Some(
             Button::new(
                 SharedString::from(format!("omp-tool-copy-{}", run.id)),
@@ -445,9 +574,12 @@ pub fn card_with_copy(
             .size(ButtonSize::Compact)
             .tooltip(tip)
             .selector(sel)
-            .on_click(move |_, _, cx| cb(copy_key.clone(), payload.clone(), cx)),
+            .on_click(move |_, _, cx| cb(key.clone(), payload.clone(), cx)),
         )
     });
+
+    let group_name: SharedString = format!("omp-tool-group-{}", run.id).into();
+    let has_actions = open_button.is_some() || copy_button.is_some();
 
     let toggle_area = div()
         .id(SharedString::from(format!("omp-tool-header-{}", run.id)))
@@ -471,17 +603,17 @@ pub fn card_with_copy(
             .size(IconSize::Xs)
             .color(theme.text_subtle),
         )
-        .child(Icon::new(kind.icon()).size(IconSize::Sm).color(if failed {
-            theme.danger
-        } else {
-            theme.text_muted
-        }))
+        .child(
+            Icon::new(kind.icon())
+                .size(IconSize::Xs)
+                .color(kind.icon_color(failed, theme)),
+        )
         .child(
             div()
                 .flex_none()
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(FontWeight::MEDIUM)
                 .text_size(Theme::TEXT_SM)
-                .text_color(theme.text)
+                .text_color(if failed { theme.danger } else { theme.text })
                 .child(title(run)),
         )
         .child(
@@ -490,55 +622,103 @@ pub fn card_with_copy(
                 .min_w_0()
                 .truncate()
                 .font_family("Menlo")
-                .text_size(Theme::TEXT_SM)
+                .text_size(Theme::TEXT_XS)
                 .text_color(theme.text_muted)
                 .child(header_summary),
         )
-        .children(edit_stat.map(|(added, removed)| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(Theme::SPACE_1)
-                .font_family("Menlo")
-                .text_size(Theme::TEXT_XS)
-                .child(div().text_color(theme.success).child(format!("+{added}")))
-                .child(div().text_color(theme.danger).child(format!("−{removed}")))
-        }))
-        .child(state_badge(run.state));
+        .children(
+            edit_stat
+                .filter(|&(a, r)| a > 0 || r > 0)
+                .map(|(added, removed)| {
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(Theme::SPACE_1)
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .rounded(px(4.0))
+                        .bg(theme.surface.alpha(0.7))
+                        .font_family("Menlo")
+                        .text_size(Theme::TEXT_XS)
+                        .when(added > 0, |row| {
+                            row.child(div().text_color(theme.success).child(format!("+{added}")))
+                        })
+                        .when(removed > 0, |row| {
+                            row.child(div().text_color(theme.danger).child(format!("−{removed}")))
+                        })
+                }),
+        );
+
+    let actions = has_actions.then(|| {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .when(!is_copied && !expanded, |row| {
+                row.opacity(0.0)
+                    .group_hover(group_name.clone(), |s| s.opacity(1.0))
+            })
+            .children(open_button)
+            .children(copy_button)
+    });
 
     let header = div()
         .flex()
         .items_center()
         .w_full()
-        .pr(Theme::SPACE_1)
         .child(toggle_area)
-        .children(copy_button);
+        .children(actions)
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .pl(px(4.0))
+                .pr(Theme::SPACE_2)
+                .child(state_indicator(run.state, theme)),
+        );
+
+    let expanded_body = expanded.then(|| {
+        div()
+            .debug_selector(|| "omp-tool-expanded".to_owned())
+            .w_full()
+            .px(Theme::SPACE_2)
+            .pt(Theme::SPACE_2)
+            .pb(Theme::SPACE_2)
+            .border_t_1()
+            .border_color(theme.border_subtle.alpha(0.7))
+            .child(body(run, select.map(|ctx| (ctx, row_ix, seg_ix)), theme))
+    });
+
+    let card_bg = if failed {
+        theme.danger.alpha(0.08)
+    } else if expanded {
+        theme.raised.alpha(0.65)
+    } else {
+        theme.raised.alpha(0.32)
+    };
+    let card_border = if failed {
+        theme.tone(Tone::Danger).border
+    } else if expanded {
+        theme.border
+    } else {
+        theme.border_subtle.alpha(0.7)
+    };
 
     div()
+        .group(group_name)
         .flex()
         .flex_col()
         .w_full()
-        .rounded(Theme::RADIUS_MD)
+        .rounded(px(7.0))
         .border_1()
-        .border_color(if failed {
-            theme.tone(Tone::Danger).border
-        } else {
-            theme.border_subtle
-        })
-        .bg(theme.surface)
+        .border_color(card_border)
+        .bg(card_bg)
         .overflow_hidden()
         .child(header)
-        .when(expanded, |c| {
-            c.child(
-                div()
-                    .debug_selector(|| "omp-tool-expanded".to_owned())
-                    .w_full()
-                    .px(Theme::SPACE_2)
-                    .pb(Theme::SPACE_2)
-                    .child(body(run, theme)),
-            )
-        })
+        .children(expanded_body)
         .into_any_element()
 }
 

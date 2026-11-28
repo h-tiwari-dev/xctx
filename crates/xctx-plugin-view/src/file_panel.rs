@@ -3,8 +3,11 @@
 
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, FontWeight, SharedString, Window, div, prelude::*, px};
-use xctx_ui::{Button, ButtonSize, ButtonVariant, IconName, Theme, Tone, cut_line};
+use gpui::{AnyElement, App, FontWeight, SharedString, StyledText, Window, div, prelude::*, px};
+use xctx_ui::{
+    Button, ButtonSize, ButtonVariant, IconName, ScrollableElement as _, Theme, Tone, cut_line,
+    highlight_lines, language_for_path,
+};
 
 use crate::common::{note, tone_text};
 use crate::files::{
@@ -316,7 +319,6 @@ impl RenderOnce for FilePanelView {
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
                 .py(Theme::SPACE_3)
                 .bg(theme.surface)
                 .child(
@@ -327,12 +329,17 @@ impl RenderOnce for FilePanelView {
                         .max_w(px(780.0))
                         .children(blocks.iter().map(|block| markdown_block(block, &theme))),
                 )
+                .overflow_y_scrollbar()
                 .into_any_element(),
             PreviewBody::Lines(lines) => {
                 let total = lines.len().min(FILES_LINE_LIMIT);
                 let gutter_digits = total.max(1).to_string().len().max(3);
                 let gutter_w = px((gutter_digits as f32) * 8.0 + 18.0);
                 let target_line = data.target_line;
+                let line_highlights = (!diff_on)
+                    .then(|| language_for_path(&data.path))
+                    .flatten()
+                    .map(|lang| highlight_lines(lang, &lines[..total], &theme));
                 let mut rows: Vec<AnyElement> = lines
                     .iter()
                     .take(FILES_LINE_LIMIT)
@@ -388,12 +395,38 @@ impl RenderOnce for FilePanelView {
                         } else {
                             row = row.pl(Theme::SPACE_3);
                         }
-                        row.child(
-                            div()
-                                .text_color(color)
-                                .child(cut_line(line, FILES_LINE_CHARS)),
-                        )
-                        .into_any_element()
+                        let shown = cut_line(line, FILES_LINE_CHARS);
+                        let line_el: AnyElement = if let Some(spans) =
+                            line_highlights.as_ref().and_then(|all| all.get(i))
+                            && !spans.is_empty()
+                        {
+                            let max_len = shown.len();
+                            let clipped: Vec<_> = spans
+                                .iter()
+                                .filter_map(|(r, style)| {
+                                    if r.start >= max_len {
+                                        return None;
+                                    }
+                                    let mut end = r.end.min(max_len);
+                                    while end > r.start && !shown.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
+                                    (r.start < end && shown.is_char_boundary(r.start))
+                                        .then_some((r.start..end, *style))
+                                })
+                                .collect();
+                            if clipped.is_empty() {
+                                div().text_color(color).child(shown).into_any_element()
+                            } else {
+                                div()
+                                    .text_color(color)
+                                    .child(StyledText::new(shown).with_highlights(clipped))
+                                    .into_any_element()
+                            }
+                        } else {
+                            div().text_color(color).child(shown).into_any_element()
+                        };
+                        row.child(line_el).into_any_element()
                     })
                     .collect();
                 if lines.len() > FILES_LINE_LIMIT {
@@ -416,12 +449,12 @@ impl RenderOnce for FilePanelView {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
                     .py(Theme::SPACE_2)
                     .bg(theme.surface)
                     .font_family("Menlo")
                     .text_size(px(12.5))
                     .children(rows)
+                    .overflow_y_scrollbar()
                     .into_any_element()
             }
         };

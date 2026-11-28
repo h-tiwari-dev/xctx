@@ -6,14 +6,24 @@
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, FontWeight, KeyBinding, Menu, MenuItem,
-    SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
-    div, prelude::*, px, size,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, FontWeight, KeyBinding, Keystroke, Menu,
+    MenuItem, SharedString, SystemMenuType, TitlebarOptions, Window, WindowAppearance,
+    WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+};
+use xctx_ui::gpui_component::{
+    Root, Sizable as _,
+    button::{Button as KitButton, ButtonVariants as _},
+    kbd::Kbd as KitKbd,
+    progress::Progress as KitProgress,
+    spinner::Spinner as KitSpinner,
+    tag::Tag as KitTag,
+    text::TextView as KitTextView,
 };
 use xctx_ui::{
     Badge, Button, ButtonSize, ButtonVariant, ComposerCard, ComposerChip, FrameOverlay,
-    HomeBackdrop, HomeHero, Icon, IconName, IconSize, MotionSettings, Overlay, OverlayPlacement,
-    Pill, Spinner, Theme, Toast, ToastAction, ToastStack, Tone, UiAssets,
+    HomeBackdrop, HomeHero, Icon, IconName, IconSize, KitAssets, MotionSettings, Overlay,
+    OverlayPlacement, Pill, ScrollableElement as _, Spinner, Theme, Toast, ToastAction, ToastStack,
+    Tone, init_kit, sync_kit_theme,
 };
 
 actions!(
@@ -349,11 +359,18 @@ impl Render for GalleryView {
                         .selected(self.light_theme)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.light_theme = !this.light_theme;
-                            cx.set_global(if this.light_theme {
+                            let next_theme = if this.light_theme {
                                 Theme::light()
                             } else {
                                 Theme::dark()
-                            });
+                            };
+                            let appearance = if this.light_theme {
+                                WindowAppearance::Light
+                            } else {
+                                WindowAppearance::Dark
+                            };
+                            cx.set_global(next_theme);
+                            sync_kit_theme(next_theme, appearance, cx);
                             this.last_event = if this.light_theme {
                                 "Switched gallery to Light theme".into()
                             } else {
@@ -815,11 +832,58 @@ impl Render for GalleryView {
             .child(self.last_event.clone())
             .child("⌘Q quit · ⌘⇧. frame overlay");
 
+        let kit_section = Self::section(
+            "GPUI Kit (gpui-component v0.11)",
+            "Themed gpui-component primitives sharing xctx_ui::Theme via sync_kit_theme and KitAssets.",
+            &theme,
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(Theme::SPACE_2)
+                .child(
+                    KitButton::new("kit-btn-primary")
+                        .primary()
+                        .small()
+                        .label("Primary"),
+                )
+                .child(KitButton::new("kit-btn-secondary").small().label("Secondary"))
+                .child(
+                    KitButton::new("kit-btn-danger")
+                        .danger()
+                        .small()
+                        .label("Danger"),
+                )
+                .child(KitTag::primary().child("gpui-kit"))
+                .child(KitTag::success().child("syntect"))
+                .child(KitTag::warning().child("Root"))
+                .child(KitSpinner::new().small())
+                .children(Keystroke::parse("cmd-k").ok().map(KitKbd::new)),
+        )
+        .child(div().w(px(280.0)).child(KitProgress::new("kit-progress").value(68.0)))
+        .child(
+            div()
+                .w_full()
+                .p(Theme::SPACE_3)
+                .rounded(Theme::RADIUS_MD)
+                .bg(theme.chrome)
+                .border_1()
+                .border_color(theme.border_subtle)
+                .child(
+                    KitTextView::markdown(
+                        "kit-md-demo",
+                        "Streaming **Markdown** + `syntect` highlighting from `gpui-component`:\n\n```rust\npub fn greet(agent: &str) -> String {\n    format!(\"ready: {agent}\")\n}\n```",
+                    )
+                    .selectable(true),
+                ),
+        );
+
         let body = div()
             .id("gallery-scroll")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
             .p(Theme::SPACE_4)
             .child(
                 div()
@@ -828,12 +892,14 @@ impl Render for GalleryView {
                     .gap(Theme::SPACE_4)
                     .max_w(px(1100.0))
                     .mx_auto()
+                    .child(kit_section)
                     .child(icons_section)
                     .child(spinner_section)
                     .child(buttons_section)
                     .child(interactive_section)
                     .child(home_hero_section),
-            );
+            )
+            .overflow_y_scrollbar();
 
         div()
             .relative()
@@ -872,9 +938,10 @@ impl Render for GalleryView {
 
 fn main() {
     gpui_platform::application()
-        .with_assets(UiAssets)
+        .with_assets(KitAssets)
         .run(|cx: &mut App| {
             cx.set_global(Theme::dark());
+            init_kit(cx);
             cx.set_global(MotionSettings::default());
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
@@ -907,7 +974,7 @@ fn main() {
                     let view = cx.new(GalleryView::new);
                     let focus = view.read(cx).focus_handle.clone();
                     window.focus(&focus, cx);
-                    view
+                    cx.new(|cx| Root::new(view, window, cx))
                 },
             );
             if let Err(e) = opened {

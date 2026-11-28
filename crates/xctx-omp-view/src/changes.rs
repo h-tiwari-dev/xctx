@@ -7,9 +7,14 @@
 use std::rc::Rc;
 
 use gpui::{AnyElement, App, FontWeight, SharedString, div, prelude::*, px};
-use xctx_ui::{Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, Theme, Tone};
+use xctx_ui::{
+    Badge, Button, ButtonSize, ButtonVariant, Icon, IconName, IconSize, ScrollableElement as _,
+    Theme, Tone,
+};
 
-use crate::markdown::diff_line_color;
+use crate::markdown::{code_block_selectable, diff_line_color};
+use crate::selectable::{SegmentId, SelectContext};
+use crate::tool_card::OpenFileHandler;
 
 /// A callback the host registers so the Changes panel's Refresh button can re-scan git.
 pub type ChangesRefresher = Rc<dyn Fn(&mut App)>;
@@ -146,6 +151,8 @@ pub(crate) struct ChangesPanelProps<'a> {
     pub has_refresher: bool,
     pub on_select: SelectIndex,
     pub on_copy: CopyCallback,
+    pub on_open_file: Option<OpenFileHandler>,
+    pub select: Option<SelectContext>,
     pub on_refresh: VoidCallback,
     pub on_close: VoidCallback,
 }
@@ -284,7 +291,6 @@ pub(crate) fn render_changes_panel(props: ChangesPanelProps<'_>, theme: &Theme) 
             .w(px(230.0))
             .flex_none()
             .max_h(px(260.0))
-            .overflow_y_scroll()
             .border_r_1()
             .border_color(theme.border_subtle)
             .py(Theme::SPACE_1)
@@ -365,7 +371,8 @@ pub(crate) fn render_changes_panel(props: ChangesPanelProps<'_>, theme: &Theme) 
                                 on_copy(copy_key.clone(), file_diff.clone(), cx);
                             }),
                     )
-            }));
+            }))
+            .overflow_y_scrollbar();
 
         let diff_pane: AnyElement = if let Some(file) = active_file {
             let on_copy_path = props.on_copy.clone();
@@ -375,6 +382,17 @@ pub(crate) fn render_changes_panel(props: ChangesPanelProps<'_>, theme: &Theme) 
             let has_diff = !diff_text.trim().is_empty();
             let copied_path = props.copied == Some("changes-path");
             let copied_diff = props.copied == Some("changes-diff");
+
+            let path_for_open = file.path.to_string();
+            let open_btn = props.on_open_file.clone().map(|open| {
+                Button::new("omp-changes-open-file", "Open")
+                    .icon(IconName::ExternalLink)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Compact)
+                    .tooltip("Open file in side panel")
+                    .selector("omp-changes-open-file")
+                    .on_click(move |_, window, cx| open(&path_for_open, window, cx))
+            });
 
             let diff_header = div()
                 .flex()
@@ -396,6 +414,7 @@ pub(crate) fn render_changes_panel(props: ChangesPanelProps<'_>, theme: &Theme) 
                         .text_color(theme.text)
                         .child(file.path.clone()),
                 )
+                .children(open_btn)
                 .child(
                     Button::new(
                         "omp-changes-copy-path",
@@ -434,6 +453,33 @@ pub(crate) fn render_changes_panel(props: ChangesPanelProps<'_>, theme: &Theme) 
                     }),
                 );
 
+            let diff_body: AnyElement = if has_diff {
+                if let Some(sel_ctx) = &props.select {
+                    code_block_selectable(
+                        &file.diff,
+                        true,
+                        Some((sel_ctx, SegmentId::new(usize::MAX, 0))),
+                        theme,
+                    )
+                } else {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .children(file.diff.lines().map(|line| {
+                            div()
+                                .text_color(diff_line_color(line, theme))
+                                .child(line.to_owned())
+                        }))
+                        .into_any_element()
+                }
+            } else {
+                div()
+                    .text_color(theme.text_subtle)
+                    .child("No diff preview available.")
+                    .into_any_element()
+            };
+
             let diff_lines = div()
                 .id("omp-changes-diff-scroll")
                 .debug_selector(|| "omp-changes-diff".to_owned())
@@ -442,28 +488,11 @@ pub(crate) fn render_changes_panel(props: ChangesPanelProps<'_>, theme: &Theme) 
                 .flex_1()
                 .min_w_0()
                 .max_h(px(228.0))
-                .overflow_y_scroll()
                 .p(Theme::SPACE_2)
                 .font_family("Menlo")
                 .text_size(Theme::TEXT_XS)
-                .children(if has_diff {
-                    file.diff
-                        .lines()
-                        .map(|line| {
-                            div()
-                                .text_color(diff_line_color(line, theme))
-                                .child(line.to_owned())
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![
-                        div()
-                            .text_color(theme.text_subtle)
-                            .child("No diff preview available.")
-                            .into_any_element(),
-                    ]
-                });
+                .child(diff_body)
+                .overflow_y_scrollbar();
 
             div()
                 .flex()

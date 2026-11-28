@@ -7,7 +7,7 @@ description = "A live WKWebView inside a GPUI window: placed over a pane, driven
 [dependencies]
 block2 = "0.6"
 futures = "0.3"
-gpui = { git = "https://github.com/zed-industries/zed.git", tag = "v1.29.3" }
+gpui = { package = "gpui-pre", version = "=0.3.14" }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSBitmapImageRep", "NSEvent", "NSImage", "NSImageRep", "NSResponder", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSObject", "NSString", "NSURL", "NSURLRequest", "NSURLResponse"] }

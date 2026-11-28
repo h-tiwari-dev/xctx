@@ -213,6 +213,7 @@ impl Workspace {
     pub(crate) fn new(prefs: UiPrefs, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = theme_for(window.appearance(), prefs.translucent);
         cx.set_global(theme);
+        xctx_ui::sync_kit_theme(theme, window.appearance(), cx);
         let (mut store, store_error) = match Store::open_default() {
             Ok(store) => (Some(store), None),
             Err(e) => (None, Some(format!("could not open the xctx store: {e}"))),

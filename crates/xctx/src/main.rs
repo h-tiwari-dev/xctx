@@ -46,28 +46,40 @@ mod workspace;
 
 use gpui::{
     App, AppContext, Bounds, Menu, MenuItem, SystemMenuType, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, point, prelude::*, px, size,
+    transparent_black,
 };
-use xctx_ui::{Theme, UiAssets};
+use xctx_ui::{KitAssets, Theme, gpui_component::Root, init_kit};
 
 use crate::keymap::{Quit, bind_keys};
 use crate::workspace::Workspace;
 
 fn main() {
     gpui_platform::application()
-        .with_assets(UiAssets)
+        .with_assets(KitAssets)
         .run(|cx: &mut App| {
             cx.set_global(Theme::dark());
+            init_kit(cx);
             bind_keys(cx);
             // The workspace handles Quit itself when its window is active; this covers the rest.
             cx.on_action(|_: &Quit, cx| {
                 let busy = cx
                     .windows()
                     .into_iter()
-                    .filter_map(|window| window.downcast::<Workspace>())
+                    .filter_map(|window| window.downcast::<Root>())
                     .any(|window| {
                         window
-                            .update(cx, |workspace, _, cx| workspace.refuse_while_busy(cx))
+                            .update(cx, |root, _, cx| {
+                                root.view()
+                                    .clone()
+                                    .downcast::<Workspace>()
+                                    .ok()
+                                    .is_some_and(|ws| {
+                                        ws.update(cx, |workspace, cx| {
+                                            workspace.refuse_while_busy(cx)
+                                        })
+                                    })
+                            })
                             .unwrap_or(false)
                     });
                 if !busy {
@@ -108,7 +120,10 @@ fn main() {
                     window_min_size: Some(size(px(760.0), px(480.0))),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| Workspace::new(prefs, window, cx)),
+                |window, cx| {
+                    let workspace = cx.new(|cx| Workspace::new(prefs, window, cx));
+                    cx.new(|cx| Root::new(workspace, window, cx).bg(transparent_black()))
+                },
             );
             if let Err(e) = opened {
                 eprintln!("xctx: could not open the main window: {e}");
