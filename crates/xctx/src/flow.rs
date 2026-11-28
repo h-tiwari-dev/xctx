@@ -154,7 +154,7 @@ impl Workspace {
 
     /// Run `op` from a panel button on the graph of the space being shown, redraw, and show what went wrong.
     /// Ignored while a dialog is open.
-    fn panel_change<T>(
+    pub(crate) fn panel_change<T>(
         &mut self,
         cx: &mut Context<Self>,
         op: impl FnOnce(&mut SpaceGraphState, &Space) -> Result<T, RpcError>,

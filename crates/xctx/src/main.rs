@@ -15,6 +15,7 @@ mod dialogs;
 mod flow;
 mod home;
 mod inbox_view;
+mod inspector;
 mod keymap;
 mod lifecycle;
 #[cfg(test)]

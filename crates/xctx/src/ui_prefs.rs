@@ -17,6 +17,8 @@ pub(crate) struct UiPrefs {
     pub(crate) translucent: bool,
     /// The Roster is shown as a narrow rail of icons.
     pub(crate) roster_collapsed: bool,
+    /// The Inspector is shown beside the space's panes.
+    pub(crate) inspector_open: bool,
 }
 
 impl Default for UiPrefs {
@@ -24,6 +26,7 @@ impl Default for UiPrefs {
         Self {
             translucent: true,
             roster_collapsed: false,
+            inspector_open: false,
         }
     }
 }
@@ -66,6 +69,7 @@ mod tests {
         let prefs = UiPrefs {
             translucent: false,
             roster_collapsed: true,
+            inspector_open: true,
         };
         prefs.save(&prefs_path(dir.path())).unwrap();
         assert_eq!(UiPrefs::load(Some(dir.path())), prefs);
@@ -78,7 +82,8 @@ mod tests {
             UiPrefs::load(Some(dir.path())),
             UiPrefs {
                 translucent: true,
-                roster_collapsed: true
+                roster_collapsed: true,
+                inspector_open: false,
             }
         );
     }

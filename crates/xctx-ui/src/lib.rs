@@ -21,6 +21,7 @@ pub mod frame_overlay;
 pub mod home_hero;
 pub mod icon;
 pub mod inbox;
+pub mod inspector;
 pub mod motion;
 pub mod overlay;
 pub mod parent_agent;

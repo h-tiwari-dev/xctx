@@ -21,6 +21,7 @@ use xctx_ui::{
 };
 
 use crate::agent_session::AgentSession;
+use crate::inspector::InspectorPlacement;
 use crate::lifecycle::reshape_space;
 use crate::omp_agent::AgentStatus;
 use crate::omp_panes::OmpPane;
@@ -1069,27 +1070,42 @@ impl Workspace {
     }
 
     /// The pane area of the space being shown: its split view (under the attempt strip when it has attempts)
-    /// with the tool dock (drawn from `dock`) on the right edge, or its Flow view when that is shown.
+    /// with the tool dock (drawn from `dock`) on the right edge, or its Flow view when that is shown. The
+    /// Inspector, when open, takes the dock's place beside the panes, or covers them in a narrow window.
     pub(crate) fn render_space(
         &self,
         tab: &SpaceTab,
         dock: Option<xctx_ui::ToolDockView>,
+        inspector: Option<InspectorPlacement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // The Flow view replaces the panes (and their tool dock); the panes keep running behind it.
-        if tab.flow_open {
-            return div()
+        let main = if tab.flow_open {
+            self.render_flow(tab, cx)
+        } else {
+            self.render_space_body(tab, cx)
+        };
+        match inspector {
+            Some(InspectorPlacement::Beside(panel)) => div()
+                .flex()
                 .size_full()
-                .child(self.render_flow(tab, cx))
-                .into_any_element();
+                .child(div().flex_1().min_w_0().h_full().child(main))
+                .child(panel)
+                .into_any_element(),
+            Some(InspectorPlacement::Overlay(panel)) => div()
+                .relative()
+                .size_full()
+                .child(div().size_full().child(main))
+                .child(div().absolute().top_0().right_0().bottom_0().child(panel))
+                .into_any_element(),
+            None if tab.flow_open => div().size_full().child(main).into_any_element(),
+            None => div()
+                .flex()
+                .size_full()
+                .child(div().flex_1().min_w_0().h_full().child(main))
+                .children(dock.map(|view| self.render_tool_dock(view, cx)))
+                .into_any_element(),
         }
-        let split = self.render_space_body(tab, cx);
-        div()
-            .flex()
-            .size_full()
-            .child(div().flex_1().min_w_0().h_full().child(split))
-            .children(dock.map(|view| self.render_tool_dock(view, cx)))
-            .into_any_element()
     }
 
     /// The split view of `tab`'s panes.

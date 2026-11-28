@@ -66,6 +66,10 @@ actions!(
         ToggleInbox,
         /// Show the Parent Agent as a dock over the shown space, or hide it; on Home, focus it.
         ToggleDock,
+        /// Show the Inspector beside the space being shown (its agents, attempts, channel and tools), or hide it.
+        ToggleInspector,
+        /// Show the Inspector on its Plugins tab.
+        ShowInspectorPlugins,
     ]
 );
 
@@ -108,6 +112,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleRoster, ws),
         KeyBinding::new("cmd-shift-i", ToggleInbox, ws),
         KeyBinding::new("cmd-j", ToggleDock, ws),
+        KeyBinding::new("cmd-i", ToggleInspector, ws),
+        KeyBinding::new("cmd-shift-p", ShowInspectorPlugins, ws),
         KeyBinding::new("escape", DismissDialog, Some(DIALOG_CONTEXT)),
     ];
     for (index, key) in TAB_KEYS.into_iter().enumerate() {

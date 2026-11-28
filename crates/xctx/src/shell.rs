@@ -148,7 +148,7 @@ impl Workspace {
     }
 
     /// Save the window preferences in the background; a failure is shown, the choice stays for this run.
-    fn save_prefs(&self, cx: &mut Context<Self>) {
+    pub(crate) fn save_prefs(&self, cx: &mut Context<Self>) {
         let Some(dir) = self
             .store
             .as_ref()
@@ -499,6 +499,22 @@ impl Workspace {
                 &["roster", "collapse"],
             ),
             action(
+                "toggle-inspector",
+                if self.prefs.inspector_open {
+                    "Hide Inspector"
+                } else {
+                    "Show Inspector"
+                },
+                Some("⌘I"),
+                &["panel", "graph", "agents", "attempts", "tools"],
+            ),
+            action(
+                "inspector-plugins",
+                "Show Plugins in Inspector",
+                Some("⌘⇧P"),
+                &["tools", "plugins", "mcp"],
+            ),
+            action(
                 "toggle-translucency",
                 if self.prefs.translucent {
                     "Make window opaque"
@@ -664,6 +680,13 @@ impl Workspace {
             "home" | "new-space" => self.show_home(window, cx),
             "inbox" => self.show_inbox(None, window, cx),
             "toggle-roster" => self.toggle_roster(cx),
+            "toggle-inspector" => {
+                let open = !self.prefs.inspector_open;
+                self.set_inspector_open(open, cx)
+            }
+            "inspector-plugins" => {
+                self.show_inspector_tab(xctx_ui::inspector::InspectorTab::Plugins, cx)
+            }
             "toggle-translucency" => self.toggle_translucency(window, cx),
             "rescan" => self.rescan(cx),
             "split-right" => self.split(SplitAxis::Horizontal, window, cx),

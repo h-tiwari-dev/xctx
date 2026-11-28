@@ -23,11 +23,13 @@ use crate::attempts::SpaceAttempts;
 use crate::control::{Control, PendingDraft, PendingMaskedRead};
 use crate::dialogs::Dialog;
 use crate::inbox_view::{EnvPrompt, PlanLaunches};
+use crate::inspector::{self, InspectorPlacement};
 use crate::keymap::{
     ActivateTab, ClosePane, CloseWindow, DismissDialog, FocusDown, FocusLeft, FocusNext, FocusPrev,
     FocusRight, FocusUp, ForkAttempts, LaunchDraft, Quit, ResizeDown, ResizeLeft, ResizeRight,
-    ResizeUp, ReviewAttempts, ShowHome, SplitDown, SplitRight, ToggleDock, ToggleFlow, ToggleInbox,
-    TogglePalette, ToggleRoster, ToggleTranslucency, ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
+    ResizeUp, ReviewAttempts, ShowHome, ShowInspectorPlugins, SplitDown, SplitRight, ToggleDock,
+    ToggleFlow, ToggleInbox, ToggleInspector, TogglePalette, ToggleRoster, ToggleTranslucency,
+    ToggleZoom, WORKSPACE_CONTEXT, palette_hint,
 };
 use crate::lifecycle::scan_index;
 use crate::parent_agent::ParentAgent;
@@ -111,6 +113,8 @@ pub(crate) struct Workspace {
     pub(crate) widen_approvals: HashSet<ItemId>,
     /// Each space's competing attempts, loaded when first needed.
     pub(crate) attempts: SpaceAttempts,
+    /// The tab the Inspector shows; whether it is open is in the window preferences.
+    pub(crate) inspector_tab: xctx_ui::inspector::InspectorTab,
     /// The data directory (the store's), which holds the RPC agents' session folders; `None` when there is none.
     pub(crate) data_dir: Option<PathBuf>,
     /// Spaces whose fork, adopt or discard of attempts is running: one at a time per space, and no Ship or
@@ -319,6 +323,7 @@ impl Workspace {
             graphs: SpaceGraphs::new(data_dir.clone()),
             widen_approvals: HashSet::new(),
             attempts: SpaceAttempts::new(data_dir.clone()),
+            inspector_tab: xctx_ui::inspector::InspectorTab::Graph,
             data_dir: data_dir.clone(),
             attempt_jobs: HashSet::new(),
             unsaved_adoptions: HashMap::new(),
@@ -670,10 +675,26 @@ impl Render for Workspace {
         self.browsers.attach(window);
         self.sync_plugin_panes(window, cx);
         self.refresh_plugin_panes(cx);
+        // The Inspector takes the dock's place beside the panes; in a narrow window it covers them instead.
+        let wide = f32::from(window.viewport_size().width) >= inspector::OVERLAY_BELOW;
+        let placement = self
+            .active_space_id()
+            .and_then(|id| self.inspector_panel(&id, cx))
+            .map(|panel| {
+                if wide {
+                    InspectorPlacement::Beside(panel.into_any_element())
+                } else {
+                    InspectorPlacement::Overlay(panel.into_any_element())
+                }
+            });
         // The dock reads what is open every frame, so a tool an agent opens lights up at once.
-        let dock = self.active_space_id().map(|id| self.tool_dock_view(&id));
+        let dock = if placement.is_some() {
+            None
+        } else {
+            self.active_space_id().map(|id| self.tool_dock_view(&id))
+        };
         let body = match self.active_tab() {
-            Some(tab) => self.render_space(tab, dock, cx),
+            Some(tab) => self.render_space(tab, dock, placement, cx),
             None => self.render_home(window, cx),
         };
         let dialog = self.render_dialog(cx);
@@ -763,6 +784,13 @@ impl Render for Workspace {
                 cx.listener(|this, _: &TogglePalette, window, cx| this.toggle_palette(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleRoster, _, cx| this.toggle_roster(cx)))
+            .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
+                let open = !this.prefs.inspector_open;
+                this.set_inspector_open(open, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowInspectorPlugins, _, cx| {
+                this.show_inspector_tab(xctx_ui::inspector::InspectorTab::Plugins, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleTranslucency, window, cx| {
                 this.toggle_translucency(window, cx)
             }))
